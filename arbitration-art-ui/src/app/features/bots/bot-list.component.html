@@ -1,0 +1,191 @@
+<div class="bot-list-page">
+  <div class="page-header">
+    <h1 class="page-title">Мои боты</h1>
+    <button class="btn btn-primary" (click)="openCreateDialog()">
+      + Создать
+    </button>
+  </div>
+
+  @if (loading()) {
+    <p class="loading-text">Загрузка...</p>
+  } @else if (bots().length === 0) {
+    <div class="empty-state">
+      <p>У вас пока нет настроенных ботов</p>
+      <button class="btn btn-primary" (click)="openCreateDialog()">
+        Создать первого бота
+      </button>
+    </div>
+  } @else {
+    <div class="bot-grid">
+      @for (bot of bots(); track bot.id) {
+        <div class="bot-card" [class.inactive]="!bot.is_active">
+          <div class="card-header">
+            <span class="coin-badge">{{ bot.coin }}</span>
+            @if (bot.is_active) {
+              <span class="status-dot active"></span>
+            } @else {
+              <span class="status-dot"></span>
+            }
+          </div>
+
+          <div class="card-body">
+            <div class="exchanges">
+              <span class="exchange-name">{{ exchangeLabels[bot.primary_exchange] || bot.primary_exchange }}</span>
+              <span class="arrow">→</span>
+              <span class="exchange-name">{{ exchangeLabels[bot.secondary_exchange] || bot.secondary_exchange }}</span>
+            </div>
+
+            <!-- Live spread data + bid/ask -->
+            @if (getSpread(bot.id); as spread$) {
+              @if (spread$ | async; as stats) {
+                @if (stats.loading) {
+                  <div class="spread-loading">Загрузка спреда...</div>
+                } @else if (stats.current) {
+                  <div class="spread-stats">
+                    <div class="spread-row open">
+                      <span class="spread-label">Open spread:</span>
+                      <span class="spread-current">{{ stats.current.openSpread | number:'1.3-3' }}</span>
+                      <span class="spread-minmax">Min: {{ stats.minOpen | number:'1.3-3' }}</span>
+                      <span class="spread-minmax">Max: {{ stats.maxOpen | number:'1.3-3' }}</span>
+                    </div>
+                    <div class="spread-row close">
+                      <span class="spread-label">Close spread:</span>
+                      <span class="spread-current">{{ stats.current.closeSpread | number:'1.3-3' }}</span>
+                      <span class="spread-minmax">Min: {{ stats.minClose | number:'1.3-3' }}</span>
+                      <span class="spread-minmax">Max: {{ stats.maxClose | number:'1.3-3' }}</span>
+                    </div>
+                  </div>
+
+                  @if (stats.history.length > 1) {
+                    <app-spread-chart [history]="stats.history" />
+                  }
+
+                  @if (stats.primaryBid) {
+                    <div class="exchange-info-table">
+                      <div class="info-header">
+                        <span class="info-col-label"></span>
+                        <span class="info-col-value">{{ exchangeLabels[bot.primary_exchange] || bot.primary_exchange }}</span>
+                        <span class="info-col-value">{{ exchangeLabels[bot.secondary_exchange] || bot.secondary_exchange }}</span>
+                      </div>
+                      <div class="info-row">
+                        <span class="info-col-label">Ask</span>
+                        <span class="info-col-value">{{ stats.primaryAsk | number:'1.2-5' }}</span>
+                        <span class="info-col-value">{{ stats.secondaryAsk | number:'1.2-5' }}</span>
+                      </div>
+                      <div class="info-row">
+                        <span class="info-col-label">Bid</span>
+                        <span class="info-col-value">{{ stats.primaryBid | number:'1.2-5' }}</span>
+                        <span class="info-col-value">{{ stats.secondaryBid | number:'1.2-5' }}</span>
+                      </div>
+                      @if (getExchangeInfo(bot.id); as info) {
+                        @if (info.primary && info.secondary) {
+                          <div class="info-divider"></div>
+                          <div class="info-row">
+                            <span class="info-col-label">Funding rate</span>
+                            <span class="info-col-value" [class.positive]="info.primary.fundingRate > 0" [class.negative]="info.primary.fundingRate < 0">
+                              {{ info.primary.fundingRate | number:'1.4-4' }}%
+                            </span>
+                            <span class="info-col-value" [class.positive]="info.secondary.fundingRate > 0" [class.negative]="info.secondary.fundingRate < 0">
+                              {{ info.secondary.fundingRate | number:'1.4-4' }}%
+                            </span>
+                          </div>
+                          <div class="info-row">
+                            <span class="info-col-label">Next Funding</span>
+                            <span class="info-col-value dim">{{ formatCountdown(info.primary.nextFundingTimestamp) }}</span>
+                            <span class="info-col-value dim">{{ formatCountdown(info.secondary.nextFundingTimestamp) }}</span>
+                          </div>
+                        }
+                      }
+                    </div>
+                  }
+
+            <div class="stats-grid">
+              <div class="stat">
+                <span class="stat-label">Спред вход</span>
+                <span class="stat-value accent">{{ bot.entry_spread }}%</span>
+              </div>
+              <div class="stat">
+                <span class="stat-label">Спред выход</span>
+                <span class="stat-value accent">{{ bot.exit_spread }}%</span>
+              </div>
+              <div class="stat">
+                <span class="stat-label">Количество</span>
+                <span class="stat-value">{{ bot.coin_amount }}</span>
+              </div>
+              <div class="stat">
+                <span class="stat-label">Тип</span>
+                <span class="stat-value">{{ bot.order_type }}</span>
+              </div>
+              <div class="stat">
+                <span class="stat-label">Макс. сделок</span>
+                <span class="stat-value">{{ bot.max_trades }}</span>
+              </div>
+            </div>
+
+            <div class="ticks-row">
+              <div class="tick-item">
+                <span class="tick-label">Open Ticks</span>
+                <span class="tick-value">{{ bot.open_ticks }}</span>
+              </div>
+              <div class="tick-item">
+                <span class="tick-label">Close Ticks</span>
+                <span class="tick-value">{{ bot.close_ticks }}</span>
+              </div>
+            </div>
+
+            <div class="leverage-row">
+              <div class="leverage-item">
+                <span class="leverage-label">Плечо {{ exchangeLabels[bot.primary_exchange] || bot.primary_exchange }}</span>
+                <span class="leverage-value">{{ bot.primary_leverage }}x</span>
+              </div>
+              <div class="leverage-item">
+                <span class="leverage-label">Плечо {{ exchangeLabels[bot.secondary_exchange] || bot.secondary_exchange }}</span>
+                <span class="leverage-value">{{ bot.secondary_leverage }}x</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="card-actions">
+            <button
+              class="btn btn-toggle"
+              [class.active]="bot.is_active"
+              (click)="toggleBot(bot)"
+              [attr.aria-label]="bot.is_active ? 'Приостановить' : 'Запустить'"
+            >
+              @if (bot.is_active) {
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <rect x="6" y="4" width="4" height="16"></rect>
+                  <rect x="14" y="4" width="4" height="16"></rect>
+                </svg>
+              } @else {
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" stroke="none">
+                  <polygon points="5,3 19,12 5,21"></polygon>
+                </svg>
+              }
+            </button>
+            <button class="btn btn-flat" (click)="openEditDialog(bot)" aria-label="Редактировать">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M17 3a2.83 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"></path>
+                <path d="m15 5 4 4"></path>
+              </svg>
+            </button>
+            <button class="btn btn-danger-flat" (click)="deleteBot(bot.id)" aria-label="Удалить">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M3 6h18"></path>
+                <path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"></path>
+                <path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"></path>
+              </svg>
+            </button>
+          </div>
+        </div>
+      }
+    </div>
+  }
+</div>
+
+@if (dialogOpen()) {
+  <app-bot-form
+    [bot]="editingBot()"
+    (closed)="onDialogClosed($event)"
+  />
+}

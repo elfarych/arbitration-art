@@ -1,0 +1,47 @@
+<div class="profile-page">
+  <h1 class="page-title">Личный кабинет</h1>
+
+  @if (loading()) {
+    <p class="loading-text">Загрузка...</p>
+  } @else if (auth.user(); as user) {
+    <div class="profile-card">
+      <div class="profile-avatar">
+        {{ user.email[0] | uppercase }}
+      </div>
+
+      <div class="profile-fields">
+        <div class="field">
+          <span class="field-label">Email</span>
+          <span class="field-value">{{ user.email }}</span>
+        </div>
+
+        <div class="field">
+          <span class="field-label">Имя пользователя</span>
+          <span class="field-value">{{ user.username }}</span>
+        </div>
+
+        @if (user.first_name || user.last_name) {
+          <div class="field">
+            <span class="field-label">Имя</span>
+            <span class="field-value">{{ user.first_name }} {{ user.last_name }}</span>
+          </div>
+        }
+
+        <div class="field">
+          <span class="field-label">Дата регистрации</span>
+          <span class="field-value">{{ user.date_joined | date: 'dd.MM.yyyy' }}</span>
+        </div>
+      </div>
+
+      <button
+        tuiButton
+        appearance="outline"
+        size="m"
+        (click)="logout()"
+        class="logout-button"
+      >
+        Выйти из аккаунта
+      </button>
+    </div>
+  }
+</div>

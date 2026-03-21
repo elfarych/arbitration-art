@@ -1,0 +1,129 @@
+# ==============================
+# Django / Python
+# ==============================
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+.venv/
+env/
+.env/
+
+# Environment variables
+.env
+*.env
+.env.*
+!.env.example
+
+# Django
+*.log
+local_settings.py
+db.sqlite3
+db.sqlite3-journal
+
+# Static & media (collected)
+staticfiles/
+media/
+
+# Migrations (uncomment if you want to ignore)
+# **/migrations/
+
+# Celery
+celerybeat-schedule
+celerybeat.pid
+
+# Coverage
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+*.cover
+
+# pytest
+.pytest_cache/
+
+# mypy
+.mypy_cache/
+
+# ==============================
+# Node.js / TypeScript
+# ==============================
+
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Build output
+dist/
+build/
+
+# TypeScript
+*.tsbuildinfo
+
+# ==============================
+# Angular
+# ==============================
+
+# Build output
+dist/
+.angular/
+.sass-cache/
+
+# Environment files
+src/environments/environment.ts
+!src/environments/environment.development.ts
+
+# ==============================
+# IDE / Editor
+# ==============================
+
+# JetBrains (PyCharm, WebStorm, etc.)
+.idea/
+
+# VS Code
+.vscode/
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+
+# Vim
+*.swp
+*.swo
+*~
+
+# ==============================
+# OS-specific
+# ==============================
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Linux
+*~
+.directory
+
+# ==============================
+# Misc
+# ==============================
+
+# Docker (override files)
+docker-compose.override.yml
+
+# Secrets
+*.pem
+*.key
