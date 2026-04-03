@@ -92,12 +92,12 @@ export class BinanceApiService {
   }
 
   /**
-   * Real-time ticker stream via WebSocket.
-   * Emits bid/ask/volume on every update.
+   * Real-time bid/ask stream via WebSocket (bookTicker).
+   * Emits bid/ask on every order book update.
    */
   streamTicker(coin: string): Observable<TickerData> {
     const symbol = coin.toLowerCase() + 'usdt';
-    const url = `wss://fstream.binance.com/ws/${symbol}@ticker`;
+    const url = `wss://fstream.binance.com/ws/${symbol}@bookTicker`;
 
     return new Observable<TickerData>((subscriber) => {
       const ws = new WebSocket(url);
@@ -110,7 +110,7 @@ export class BinanceApiService {
             ask: parseFloat(d.a),
             bidQty: parseFloat(d.B),
             askQty: parseFloat(d.A),
-            volume: parseFloat(d.v),
+            volume: 0,
           });
         } catch {
           // ignore
@@ -118,10 +118,62 @@ export class BinanceApiService {
       };
 
       ws.onerror = () => subscriber.error(new Error('Binance WS error'));
-      ws.onclose = () => subscriber.complete();
+      ws.onclose = () =>
+        subscriber.error(new Error('Binance WS closed unexpectedly'));
 
       return () => ws.close();
     });
+  }
+
+  /**
+   * Fetch aggregated trades for spread history.
+   * Returns up to 1000 trades, sorted newest-first.
+   */
+  getAggTrades(coin: string, limit = 1000, endTime?: number): Observable<AggTrade[]> {
+    const symbol = `${coin.toUpperCase()}USDT`;
+    let url = `${this.baseUrl}/aggTrades?symbol=${symbol}&limit=${limit}`;
+    if (endTime) {
+      url += `&endTime=${endTime}`;
+    }
+
+    return this.http.get<{ p: string; q: string; T: number }[]>(url).pipe(
+      map((trades) =>
+        trades.map((t) => ({
+          price: parseFloat(t.p),
+          timestamp: t.T,
+        })),
+      ),
+    );
+  }
+
+  /**
+   * Fetch 1-minute kline (candlestick) data.
+   * Returns OHLC data for spread history.
+   */
+  getKlines(
+    coin: string,
+    limit = 1000,
+    endTime?: number,
+  ): Observable<KlineData[]> {
+    const symbol = `${coin.toUpperCase()}USDT`;
+    let url = `${this.baseUrl}/klines?symbol=${symbol}&interval=1m&limit=${limit}`;
+    if (endTime) {
+      url += `&endTime=${endTime}`;
+    }
+
+    // Binance klines response: array of arrays
+    // [openTime, open, high, low, close, volume, closeTime, ...]
+    return this.http.get<(string | number)[][]>(url).pipe(
+      map((klines) =>
+        klines.map((k) => ({
+          timestamp: k[0] as number, // openTime
+          open: parseFloat(k[1] as string),
+          high: parseFloat(k[2] as string),
+          low: parseFloat(k[3] as string),
+          close: parseFloat(k[4] as string),
+        })),
+      ),
+    );
   }
 }
 
@@ -132,3 +184,17 @@ export interface TickerData {
   askQty: number;
   volume: number;
 }
+
+export interface AggTrade {
+  price: number;
+  timestamp: number;
+}
+
+export interface KlineData {
+  timestamp: number;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+}
+

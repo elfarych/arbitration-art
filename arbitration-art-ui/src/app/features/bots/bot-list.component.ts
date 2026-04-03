@@ -14,11 +14,12 @@ import { SpreadMonitorService, SpreadStats } from '../../core/services/spread-mo
 import { BotExchangeInfo, ExchangeInfoService } from '../../core/services/exchange-info.service';
 import { BotFormComponent } from './bot-form.component';
 import { SpreadChartComponent } from '../../shared/components/spread-chart.component';
+import { SpreadHistoryDialogComponent } from './spread-history-dialog.component';
 
 @Component({
   selector: 'app-bot-list',
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [AsyncPipe, DecimalPipe, BotFormComponent, SpreadChartComponent],
+  imports: [AsyncPipe, DecimalPipe, BotFormComponent, SpreadChartComponent, SpreadHistoryDialogComponent],
   templateUrl: './bot-list.component.html',
   styleUrl: './bot-list.component.scss',
 })
@@ -38,6 +39,7 @@ export class BotListComponent implements OnInit, OnDestroy {
   // Dialog state
   readonly dialogOpen = signal(false);
   readonly editingBot = signal<BotConfig | null>(null);
+  readonly historyBot = signal<BotConfig | null>(null);
 
   // Spread monitors per bot
   spreadSubjects = new Map<number, BehaviorSubject<SpreadStats>>();
@@ -76,6 +78,14 @@ export class BotListComponent implements OnInit, OnDestroy {
     if (result) {
       this.loadBots();
     }
+  }
+
+  openHistory(bot: BotConfig): void {
+    this.historyBot.set(bot);
+  }
+
+  closeHistory(): void {
+    this.historyBot.set(null);
   }
 
   deleteBot(id: number): void {

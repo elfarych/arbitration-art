@@ -3,7 +3,7 @@ import { HttpClient } from '@angular/common/http';
 import { catchError, forkJoin, map, Observable, of } from 'rxjs';
 
 import { ExchangeTickerInfo } from './exchange-info.service';
-import { TickerData } from './binance-api.service';
+import { AggTrade, KlineData, TickerData } from './binance-api.service';
 
 @Injectable({ providedIn: 'root' })
 export class MexcApiService {
@@ -103,6 +103,7 @@ export class MexcApiService {
 
     return new Observable<TickerData>((subscriber) => {
       const ws = new WebSocket(url);
+      let pingInterval: ReturnType<typeof setInterval>;
 
       ws.onopen = () => {
         ws.send(
@@ -111,6 +112,13 @@ export class MexcApiService {
             param: { symbol },
           }),
         );
+
+        // Send ping every 30s to keep the connection alive
+        pingInterval = setInterval(() => {
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ method: 'ping' }));
+          }
+        }, 30_000);
       };
 
       ws.onmessage = (event) => {
@@ -131,10 +139,75 @@ export class MexcApiService {
       };
 
       ws.onerror = () => subscriber.error(new Error('MEXC WS error'));
-      ws.onclose = () => subscriber.complete();
+      ws.onclose = () =>
+        subscriber.error(new Error('MEXC WS closed unexpectedly'));
 
-      return () => ws.close();
+      return () => {
+        clearInterval(pingInterval);
+        ws.close();
+      };
     });
   }
 
+  /**
+   * Fetch recent contract deals for spread history.
+   * Returns up to `limit` trades, sorted newest-first.
+   */
+  getDeals(coin: string, limit = 1000): Observable<AggTrade[]> {
+    const symbol = `${coin.toUpperCase()}_USDT`;
+
+    return this.http
+      .get<{ success: boolean; data: { p: number; t: number }[] }>(
+        `${this.baseUrl}/deals/${symbol}?limit=${limit}`,
+      )
+      .pipe(
+        map((res) =>
+          res.success
+            ? res.data.map((d) => ({ price: d.p, timestamp: d.t }))
+            : [],
+        ),
+      );
+  }
+
+  /**
+   * Fetch kline (candlestick) data for a time range.
+   * Returns OHLC data for spread history.
+   */
+  getKlines(
+    coin: string,
+    limit = 1000,
+    endTime?: number,
+  ): Observable<KlineData[]> {
+    const symbol = `${coin.toUpperCase()}_USDT`;
+    const end = endTime
+      ? Math.floor(endTime / 1000)
+      : Math.floor(Date.now() / 1000);
+    // Go back `limit` minutes from endTime
+    const start = end - limit * 60;
+
+    return this.http
+      .get<{
+        success: boolean;
+        data: {
+          time: number[];
+          open: number[];
+          high: number[];
+          low: number[];
+          close: number[];
+        };
+      }>(`${this.baseUrl}/kline/${symbol}?interval=Min1&start=${start}&end=${end}`)
+      .pipe(
+        map((res) => {
+          if (!res.success || !res.data?.time) return [];
+
+          return res.data.time.map((t, i) => ({
+            timestamp: t * 1000,
+            open: res.data.open[i],
+            high: res.data.high[i],
+            low: res.data.low[i],
+            close: res.data.close[i],
+          }));
+        }),
+      );
+  }
 }

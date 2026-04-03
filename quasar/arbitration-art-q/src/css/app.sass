@@ -1,0 +1,26 @@
+// app global css in Sass form
+*
+  padding: 0
+  margin: 0
+  box-sizing: border-box
+
+
+body
+  font-size: $body-font-size
+  line-height: $body-line-height
+  background: $dark-page
+  color: $text-color
+
+
+.q-card--dark
+  box-shadow: 0 0 30px 0 rgba(0,0,0,.3)
+
+.q-dialog__backdrop
+  backdrop-filter: blur(5px)
+
+// Глобальная стилизация всех инпутов (убираем бордеры, ставим темный фон)
+.q-field__control
+  background: $dark-page !important
+  border-radius: $generic-border-radius !important
+  &:before, &:after
+    border: none !important

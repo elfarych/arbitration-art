@@ -1,0 +1,38 @@
+{
+  "name": "arbitration-art-q",
+  "version": "0.0.1",
+  "description": "Arbitration Art Quasar App",
+  "productName": "Arbitration App",
+  "author": "eldar <devspace88@gmail.com>",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "test": "echo \"No test specified\" && exit 0",
+    "dev": "quasar dev",
+    "build": "quasar build",
+    "postinstall": "quasar prepare"
+  },
+  "dependencies": {
+    "@quasar/extras": "^1.16.4",
+    "axios": "^1.13.6",
+    "lightweight-charts": "^5.1.0",
+    "pinia": "^3.0.1",
+    "quasar": "^2.16.0",
+    "vue": "^3.5.22",
+    "vue-i18n": "^11.3.0",
+    "vue-router": "^5.0.3"
+  },
+  "devDependencies": {
+    "@intlify/unplugin-vue-i18n": "^11.0.0",
+    "@quasar/app-vite": "^2.5.1",
+    "@types/node": "^22.19.11",
+    "autoprefixer": "^10.4.27",
+    "typescript": "^5.9.3"
+  },
+  "engines": {
+    "node": "^28 || ^26 || ^24 || ^22.12",
+    "npm": ">= 6.13.4",
+    "yarn": ">= 1.21.1",
+    "pnpm": ">= 10.0.0"
+  }
+}
