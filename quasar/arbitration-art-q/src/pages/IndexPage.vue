@@ -1,5 +1,5 @@
 <template>
-  <q-page padding class="bot-list-page max-width">
+  <q-page padding class="bot-list-page">
     <div class="row items-center justify-between q-mb-lg">
       <h1 class="text-h5 text-title-color text-weight-bold q-my-none">Мои боты</h1>
       <q-btn color="primary" text-color="white" no-caps label="+ Создать" @click="openCreateDialog" />
@@ -15,23 +15,21 @@
       <q-btn color="primary" outline no-caps label="Создать первого бота" @click="openCreateDialog" />
     </div>
 
-    <div v-else class="row q-col-gutter-md">
-      <div v-for="bot in bots" :key="bot.id" class="col-12 col-md-6 col-lg-4">
-        <BotCard 
-          :bot="bot" 
-          @toggle="toggleBot" 
-          @edit="openEditDialog" 
-          @delete="deleteBot" 
-          @history="openHistory" 
-        />
-      </div>
+    <div v-else class="bot-cards-grid">
+      <BotCard 
+        v-for="bot in bots" :key="bot.id"
+        :bot="bot" 
+        @toggle="toggleBot" 
+        @edit="openEditDialog" 
+        @delete="deleteBot" 
+        @history="openHistory" 
+      />
     </div>
 
     <!-- Modals to be implemented next -->
     <BotFormDialog 
       v-model="isFormOpen" 
       :bot="editingBot" 
-      @saved="loadBots" 
     />
     
     <SpreadHistoryDialog 
@@ -44,14 +42,16 @@
 <script setup lang="ts">
 import { ref, onMounted } from 'vue';
 import { useQuasar } from 'quasar';
-import { botConfigApi, type BotConfig } from 'src/services/api/botConfig';
+import type { BotConfig } from 'src/stores/bots/api/botConfig';
+import { useBotsStore } from 'src/stores/bots/bots.store';
+import { storeToRefs } from 'pinia';
 import BotCard from 'src/components/bots/BotCard.vue';
 import BotFormDialog from 'src/components/bots/BotFormDialog.vue';
 import SpreadHistoryDialog from 'src/components/bots/SpreadHistoryDialog.vue';
 
 const $q = useQuasar();
-const bots = ref<BotConfig[]>([]);
-const loading = ref(true);
+const botsStore = useBotsStore();
+const { bots, loading } = storeToRefs(botsStore);
 
 const isFormOpen = ref(false);
 const editingBot = ref<BotConfig | null>(null);
@@ -60,14 +60,7 @@ const isHistoryOpen = ref(false);
 const historyBot = ref<BotConfig | null>(null);
 
 const loadBots = async () => {
-  loading.value = true;
-  try {
-    bots.value = await botConfigApi.list();
-  } catch (e) {
-    console.error('Failed to load bots', e);
-  } finally {
-    loading.value = false;
-  }
+  await botsStore.fetchBots();
 };
 
 const openCreateDialog = () => {
@@ -86,13 +79,9 @@ const openHistory = (bot: BotConfig) => {
 };
 
 const toggleBot = async (bot: BotConfig) => {
-  const previousState = bot.is_active;
-  bot.is_active = !previousState;
-  
   try {
-    await botConfigApi.update(bot.id, { is_active: !previousState });
+    await botsStore.toggleBot(bot);
   } catch (e) {
-    bot.is_active = previousState;
     $q.notify({ color: 'negative', message: 'Ошибка обновления статуса' });
   }
 };
@@ -107,8 +96,7 @@ const deleteBot = (id: number) => {
     color: 'negative'
   }).onOk(async () => {
     try {
-      await botConfigApi.delete(id);
-      await loadBots();
+      await botsStore.deleteBot(id);
     } catch (e) {
       $q.notify({ color: 'negative', message: 'Не удалось удалить бота' });
     }
@@ -122,8 +110,12 @@ onMounted(() => {
 
 <style lang="sass" scoped>
 .bot-list-page
-  max-width: 1200px
-  margin: 0 auto
+  /* Full screen layout */
+
+.bot-cards-grid
+  display: grid
+  grid-template-columns: repeat(auto-fill, minmax(370px, 1fr))
+  gap: 16px
 
 .text-title-color
   color: $title-color !important

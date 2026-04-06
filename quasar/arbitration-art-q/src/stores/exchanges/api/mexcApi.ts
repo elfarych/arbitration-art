@@ -1,9 +1,31 @@
 import axios from 'axios';
-import type { ExchangeTickerInfo, TickerData, AggTrade, KlineData } from './binanceApi';
+import type { ExchangeTickerInfo, TickerData, AggTrade, KlineData, DepthData } from './binanceApi';
 
 const mexcHttp = axios.create({ baseURL: '/mexc-api/api/v1/contract' });
 
 export const mexcApi = {
+  async getAllTickers(): Promise<Record<string, { bid: number; ask: number }>> {
+    try {
+      const { data } = await mexcHttp.get<{ success: boolean; data: Array<{ symbol: string; bid1: number; ask1: number }> }>('/ticker');
+      const result: Record<string, { bid: number; ask: number }> = {};
+      if (data.success && data.data) {
+        for (const item of data.data) {
+          if (item.symbol.endsWith('_USDT')) {
+            const coin = item.symbol.replace('_USDT', '');
+            result[coin] = {
+              bid: item.bid1,
+              ask: item.ask1
+            };
+          }
+        }
+      }
+      return result;
+    } catch (e) {
+      console.error('MEXC Futures getAllTickers error:', e);
+      return {};
+    }
+  },
+
   async symbolExists(coin: string): Promise<boolean> {
     const symbol = `${coin.toUpperCase()}_USDT`;
     try {
@@ -94,6 +116,47 @@ export const mexcApi = {
     if (onError) {
       ws.onerror = () => onError(new Error('MEXC WS error'));
       ws.onclose = () => onError(new Error('MEXC WS closed unexpectedly'));
+    }
+
+    return () => {
+      window.clearInterval(pingInterval);
+      ws.close();
+    };
+  },
+
+  streamDepth(coin: string, onMessage: (data: DepthData) => void, onError?: (err: Error) => void): () => void {
+    const symbol = `${coin.toUpperCase()}_USDT`;
+    const url = 'wss://contract.mexc.com/edge';
+    const ws = new WebSocket(url);
+    let pingInterval: number;
+
+    ws.onopen = () => {
+      ws.send(JSON.stringify({ method: 'sub.depth', param: { symbol } }));
+      pingInterval = window.setInterval(() => {
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ method: 'ping' }));
+        }
+      }, 30_000);
+    };
+
+    ws.onmessage = (event) => {
+      try {
+        const msg = JSON.parse(event.data);
+        if (msg.channel === 'push.depth' && msg.data) {
+          const d = msg.data;
+          if (d.asks || d.bids) {
+            onMessage({
+              bids: (d.bids || []).map((item: number[]) => [item[0], item[1]]),
+              asks: (d.asks || []).map((item: number[]) => [item[0], item[1]]),
+            });
+          }
+        }
+      } catch {}
+    };
+
+    if (onError) {
+      ws.onerror = () => onError(new Error('MEXC WS Depth error'));
+      ws.onclose = () => onError(new Error('MEXC WS Depth closed unexpectedly'));
     }
 
     return () => {

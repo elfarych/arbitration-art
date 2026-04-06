@@ -67,7 +67,7 @@ export default defineConfig((ctx) => {
 
       // extendViteConf (viteConf) {},
       // viteVuePluginOptions: {},
-      
+
       vitePlugins: [
         ['@intlify/unplugin-vue-i18n/vite', {
           // if you want to use Vue I18n Legacy API, you need to set `compositionOnly: false`
@@ -95,10 +95,20 @@ export default defineConfig((ctx) => {
           changeOrigin: true,
           rewrite: (path) => path.replace(/^\/binance-api/, '')
         },
+        '/binance-spot-api': {
+          target: 'https://api.binance.com',
+          changeOrigin: true,
+          rewrite: (path) => path.replace(/^\/binance-spot-api/, '')
+        },
         '/mexc-api': {
           target: 'https://contract.mexc.com',
           changeOrigin: true,
           rewrite: (path) => path.replace(/^\/mexc-api/, '')
+        },
+        '/bybit-api': {
+          target: 'https://api.bybit.com',
+          changeOrigin: true,
+          rewrite: (path) => path.replace(/^\/bybit-api/, '')
         }
       }
     },
@@ -118,7 +128,7 @@ export default defineConfig((ctx) => {
       // directives: [],
 
       // Quasar plugins
-      plugins: []
+      plugins: ['Notify', 'Dialog']
     },
 
     // animations: 'all', // --- includes all animations

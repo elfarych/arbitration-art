@@ -6,7 +6,7 @@
 
 <script setup lang="ts">
 import { ref, watch, onMounted, onUnmounted } from 'vue';
-import type { SpreadSnapshot } from 'src/composables/useSpreadMonitor';
+import type { SpreadSnapshot } from 'src/stores/exchanges/spreadMonitor';
 
 const props = defineProps<{
   history: SpreadSnapshot[];
@@ -22,25 +22,21 @@ const drawLine = (
   toY: (v: number) => number,
   padT: number,
   chartH: number,
-  key: 'openSpread' | 'closeSpread',
+  key: 'primaryExecPrice' | 'secondaryExecPrice',
   color: string,
-  fillColor: string,
 ) => {
+  if (!data.length) return;
   ctx.beginPath();
-  ctx.moveTo(toX(0), toY(data[0][key]));
+  ctx.moveTo(toX(0), toY((data[0] as SpreadSnapshot)[key]));
   for (let i = 1; i < data.length; i++) {
-    ctx.lineTo(toX(i), toY(data[i][key]));
+    ctx.lineTo(toX(i), toY((data[i] as SpreadSnapshot)[key]));
   }
   ctx.strokeStyle = color;
   ctx.lineWidth = 1.5;
   ctx.stroke();
 
-  // Fill area to bottom
-  ctx.lineTo(toX(data.length - 1), padT + chartH);
-  ctx.lineTo(toX(0), padT + chartH);
-  ctx.closePath();
-  ctx.fillStyle = fillColor;
-  ctx.fill();
+  ctx.lineTo(toX(data.length - 1), toY((data[data.length - 1] as SpreadSnapshot)[key]));
+  // No fill area needed for price lines
 };
 
 const draw = () => {
@@ -70,8 +66,9 @@ const draw = () => {
   let min = Infinity;
   let max = -Infinity;
   for (const s of data) {
-    min = Math.min(min, s.openSpread, s.closeSpread);
-    max = Math.max(max, s.openSpread, s.closeSpread);
+    if (!s.primaryExecPrice || !s.secondaryExecPrice) continue;
+    min = Math.min(min, s.primaryExecPrice, s.secondaryExecPrice);
+    max = Math.max(max, s.primaryExecPrice, s.secondaryExecPrice);
   }
 
   const range = max - min || 1;
@@ -110,8 +107,8 @@ const draw = () => {
     ctx.setLineDash([]);
   }
 
-  drawLine(ctx, data, toX, toY, padT, chartH, 'openSpread', '#4caf50', 'rgba(76,175,80,0.06)');
-  drawLine(ctx, data, toX, toY, padT, chartH, 'closeSpread', '#ef5350', 'rgba(239,83,80,0.06)');
+  drawLine(ctx, data, toX, toY, padT, chartH, 'primaryExecPrice', '#1976d2');
+  drawLine(ctx, data, toX, toY, padT, chartH, 'secondaryExecPrice', 'rgba(255, 255, 255, 0.7)');
 
   // Y-axis labels
   ctx.fillStyle = 'rgba(255,255,255,0.5)';
@@ -119,28 +116,30 @@ const draw = () => {
   ctx.textAlign = 'left';
   const labelX = w - padR + 6;
 
-  ctx.fillText(max.toFixed(3), labelX, padT + 4);
-  ctx.fillText(min.toFixed(3), labelX, h - padB + 3);
+  ctx.fillText(max.toFixed(5), labelX, padT + 4);
+  ctx.fillText(min.toFixed(5), labelX, h - padB + 3);
 
   const mid = (max + min) / 2;
   ctx.fillStyle = 'rgba(255,255,255,0.3)';
-  ctx.fillText(mid.toFixed(3), labelX, padT + chartH / 2 + 3);
+  ctx.fillText(mid.toFixed(5), labelX, padT + chartH / 2 + 3);
 
   // Top-left legend
-  const last = data[data.length - 1];
+  const last = data[data.length - 1] as SpreadSnapshot;
+  if (!last || !last.primaryExecPrice || !last.secondaryExecPrice) return;
+  
   ctx.font = 'bold 11px -apple-system, BlinkMacSystemFont, sans-serif';
   ctx.textAlign = 'left';
 
-  ctx.fillStyle = '#4caf50';
-  ctx.fillText(`O: ${last.openSpread.toFixed(3)}`, padL + 2, padT - 1);
+  ctx.fillStyle = '#1976d2';
+  ctx.fillText(`Осн: ${last.primaryExecPrice.toFixed(5)}`, padL + 2, padT - 1);
 
-  ctx.fillStyle = '#ef5350';
-  const oWidth = ctx.measureText(`O: ${last.openSpread.toFixed(3)}`).width;
-  ctx.fillText(`C: ${last.closeSpread.toFixed(3)}`, padL + oWidth + 12, padT - 1);
+  ctx.fillStyle = 'rgba(255, 255, 255, 0.7)';
+  const oWidth = ctx.measureText(`Осн: ${last.primaryExecPrice.toFixed(5)}`).width;
+  ctx.fillText(`Втор: ${last.secondaryExecPrice.toFixed(5)}`, padL + oWidth + 12, padT - 1);
 };
 
 watch(
-  () => props.history.length,
+  () => props.history[props.history.length - 1]?.timestamp,
   () => {
     if (animationFrame) cancelAnimationFrame(animationFrame);
     animationFrame = requestAnimationFrame(draw);

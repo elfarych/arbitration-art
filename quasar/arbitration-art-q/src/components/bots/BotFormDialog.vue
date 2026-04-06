@@ -108,8 +108,7 @@
               toggle-text-color="dark"
               :options="[
                 {label: 'Покупка', value: 'buy'},
-                {label: 'Продажа', value: 'sell'},
-                {label: 'Авто', value: 'auto'}
+                {label: 'Продажа', value: 'sell'}
               ]"
             />
           </div>
@@ -129,9 +128,9 @@
 
 <script setup lang="ts">
 import { ref, watch, computed } from 'vue';
-import { botConfigApi, type BotConfig, type BotConfigPayload } from 'src/services/api/botConfig';
-import { binanceApi } from 'src/services/exchanges/binanceApi';
-import { mexcApi } from 'src/services/exchanges/mexcApi';
+import type { BotConfig, BotConfigPayload } from 'src/stores/bots/api/botConfig';
+import { useBotsStore } from 'src/stores/bots/bots.store';
+import { useExchangesStore } from 'src/stores/exchanges/exchanges.store';
 import { useQuasar } from 'quasar';
 
 const props = defineProps<{
@@ -145,16 +144,22 @@ const emit = defineEmits<{
 }>();
 
 const $q = useQuasar();
+const botsStore = useBotsStore();
+const exchangesStore = useExchangesStore();
 
 const isEdit = computed(() => !!props.bot);
 
 const exchangeOptions = [
   { label: 'Binance Futures', value: 'binance_futures' },
+  { label: 'Binance Spot', value: 'binance_spot' },
+  { label: 'Bybit Futures', value: 'bybit_futures' },
   { label: 'Mexc Futures', value: 'mexc_futures' }
 ];
 
 const exchangeLabels: Record<string, string> = {
   binance_futures: 'Binance Futures',
+  binance_spot: 'Binance Spot',
+  bybit_futures: 'Bybit Futures',
   mexc_futures: 'Mexc Futures'
 };
 
@@ -170,7 +175,7 @@ const defaultForm: BotConfigPayload = {
   max_trades: 1,
   primary_leverage: 10,
   secondary_leverage: 10,
-  order_type: 'auto',
+  order_type: 'buy',
   is_active: true
 };
 
@@ -194,28 +199,16 @@ const validateCoin = async () => {
   validationResults.value = [];
   
   try {
-    let pExists = false, sExists = false;
-    
-    if (form.value.primary_exchange === 'binance_futures') pExists = await binanceApi.symbolExists(form.value.coin);
-    else pExists = await mexcApi.symbolExists(form.value.coin);
-
-    if (form.value.secondary_exchange === 'mexc_futures') sExists = await mexcApi.symbolExists(form.value.coin);
-    else sExists = await binanceApi.symbolExists(form.value.coin);
+    const res = await exchangesStore.validateSymbol(form.value.coin, form.value.primary_exchange, form.value.secondary_exchange);
 
     validationResults.value = [
-      { exchange: form.value.primary_exchange, exists: pExists },
-      { exchange: form.value.secondary_exchange, exists: sExists }
+      { exchange: form.value.primary_exchange, exists: res.primaryExists },
+      { exchange: form.value.secondary_exchange, exists: res.secondaryExists }
     ];
 
-    // Fetch estimated price for AMOUNT helper
-    if (pExists) {
-      const price = form.value.primary_exchange === 'binance_futures' 
-        ? await binanceApi.getPrice(form.value.coin) 
-        : await mexcApi.getPrice(form.value.coin);
-      if (price) {
-        priceCache = price;
-        updateEstimated();
-      }
+    if (res.primaryExists && res.price) {
+      priceCache = res.price;
+      updateEstimated();
     }
   } catch (e) {
     console.error(e);
@@ -238,11 +231,11 @@ const onSubmit = async () => {
   saving.value = true;
   try {
     if (isEdit.value && props.bot) {
-      await botConfigApi.update(props.bot.id, form.value);
+      await botsStore.updateBot(props.bot.id, form.value);
       $q.notify({ color: 'positive', message: 'Бот успешно обновлен!' });
     } else {
       form.value.coin = form.value.coin.toUpperCase();
-      await botConfigApi.create(form.value);
+      await botsStore.createBot(form.value);
       $q.notify({ color: 'positive', message: 'Бот успешно создан!' });
     }
     emit('saved');

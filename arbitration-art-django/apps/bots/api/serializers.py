@@ -1,6 +1,6 @@
 from rest_framework import serializers
 
-from apps.bots.models import BotConfig
+from apps.bots.models import BotConfig, EmulationTrade
 
 
 class BotConfigSerializer(serializers.ModelSerializer):
@@ -27,3 +27,30 @@ class BotConfigSerializer(serializers.ModelSerializer):
             "updated_at",
         )
         read_only_fields = ("id", "created_at", "updated_at")
+
+
+class EmulationTradeSerializer(serializers.ModelSerializer):
+    """Serializer for EmulationTrade CRUD operations."""
+
+    class Meta:
+        model = EmulationTrade
+        fields = (
+            "id",
+            "bot",
+            "coin",
+            "primary_exchange",
+            "secondary_exchange",
+            "order_type",
+            "status",
+            "amount",
+            "primary_open_price",
+            "secondary_open_price",
+            "open_spread",
+            "primary_close_price",
+            "secondary_close_price",
+            "close_spread",
+            "profit_percentage",
+            "opened_at",
+            "closed_at",
+        )
+        read_only_fields = ("id", "opened_at")

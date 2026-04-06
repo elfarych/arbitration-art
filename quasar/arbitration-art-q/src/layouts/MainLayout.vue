@@ -8,6 +8,11 @@
         
         <q-space />
 
+        <div class="row q-gutter-sm q-mr-md text-weight-medium">
+          <q-btn flat no-caps label="Мои боты" to="/" />
+          <q-btn flat no-caps label="Скринер" text-color="warning" to="/screener" />
+        </div>
+
         <div v-if="authStore.currentUser" class="flex flex-center cursor-pointer q-pa-sm user-info" @click="goToProfile">
           <!-- User Avatar -->
           <q-avatar color="primary" text-color="white" size="sm" font-size="0.8rem" class="text-weight-bold">

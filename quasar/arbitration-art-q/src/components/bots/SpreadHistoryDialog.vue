@@ -28,9 +28,8 @@
 <script setup lang="ts">
 import { ref, watch, onUnmounted, nextTick } from 'vue';
 import { createChart, type IChartApi, type ISeriesApi, ColorType } from 'lightweight-charts';
-import type { BotConfig } from 'src/services/api/botConfig';
-import { binanceApi } from 'src/services/exchanges/binanceApi';
-import { mexcApi } from 'src/services/exchanges/mexcApi';
+import type { BotConfig } from 'src/stores/bots/api/botConfig';
+import { useExchangesStore } from 'src/stores/exchanges/exchanges.store';
 
 const props = defineProps<{
   modelValue: boolean;
@@ -94,45 +93,14 @@ const loadHistory = async () => {
   error.value = '';
 
   try {
-    const limitParams = 60 * 6; // last 6 hours based on 1m klines
-    
-    let pkPromise, skPromise;
-    
-    if (props.bot.primary_exchange === 'binance_futures') pkPromise = binanceApi.getKlines(props.bot.coin, limitParams);
-    else pkPromise = mexcApi.getKlines(props.bot.coin, limitParams);
-
-    if (props.bot.secondary_exchange === 'mexc_futures') skPromise = mexcApi.getKlines(props.bot.coin, limitParams);
-    else skPromise = binanceApi.getKlines(props.bot.coin, limitParams);
-
-    const [primaryKlines, secondaryKlines] = await Promise.all([pkPromise, skPromise]);
-
-    const openData = [];
-    const closeData = [];
-    const pMap = new Map();
-    primaryKlines.forEach(k => pMap.set(k.timestamp, k.close));
-    
-    for (const sk of secondaryKlines) {
-      const pkClose = pMap.get(sk.timestamp);
-      if (pkClose !== undefined) {
-        const openS = ((pkClose - sk.close) / sk.close) * 100;
-        const closeS = ((sk.close - pkClose) / pkClose) * 100;
-        
-        // TradingView requires Unix timestamp in seconds
-        const time = Math.floor(sk.timestamp / 1000) as any;
-        
-        openData.push({ time, value: openS });
-        closeData.push({ time, value: closeS });
-      }
-    }
-
-    openData.sort((a,b) => a.time - b.time);
-    closeData.sort((a,b) => a.time - b.time);
+    const exchangesStore = useExchangesStore();
+    const { openData, closeData } = await exchangesStore.getSpreadHistory(props.bot);
 
     await nextTick();
     if (!chart) initChart();
     
-    openSeries?.setData(openData);
-    closeSeries?.setData(closeData);
+    openSeries?.setData(openData as any);
+    closeSeries?.setData(closeData as any);
     chart?.timeScale().fitContent();
     
   } catch (err) {

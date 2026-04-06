@@ -1,5 +1,7 @@
 import { binanceApi, type ExchangeTickerInfo } from './binanceApi';
+import { binanceSpotApi } from './binanceSpotApi';
 import { mexcApi } from './mexcApi';
+import { bybitApi } from './bybitApi';
 
 export interface BotExchangeInfo {
   primary: ExchangeTickerInfo | null;
@@ -12,8 +14,12 @@ export const exchangeInfoService = {
     switch (exchange) {
       case 'binance_futures':
         return await binanceApi.getTickerInfo(coin);
+      case 'binance_spot':
+        return await binanceSpotApi.getTickerInfo(coin);
       case 'mexc_futures':
         return await mexcApi.getTickerInfo(coin);
+      case 'bybit_futures':
+        return await bybitApi.getTickerInfo(coin);
       default:
         return null;
     }

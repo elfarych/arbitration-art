@@ -23,6 +23,11 @@ export interface AggTrade {
   timestamp: number;
 }
 
+export interface DepthData {
+  bids: [number, number][]; // price, quantity
+  asks: [number, number][]; // price, quantity
+}
+
 export interface KlineData {
   timestamp: number;
   open: number;
@@ -34,6 +39,26 @@ export interface KlineData {
 const binanceHttp = axios.create({ baseURL: '/binance-api/fapi/v1' });
 
 export const binanceApi = {
+  async getAllTickers(): Promise<Record<string, { bid: number; ask: number }>> {
+    try {
+      const { data } = await binanceHttp.get<Array<{ symbol: string; bidPrice: string; askPrice: string }>>('/ticker/bookTicker');
+      const result: Record<string, { bid: number; ask: number }> = {};
+      for (const item of data) {
+        if (item.symbol.endsWith('USDT')) {
+          const coin = item.symbol.replace('USDT', '');
+          result[coin] = {
+            bid: parseFloat(item.bidPrice),
+            ask: parseFloat(item.askPrice)
+          };
+        }
+      }
+      return result;
+    } catch (e) {
+      console.error('Binance Futures getAllTickers error:', e);
+      return {};
+    }
+  },
+
   async symbolExists(coin: string): Promise<boolean> {
     try {
       await binanceHttp.get(`/ticker/price?symbol=${coin.toUpperCase()}USDT`);
@@ -112,6 +137,31 @@ export const binanceApi = {
     if (onError) {
       ws.onerror = () => onError(new Error('Binance WS error'));
       ws.onclose = () => onError(new Error('Binance WS closed unexpectedly'));
+    }
+
+    return () => ws.close();
+  },
+
+  streamDepth(coin: string, onMessage: (data: DepthData) => void, onError?: (err: Error) => void): () => void {
+    const symbol = coin.toLowerCase() + 'usdt';
+    const url = `wss://fstream.binance.com/ws/${symbol}@depth20@100ms`;
+    const ws = new WebSocket(url);
+
+    ws.onmessage = (event) => {
+      try {
+        const d = JSON.parse(event.data);
+        if (d.e === 'depthUpdate' || (d.b && d.a)) { // Format sanity check
+          onMessage({
+            bids: d.b.map((item: string[]) => [parseFloat(item[0]), parseFloat(item[1])]),
+            asks: d.a.map((item: string[]) => [parseFloat(item[0]), parseFloat(item[1])]),
+          });
+        }
+      } catch {}
+    };
+
+    if (onError) {
+      ws.onerror = () => onError(new Error('Binance WS Depth error'));
+      ws.onclose = () => onError(new Error('Binance WS Depth closed unexpectedly'));
     }
 
     return () => ws.close();
