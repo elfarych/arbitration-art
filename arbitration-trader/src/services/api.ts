@@ -1,0 +1,52 @@
+import axios, { AxiosInstance } from 'axios';
+import { config } from '../config.js';
+import type { TradeOpenPayload, TradeClosePayload, TradeRecord } from '../types/index.js';
+import { logger } from '../utils/logger.js';
+
+const TAG = 'API';
+
+const client: AxiosInstance = axios.create({
+    baseURL: config.djangoApiUrl,
+    headers: {
+        'Content-Type': 'application/json',
+    },
+    timeout: 15000,
+});
+
+export const api = {
+    async openTrade(payload: TradeOpenPayload): Promise<TradeRecord> {
+        try {
+            const { data } = await client.post('/bots/real-trades/', payload);
+            logger.info(TAG, `Trade opened in Django: ID=${data.id}, coin=${data.coin}`);
+            return data;
+        } catch (e: any) {
+            logger.error(TAG, `openTrade failed: ${e?.response?.status} ${JSON.stringify(e?.response?.data) || e.message}`);
+            throw e;
+        }
+    },
+
+    async closeTrade(id: number, payload: TradeClosePayload): Promise<TradeRecord> {
+        try {
+            const { data } = await client.patch(`/bots/real-trades/${id}/`, payload);
+            logger.info(TAG, `Trade closed in Django: ID=${id}, profit=${payload.profit_usdt} USDT`);
+            return data;
+        } catch (e: any) {
+            logger.error(TAG, `closeTrade failed for ID=${id}: ${e?.response?.status} ${JSON.stringify(e?.response?.data) || e.message}`);
+            throw e;
+        }
+    },
+
+    async getOpenTrades(): Promise<TradeRecord[]> {
+        try {
+            const { data } = await client.get('/bots/real-trades/', {
+                params: { status: 'open' },
+            });
+            const trades = data.results || data || [];
+            logger.info(TAG, `Fetched ${trades.length} open trades from Django`);
+            return trades;
+        } catch (e: any) {
+            logger.error(TAG, `getOpenTrades failed: ${e?.response?.status} ${JSON.stringify(e?.response?.data) || e.message}`);
+            return [];
+        }
+    },
+};

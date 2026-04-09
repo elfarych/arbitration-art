@@ -4,6 +4,8 @@
 The **Arbitration Art** architecture follows a strictly decoupled client-server model:
 1. **Frontend (Client):** A Single Page Application (SPA) built using Quasar Framework.
 2. **Backend (API):** A monolithic Django REST Framework application providing stateless JSON APIs.
+3. **Arbitration Scanner** (`arbitration-scanner/`): Node.js/TypeScript service that monitors price spreads between Binance Futures and Bybit Futures and records emulated trades to Django.
+4. **Arbitration Trader** (`arbitration-trader/`): Node.js/TypeScript service that performs **real arbitrage trading** on Binance Futures and Bybit Futures. Uses CCXT for exchange communication, WebSocket for orderbook monitoring, and records actual trade data (order IDs, fill prices, commissions) to Django.
 
 ## Layers & Components
 

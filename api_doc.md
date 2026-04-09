@@ -53,3 +53,43 @@ CRUD operations for bot configurations. Requires Authentication. Only returns re
 
 - **DELETE** `/bots/{id}/`
   - Deletes the specified bot configuration.
+
+## 3. Emulation Trades (`/api/bots/trades/`)
+CRUD for emulated arbitrage trades (from `arbitration-scanner`). No authentication required.
+
+- **GET** `/bots/trades/?status=open` — List trades, filterable by status.
+- **POST** `/bots/trades/` — Create a new emulation trade.
+- **PATCH** `/bots/trades/{id}/` — Update a trade (e.g., close it).
+
+## 4. Real Trades (`/api/bots/real-trades/`)
+CRUD for real arbitrage trades (from `arbitration-trader`). No authentication required for scanner access.
+
+- **GET** `/bots/real-trades/?status=open`
+  - Response: List of real trades, filterable by `status`.
+  - Example Response:
+    ```json
+    [
+      {
+        "id": 1,
+        "coin": "BTC/USDT:USDT",
+        "primary_exchange": "binance_futures",
+        "secondary_exchange": "bybit_futures",
+        "order_type": "buy",
+        "status": "open",
+        "amount": "0.001",
+        "leverage": 10,
+        "primary_open_price": "67500.50000000",
+        "secondary_open_price": "67480.20000000",
+        "primary_open_order_id": "123456789",
+        "secondary_open_order_id": "987654321",
+        "open_spread": "0.0301",
+        "open_commission": "0.027001",
+        "opened_at": "2026-04-09T17:00:00Z"
+      }
+    ]
+    ```
+
+- **POST** `/bots/real-trades/` — Create a new real trade record.
+- **PATCH** `/bots/real-trades/{id}/` — Update a trade (close with actual fill data).
+  - Body includes: `status`, `close_reason`, `primary_close_price`, `secondary_close_price`, `primary_close_order_id`, `secondary_close_order_id`, `close_spread`, `close_commission`, `profit_usdt`, `profit_percentage`, `closed_at`.
+

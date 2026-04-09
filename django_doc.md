@@ -11,7 +11,9 @@ The backend uses a standard Django architecture with a segmented structure for a
   - Features a split settings architecture (`base.py`, `development.py`, `production.py`) inside `arbitration_art_django/settings/`.
 - **Apps:** Stored inside `apps/` directory within the virtual environment root. Currently available:
   - `users`: Contains a custom `User` model using `email` as the primary login field (inherited from `AbstractUser`) and handles user authentication and permissions.
-  - `bots`: Contains `BotConfig` model representing an arbitrage bot configuration, containing fields like primary/secondary exchange (e.g., Binance, Mexc), entry/exit spreads, coin details, max trades, order types, and leverages. It manages logic related to bot functionality.
+  - `bots`: Contains `BotConfig` model representing an arbitrage bot configuration, containing fields like primary/secondary exchange (e.g., Binance, Mexc), entry/exit spreads, coin details, max trades, order types, and leverages. Also includes:
+    - `EmulationTrade`: Stores emulated arbitrage trade cycles from the `arbitration-scanner` service.
+    - `Trade`: Stores real arbitrage trade cycles from the `arbitration-trader` service, including actual exchange order IDs, commissions, fill prices, close reasons (profit/timeout/shutdown/error), and USDT profit tracking.
 
 ## Key Technical Decisions
 - **Environment Variables:** Handled via `django-environ` (`.env` file).

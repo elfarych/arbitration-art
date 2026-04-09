@@ -1,8 +1,8 @@
 from rest_framework import viewsets
 from rest_framework.permissions import AllowAny
 
-from apps.bots.api.serializers import BotConfigSerializer, EmulationTradeSerializer
-from apps.bots.models import BotConfig, EmulationTrade
+from apps.bots.api.serializers import BotConfigSerializer, EmulationTradeSerializer, TradeSerializer
+from apps.bots.models import BotConfig, EmulationTrade, Trade
 
 
 class BotConfigViewSet(viewsets.ModelViewSet):
@@ -48,3 +48,20 @@ class EmulationTradeViewSet(viewsets.ModelViewSet):
         ctx = super().get_serializer_context()
         ctx['user'] = self.request.user
         return ctx
+
+
+class TradeViewSet(viewsets.ModelViewSet):
+    """CRUD ViewSet for real arbitrage trades."""
+
+    serializer_class = TradeSerializer
+    permission_classes = [AllowAny]
+
+    def get_queryset(self) -> Trade:
+        qs = Trade.objects.all()
+
+        # Support status filtering (e.g. ?status=open)
+        status = self.request.query_params.get("status")
+        if status:
+            qs = qs.filter(status=status)
+
+        return qs
