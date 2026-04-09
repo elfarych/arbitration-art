@@ -73,14 +73,21 @@ export class BybitClient implements IExchangeClient {
         const order = await this.exchange.createMarketOrder(symbol, side, amount, undefined, params);
         let filled = order;
 
-        // DB Lag fallback: give exchange matching engine 500ms to calculate fills before fetching
-        if (!filled.average || filled.status !== 'closed') {
-            await new Promise(r => setTimeout(r, 500));
+        // DB Lag fallback: Bybit API sometimes requires over 500ms to calculate fills
+        let retries = 0;
+        while ((!filled.average || filled.status !== 'closed') && retries < 5) {
+            await new Promise(r => setTimeout(r, 1000)); // 1000ms * 5 = up to 5s buffer
+            retries++;
             try {
-                filled = await this.exchange.fetchOrder(order.id, symbol);
+                const checked = await this.exchange.fetchOrder(order.id, symbol);
+                if (checked) filled = checked;
+                
+                // If the exchange finally returned a valid price, we can stop waiting
+                if (filled.average && filled.status === 'closed') {
+                    break;
+                }
             } catch (e) {
-                // Fallback to raw order if fetchOrder throws
-                filled = order;
+                // If fetch drops, ignore and keep trying until timeout
             }
         }
 

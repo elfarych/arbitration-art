@@ -334,6 +334,10 @@ export class Trader {
             const binanceResult = bSettled.value;
             const bybitResult = ySettled.value;
 
+            // Fallback for Bybit APIs that sometimes return 0.00 as execution price for Instant Market Orders
+            const bPriceSafe = binanceResult.avgPrice > 0 ? binanceResult.avgPrice : (binanceSide === 'buy' ? prices.primaryAsk : prices.primaryBid);
+            const yPriceSafe = bybitResult.avgPrice > 0 ? bybitResult.avgPrice : (bybitSide === 'buy' ? prices.secondaryAsk : prices.secondaryBid);
+
             const totalCommission = d(binanceResult.commission + bybitResult.commission, 6);
 
             // Record trade in Django with actual fill data
@@ -345,8 +349,8 @@ export class Trader {
                 status: 'open',
                 amount: d(amount),
                 leverage: config.leverage,
-                primary_open_price: d(binanceResult.avgPrice),
-                secondary_open_price: d(bybitResult.avgPrice),
+                primary_open_price: d(bPriceSafe),
+                secondary_open_price: d(yPriceSafe),
                 primary_open_order_id: binanceResult.orderId,
                 secondary_open_order_id: bybitResult.orderId,
                 open_spread: d(spread, 4),
@@ -357,7 +361,7 @@ export class Trader {
             state.openedAtMs = Date.now();
             // Note: slot is naturally held until close.
 
-            logger.info(this.tag, `✅ Opened ${symbol} (${orderType}). DB ID: ${tradeRecord.id}, Binance: ${binanceResult.avgPrice}, Bybit: ${bybitResult.avgPrice}`);
+            logger.info(this.tag, `✅ Opened ${symbol} (${orderType}). DB ID: ${tradeRecord.id}, Binance: ${bPriceSafe}, Bybit: ${yPriceSafe}`);
 
         } catch (e: any) {
             logger.error(this.tag, `❌ Failed to open ${symbol}: ${e.message}`);
@@ -520,13 +524,21 @@ export class Trader {
 
             await Promise.all(closePromises);
 
+            const pOpen = parseFloat(trade.primary_open_price as any);
+            const sOpen = parseFloat(trade.secondary_open_price as any);
+
+            // ---- Fallback for Bybit testnet/market order 0.00 bug on exit ----
+            if (bPrice === 0 && bSize > 0) {
+                bPrice = binanceCloseSide === 'buy' ? (prices?.primaryAsk ?? pOpen) : (prices?.primaryBid ?? pOpen);
+            }
+            if (yPrice === 0 && ySize > 0) {
+                yPrice = bybitCloseSide === 'buy' ? (prices?.secondaryAsk ?? sOpen) : (prices?.secondaryBid ?? sOpen);
+            }
+
             // ---- 3. Calculate Results & Update Django ----
             const amount = parseFloat(trade.amount as any);
             const openCommission = parseFloat(trade.open_commission as any) || 0;
             const totalCommission = openCommission + closeCommission;
-
-            const pOpen = parseFloat(trade.primary_open_price as any);
-            const sOpen = parseFloat(trade.secondary_open_price as any);
             const { profitUsdt, profitPercentage } = calculateRealPnL(
                 pOpen, sOpen, bPrice, yPrice, amount, orderType, totalCommission,
             );
@@ -541,7 +553,7 @@ export class Trader {
                     try {
                         await api.closeTrade(trade.id, {
                             status: closeStatus as 'closed' | 'force_closed',
-                            close_reason: reason,
+                            close_reason: reason === 'liquidation' ? 'error' as any : reason,
                             primary_close_price: d(bPrice),
                             secondary_close_price: d(yPrice),
                             primary_close_order_id: bOrder,

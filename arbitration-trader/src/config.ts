@@ -35,6 +35,7 @@ export const config = {
     closeThreshold: Number(process.env.CLOSE_THRESHOLD || '1.5'),
     orderbookLimit: Number(process.env.ORDERBOOK_LIMIT || '50'),
     chunkSize: Number(process.env.CHUNK_SIZE || '10'),
+    topLiquidPairsCount: Number(process.env.TOP_LIQUID_PAIRS_COUNT || '100'),
 
     // === Infrastructure ===
     djangoApiUrl: process.env.DJANGO_API_URL || 'http://127.0.0.1:8000/api',

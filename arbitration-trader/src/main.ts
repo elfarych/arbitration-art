@@ -62,9 +62,27 @@ async function bootstrap() {
     // 3. Find common USDT linear perpetual markets
     const binanceSymbols = new Set(binanceClient.getUsdtSymbols());
     const bybitSymbols = bybitClient.getUsdtSymbols();
-    const commonSymbols = bybitSymbols.filter(sym => binanceSymbols.has(sym));
+    let commonSymbols = bybitSymbols.filter(sym => binanceSymbols.has(sym));
 
     logger.info(TAG, `Found ${commonSymbols.length} intersecting USDT futures pairs.`);
+
+    logger.info(TAG, 'Fetching 24h volume to determine top 100 liquid pairs...');
+    try {
+        const tickers = await binanceClient.ccxtInstance.fetchTickers(commonSymbols);
+        
+        // Sort commonSymbols by quoteVolume descending
+        commonSymbols.sort((a, b) => {
+            const volA = tickers[a]?.quoteVolume || 0;
+            const volB = tickers[b]?.quoteVolume || 0;
+            return volB - volA; // Highest volume first
+        });
+
+        const TOP_LIMIT = config.topLiquidPairsCount;
+        commonSymbols = commonSymbols.slice(0, TOP_LIMIT);
+        logger.info(TAG, `Filtered down to top ${commonSymbols.length} most liquid pairs based on Binance 24h USDT volume.`);
+    } catch (e: any) {
+        logger.warn(TAG, `Failed to fetch volume data, proceeding with all ${commonSymbols.length} pairs. Error: ${e.message}`);
+    }
 
     if (commonSymbols.length === 0) {
         logger.error(TAG, 'No common symbols found. Exiting.');
@@ -84,14 +102,15 @@ async function bootstrap() {
     logger.info(TAG, `Setting leverage ${config.leverage}x and isolated margin on ${tradeableSymbols.length} pairs...`);
 
     let leverageErrors = 0;
-    const batchSize = 5; // Process in small batches to avoid rate limits
+    const batchSize = 5; // Reduced from 10: Bybit allows exactly 10 req/s. 5 pairs * 2 req = 10 req.
     const finalTradeableSymbols: string[] = [];
 
     const setupSymbol = async (symbol: string) => {
-        await binanceClient.setIsolatedMargin(symbol);
-        await binanceClient.setLeverage(symbol, config.leverage);
-        await bybitClient.setIsolatedMargin(symbol);
-        await bybitClient.setLeverage(symbol, config.leverage);
+        // Run Binance and Bybit branches completely in parallel
+        await Promise.all([
+            binanceClient.setIsolatedMargin(symbol).then(() => binanceClient.setLeverage(symbol, config.leverage)),
+            bybitClient.setIsolatedMargin(symbol).then(() => bybitClient.setLeverage(symbol, config.leverage))
+        ]);
     };
 
     for (let i = 0; i < tradeableSymbols.length; i += batchSize) {
@@ -107,9 +126,9 @@ async function bootstrap() {
             }
         });
 
-        // Small delay between batches to respect rate limits
+        // Strict 1.2s delay to prevent Bybit "Too many visits" HTTP 429
         if (i + batchSize < tradeableSymbols.length) {
-            await new Promise(r => setTimeout(r, 200));
+            await new Promise(r => setTimeout(r, 1200));
         }
     }
 
