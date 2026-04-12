@@ -133,7 +133,7 @@ export function checkLegDrawdown(
  * @param orderbookSide Array of [price, volume] orderbook levels.
  * @param targetCoins Total required base currency quantity.
  */
-export function calculateVWAP(orderbookSide: [number, number][], targetCoins: number, isClosing: boolean = false): number {
+export function calculateVWAP(orderbookSide: [number, number][], targetCoins: number, isEmergency: boolean = false): number {
     if (!orderbookSide || orderbookSide.length === 0) return NaN;
     if (targetCoins <= 0) return orderbookSide[0][0];
 
@@ -153,16 +153,15 @@ export function calculateVWAP(orderbookSide: [number, number][], targetCoins: nu
     }
 
     if (accCoins < targetCoins) {
-        if (!isClosing) {
-            // Cancel trade open if liquidity is missing
+        if (!isEmergency) {
+            // КРИТИЧЕСКИЙ ФИКС: Для Входа и Тейк-Профита нам НУЖЕН полный объем. 
+            // Если в стакане не хватает монет - возвращаем NaN (Отменяем сигнал!)
             return NaN;
         }
-        // Not enough liquidity across all fetched levels to fill the entire order.
-        // We return the VWAP of everything available as the best approximation, 
-        // preventing the bot from becoming "blind" to active trades during extreme volatility crunches.
+        // В случае экстренной ликвидации или таймаута берем что есть
         logger.warn('Math', `Insufficient depth to fill ${targetCoins}. Using VWAP of available ${accCoins}`);
         return accQuoteVal / accCoins;
     }
 
-    return accQuoteVal / accCoins;
+    return accQuoteVal / targetCoins;
 }

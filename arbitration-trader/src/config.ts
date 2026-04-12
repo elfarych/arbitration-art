@@ -19,6 +19,20 @@ export const config = {
         apiKey: requireEnv('BYBIT_API_KEY'),
         secret: requireEnv('BYBIT_SECRET'),
     },
+    gate: {
+        apiKey: process.env.GATE_API_KEY || '',
+        secret: process.env.GATE_SECRET || '',
+    },
+    mexc: {
+        apiKey: process.env.MEXC_API_KEY || '',
+        secret: process.env.MEXC_SECRET || '',
+    },
+
+    // === Exchange Routing ===
+    // Выбор активных бирж для арбитража.
+    // Доступные варианты: binance, bybit, mexc, gate
+    primaryExchange: process.env.PRIMARY_EXCHANGE?.toLowerCase() || 'binance',
+    secondaryExchange: process.env.SECONDARY_EXCHANGE?.toLowerCase() || 'bybit',
 
     // === Testnet mode ===
     useTestnet: process.env.USE_TESTNET === 'true',

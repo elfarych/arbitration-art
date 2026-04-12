@@ -69,10 +69,10 @@ export class Trader {
     constructor(
         public id: number,
         public symbols: string[],
-        private binanceWs: Exchange,
-        private bybitWs: Exchange,
-        private binanceClient: IExchangeClient,
-        private bybitClient: IExchangeClient,
+        private primaryWs: Exchange,
+        private secondaryWs: Exchange,
+        private primaryClient: IExchangeClient,
+        private secondaryClient: IExchangeClient,
         private marketInfo: MarketInfoService,
         private tradeCounter: TradeCounter,
     ) {
@@ -117,8 +117,8 @@ export class Trader {
 
         const loops: Promise<void>[] = [];
         for (const symbol of this.symbols) {
-            loops.push(this.watchLoop(this.binanceWs, symbol, 'Binance'));
-            loops.push(this.watchLoop(this.bybitWs, symbol, 'Bybit'));
+            loops.push(this.watchLoop(this.primaryWs, symbol, this.primaryClient.name));
+            loops.push(this.watchLoop(this.secondaryWs, symbol, this.secondaryClient.name));
         }
 
         await Promise.all(loops);
@@ -161,14 +161,13 @@ export class Trader {
         }
     }
 
-    private getPrices(symbol: string, targetCoinsFallback?: number, isClosing: boolean = false): OrderbookPrices | null {
-        const bOb = (this.binanceWs as any).orderbooks?.[symbol];
-        const yOb = (this.bybitWs as any).orderbooks?.[symbol];
+    private getPrices(symbol: string, targetCoinsFallback?: number, isEmergency: boolean = false): OrderbookPrices | null {
+        const bOb = (this.primaryWs as any).orderbooks?.[symbol];
+        const yOb = (this.secondaryWs as any).orderbooks?.[symbol];
 
         if (
-            !bOb || !yOb ||
-            !bOb.bids?.length || !bOb.asks?.length ||
-            !yOb.bids?.length || !yOb.asks?.length
+            !bOb?.bids?.length || !bOb?.asks?.length ||
+            !yOb?.bids?.length || !yOb?.asks?.length
         ) {
             return null;
         }
@@ -177,14 +176,14 @@ export class Trader {
         // If volume evaluates to 0, calculateVWAP gracefully falls back to absolute Top of Book
         const targetCoins = targetCoinsFallback ?? info?.tradeAmount ?? 0;
 
-        const pBid = calculateVWAP(bOb.bids, targetCoins, isClosing);
-        const pAsk = calculateVWAP(bOb.asks, targetCoins, isClosing);
-        const sBid = calculateVWAP(yOb.bids, targetCoins, isClosing);
-        const sAsk = calculateVWAP(yOb.asks, targetCoins, isClosing);
+        const pBid = calculateVWAP(bOb.bids, targetCoins, isEmergency);
+        const pAsk = calculateVWAP(bOb.asks, targetCoins, isEmergency);
+        const sBid = calculateVWAP(yOb.bids, targetCoins, isEmergency);
+        const sAsk = calculateVWAP(yOb.asks, targetCoins, isEmergency);
 
         if (isNaN(pBid) || isNaN(pAsk) || isNaN(sBid) || isNaN(sAsk)) {
             // Not enough liquidity in the depth to fill even this target size
-            logger.debug(this.tag, `📉 Insufficient depth on ${symbol} to fill ${targetCoins} coins. isClosing: ${isClosing}`);
+            logger.debug(this.tag, `📉 Insufficient depth on ${symbol} to fill ${targetCoins} coins. isEmergency: ${isEmergency}`);
             return null;
         }
 
@@ -213,7 +212,7 @@ export class Trader {
             targetCoins = parseFloat(state.activeTrade!.amount as any);
         } else {
             // Dynamic lot sizing based on current best bid
-            const bOb = (this.binanceWs as any).orderbooks?.[symbol];
+            const bOb = (this.primaryWs as any).orderbooks?.[symbol];
             const currentPrice = bOb?.bids?.[0]?.[0];
             if (!currentPrice) return;
 
@@ -229,7 +228,16 @@ export class Trader {
             }
         }
         
-        const prices = this.getPrices(symbol, targetCoins, isClosing);
+        if (isClosing) {
+            // ==== 2. IN TRADE: monitor PnL for exit ====
+            const strictPrices = this.getPrices(symbol, targetCoins, false);
+            const emergencyPrices = this.getPrices(symbol, targetCoins, true);
+            await this.checkExit(symbol, state, strictPrices, emergencyPrices);
+            return;
+        }
+
+        // ==== 3. IDLE: look for entry ====
+        const prices = this.getPrices(symbol, targetCoins, false);
         if (!prices) return;
 
         const currentBuySpread = calculateOpenSpread(prices, 'buy');
@@ -240,20 +248,14 @@ export class Trader {
 
         if (state.baselineBuy === null) {
             state.baselineBuy = currentBuySpread;
-        } else if (!isClosing) {
+        } else {
             state.baselineBuy = state.baselineBuy * (1 - EMA_ALPHA) + currentBuySpread * EMA_ALPHA;
         }
 
         if (state.baselineSell === null) {
             state.baselineSell = currentSellSpread;
-        } else if (!isClosing) {
+        } else {
             state.baselineSell = state.baselineSell * (1 - EMA_ALPHA) + currentSellSpread * EMA_ALPHA;
-        }
-
-        // ==== 2. IN TRADE: monitor PnL for exit ====
-        if (state.activeTrade) {
-            await this.checkExit(symbol, state, prices, currentBuySpread, currentSellSpread);
-            return;
         }
 
         // ==== 3. IDLE: look for entry ====
@@ -297,29 +299,27 @@ export class Trader {
             logger.info(this.tag, `🔴 OPENING ${symbol} (${orderType}), amount: ${amount}, spread: ${spread.toFixed(3)}%`);
 
             // Determine order sides for each exchange
-            //   buy  = Long Binance (buy) + Short Bybit (sell)
-            //   sell = Short Binance (sell) + Long Bybit (buy)
-            const binanceSide = orderType === 'buy' ? 'buy' : 'sell';
-            const bybitSide = orderType === 'buy' ? 'sell' : 'buy';
+            const primarySide = orderType === 'buy' ? 'buy' : 'sell';
+            const secondarySide = orderType === 'buy' ? 'sell' : 'buy';
 
             // Execute both orders concurrently using Promise.allSettled for atomicity safety
-            const [bSettled, ySettled] = await Promise.allSettled([
-                this.binanceClient.createMarketOrder(symbol, binanceSide, amount),
-                this.bybitClient.createMarketOrder(symbol, bybitSide, amount),
+            const [pSettled, sSettled] = await Promise.allSettled([
+                this.primaryClient.createMarketOrder(symbol, primarySide, amount),
+                this.secondaryClient.createMarketOrder(symbol, secondarySide, amount),
             ]);
 
-            if (bSettled.status === 'rejected' || ySettled.status === 'rejected') {
+            if (pSettled.status === 'rejected' || sSettled.status === 'rejected') {
                 logger.error(this.tag, `❌ Atomic execution failed for ${symbol}! Reverting successful legs...`);
                 
                 // Rollback the leg that ACTUALLY opened
-                if (bSettled.status === 'fulfilled') {
-                    const revSide = binanceSide === 'buy' ? 'sell' : 'buy';
+                if (pSettled.status === 'fulfilled') {
+                    const revSide = primarySide === 'buy' ? 'sell' : 'buy';
                     // ReduceOnly is critical to avoid opening a new opposite margin position!
-                    await this.binanceClient.createMarketOrder(symbol, revSide, bSettled.value.filledQty, { reduceOnly: true }).catch(console.error);
+                    await this.primaryClient.createMarketOrder(symbol, revSide, pSettled.value.filledQty, { reduceOnly: true }).catch(console.error);
                 }
-                if (ySettled.status === 'fulfilled') {
-                    const revSide = bybitSide === 'buy' ? 'sell' : 'buy';
-                    await this.bybitClient.createMarketOrder(symbol, revSide, ySettled.value.filledQty, { reduceOnly: true }).catch(console.error);
+                if (sSettled.status === 'fulfilled') {
+                    const revSide = secondarySide === 'buy' ? 'sell' : 'buy';
+                    await this.secondaryClient.createMarketOrder(symbol, revSide, sSettled.value.filledQty, { reduceOnly: true }).catch(console.error);
                 }
 
                 // Insurance policy against Network Timeout (order fulfilled but API crashed)
@@ -331,29 +331,37 @@ export class Trader {
                 return; // Graceful bail out
             }
 
-            const binanceResult = bSettled.value;
-            const bybitResult = ySettled.value;
+            const primaryResult = pSettled.value;
+            const secondaryResult = sSettled.value;
 
             // Fallback for Bybit APIs that sometimes return 0.00 as execution price for Instant Market Orders
-            const bPriceSafe = binanceResult.avgPrice > 0 ? binanceResult.avgPrice : (binanceSide === 'buy' ? prices.primaryAsk : prices.primaryBid);
-            const yPriceSafe = bybitResult.avgPrice > 0 ? bybitResult.avgPrice : (bybitSide === 'buy' ? prices.secondaryAsk : prices.secondaryBid);
+            const pPriceSafe = primaryResult.avgPrice > 0 ? primaryResult.avgPrice : (primarySide === 'buy' ? prices.primaryAsk : prices.primaryBid);
+            const sPriceSafe = secondaryResult.avgPrice > 0 ? secondaryResult.avgPrice : (secondarySide === 'buy' ? prices.secondaryAsk : prices.secondaryBid);
 
-            const totalCommission = d(binanceResult.commission + bybitResult.commission, 6);
+            const totalCommission = d(primaryResult.commission + secondaryResult.commission, 6);
+
+            // 🟢 Calculate real spread factoring in market order slippage
+            let realOpenSpread = spread;
+            if (pPriceSafe > 0 && sPriceSafe > 0) {
+                realOpenSpread = orderType === 'buy'
+                    ? ((sPriceSafe - pPriceSafe) / pPriceSafe) * 100
+                    : ((pPriceSafe - sPriceSafe) / sPriceSafe) * 100;
+            }
 
             // Record trade in Django with actual fill data
             const tradeRecord = await api.openTrade({
                 coin: symbol,
-                primary_exchange: 'binance_futures',
-                secondary_exchange: 'bybit_futures',
+                primary_exchange: `${this.primaryClient.name.toLowerCase()}_futures`,
+                secondary_exchange: `${this.secondaryClient.name.toLowerCase()}_futures`,
                 order_type: orderType,
                 status: 'open',
                 amount: d(amount),
                 leverage: config.leverage,
-                primary_open_price: d(bPriceSafe),
-                secondary_open_price: d(yPriceSafe),
-                primary_open_order_id: binanceResult.orderId,
-                secondary_open_order_id: bybitResult.orderId,
-                open_spread: d(spread, 4),
+                primary_open_price: d(pPriceSafe),
+                secondary_open_price: d(sPriceSafe),
+                primary_open_order_id: primaryResult.orderId,
+                secondary_open_order_id: secondaryResult.orderId,
+                open_spread: d(realOpenSpread, 4),
                 open_commission: totalCommission,
             });
 
@@ -361,7 +369,7 @@ export class Trader {
             state.openedAtMs = Date.now();
             // Note: slot is naturally held until close.
 
-            logger.info(this.tag, `✅ Opened ${symbol} (${orderType}). DB ID: ${tradeRecord.id}, Binance: ${bPriceSafe}, Bybit: ${yPriceSafe}`);
+            logger.info(this.tag, `✅ Opened ${symbol} (${orderType}). DB ID: ${tradeRecord.id}, ${this.primaryClient.name}: ${pPriceSafe}, ${this.secondaryClient.name}: ${sPriceSafe}`);
 
         } catch (e: any) {
             logger.error(this.tag, `❌ Failed to open ${symbol}: ${e.message}`);
@@ -390,38 +398,38 @@ export class Trader {
         const info = this.marketInfo.getInfo(symbol);
         const minQty = info?.minQty || 0;
         try {
-            // Try closing any position that might have been opened on Binance
+            // Try closing any position that might have been opened on Primary
             try {
-                const binancePositions = await (this.binanceClient as any).ccxtInstance.fetchPositions([symbol]);
-                for (const pos of binancePositions) {
+                const primaryPositions = await (this.primaryClient as any).ccxtInstance.fetchPositions([symbol]);
+                for (const pos of primaryPositions) {
                     if (pos.symbol !== symbol) continue; // Defense against CCXT bug sending all symbols
 
-                    const size = Math.abs(Number(pos.contracts ?? 0));
+                    const size = Math.abs(Number(pos.contracts ?? pos.amount ?? 0));
                     if (size > 0 && size >= minQty) {
                         const side = pos.side === 'long' ? 'sell' : 'buy';
-                        await this.binanceClient.createMarketOrder(symbol, side, size, { reduceOnly: true });
-                        logger.info(this.tag, `🧹 Cleaned up Binance position for ${symbol}`);
+                        await this.primaryClient.createMarketOrder(symbol, side, size, { reduceOnly: true });
+                        logger.info(this.tag, `🧹 Cleaned up ${this.primaryClient.name} position for ${symbol}`);
                     }
                 }
             } catch (err: any) {
-                logger.error(this.tag, `Failed to clean up Binance position for ${symbol}: ${err.message}`);
+                logger.error(this.tag, `Failed to clean up ${this.primaryClient.name} position for ${symbol}: ${err.message}`);
             }
 
-            // Try closing any position that might have been opened on Bybit
+            // Try closing any position that might have been opened on Secondary
             try {
-                const bybitPositions = await (this.bybitClient as any).ccxtInstance.fetchPositions([symbol]);
-                for (const pos of bybitPositions) {
+                const secondaryPositions = await (this.secondaryClient as any).ccxtInstance.fetchPositions([symbol]);
+                for (const pos of secondaryPositions) {
                     if (pos.symbol !== symbol) continue; // Defense against CCXT bug sending all symbols
 
-                    const size = Math.abs(Number(pos.contracts ?? 0));
+                    const size = Math.abs(Number(pos.contracts ?? pos.amount ?? 0));
                     if (size > 0 && size >= minQty) {
                         const side = pos.side === 'long' ? 'sell' : 'buy';
-                        await this.bybitClient.createMarketOrder(symbol, side, size, { reduceOnly: true });
-                        logger.info(this.tag, `🧹 Cleaned up Bybit position for ${symbol}`);
+                        await this.secondaryClient.createMarketOrder(symbol, side, size, { reduceOnly: true });
+                        logger.info(this.tag, `🧹 Cleaned up ${this.secondaryClient.name} position for ${symbol}`);
                     }
                 }
             } catch (err: any) {
-                logger.error(this.tag, `Failed to clean up Bybit position for ${symbol}: ${err.message}`);
+                logger.error(this.tag, `Failed to clean up ${this.secondaryClient.name} position for ${symbol}: ${err.message}`);
             }
 
         } catch (cleanupErr: any) {
@@ -434,9 +442,8 @@ export class Trader {
     private async checkExit(
         symbol: string,
         state: PairState,
-        prices: OrderbookPrices,
-        currentBuySpread: number,
-        currentSellSpread: number,
+        strictPrices: OrderbookPrices | null,
+        emergencyPrices: OrderbookPrices | null,
     ) {
         const trade = state.activeTrade!;
         const pOpen = parseFloat(trade.primary_open_price as any);
@@ -444,19 +451,26 @@ export class Trader {
         const orderType = trade.order_type as 'buy' | 'sell';
 
         // ==== LIQUIDATION PROTECTION ====
-        const maxDrawdown = checkLegDrawdown({ pOpen, sOpen }, prices, orderType, config.leverage);
-        if (maxDrawdown >= config.maxLegDrawdownPercent) {
-            logger.error(this.tag, `🚨 LIQUIDATION PROTECTION TRIGGERED on ${symbol} (${orderType}). Max leg drawdown: -${maxDrawdown.toFixed(2)}%`);
-            await this.executeClose(symbol, state, 'liquidation', prices, currentBuySpread, currentSellSpread);
-            return;
+        if (emergencyPrices) {
+            const maxDrawdown = checkLegDrawdown({ pOpen, sOpen }, emergencyPrices, orderType, config.leverage);
+            if (maxDrawdown >= config.maxLegDrawdownPercent) {
+                logger.error(this.tag, `🚨 LIQUIDATION TRIGGERED on ${symbol}`);
+                const bSpr = calculateOpenSpread(emergencyPrices, 'buy');
+                const sSpr = calculateOpenSpread(emergencyPrices, 'sell');
+                await this.executeClose(symbol, state, 'liquidation', emergencyPrices, bSpr, sSpr);
+                return;
+            }
         }
 
         // ==== PROFIT CHECK ====
-        const currentPnL = calculateTruePnL({ pOpen, sOpen }, prices, orderType);
-
-        if (currentPnL < config.closeThreshold) return;
-
-        await this.executeClose(symbol, state, 'profit', prices, currentBuySpread, currentSellSpread);
+        if (strictPrices) {
+            const currentPnL = calculateTruePnL({ pOpen, sOpen }, strictPrices, orderType);
+            if (currentPnL >= config.closeThreshold) {
+                const bSpr = calculateOpenSpread(strictPrices, 'buy');
+                const sSpr = calculateOpenSpread(strictPrices, 'sell');
+                await this.executeClose(symbol, state, 'profit', strictPrices, bSpr, sSpr);
+            }
+        }
     }
 
     private async executeClose(
@@ -476,63 +490,62 @@ export class Trader {
         logger.info(this.tag, `🟢 CLOSING ${symbol} (${orderType}), reason: ${reason}`);
 
         try {
-            const binanceCloseSide = orderType === 'buy' ? 'sell' : 'buy';
-            const bybitCloseSide = orderType === 'buy' ? 'buy' : 'sell';
+            const primaryCloseSide = orderType === 'buy' ? 'sell' : 'buy';
+            const secondaryCloseSide = orderType === 'buy' ? 'buy' : 'sell';
 
-            let bPrice = 0, yPrice = 0, bOrder = 'already_closed', yOrder = 'already_closed';
+            let pPrice = 0, sPrice = 0, pOrder = 'already_closed', sOrder = 'already_closed';
             let closeCommission = 0;
 
             // ---- 1. Check current positions to make closing idempotent ----
-            const bPositions = await (this.binanceClient as any).ccxtInstance.fetchPositions([symbol]);
-            const yPositions = await (this.bybitClient as any).ccxtInstance.fetchPositions([symbol]);
+            const pPositions = await (this.primaryClient as any).ccxtInstance.fetchPositions([symbol]);
+            const sPositions = await (this.secondaryClient as any).ccxtInstance.fetchPositions([symbol]);
 
-            const bPos = bPositions.find((p: any) => p.symbol === symbol && Math.abs(Number(p.contracts ?? 0)) > 0);
-            const yPos = yPositions.find((p: any) => p.symbol === symbol && Math.abs(Number(p.contracts ?? 0)) > 0);
+            const pPos = pPositions.find((p: any) => p.symbol === symbol && Math.abs(Number(p.contracts ?? p.amount ?? 0)) > 0);
+            const sPos = sPositions.find((p: any) => p.symbol === symbol && Math.abs(Number(p.contracts ?? p.amount ?? 0)) > 0);
 
-            const bSize = bPos ? Math.abs(Number(bPos.contracts ?? 0)) : 0;
-            const ySize = yPos ? Math.abs(Number(yPos.contracts ?? 0)) : 0;
+            const pSize = pPos ? Math.abs(Number(pPos.contracts ?? pPos.amount ?? 0)) : 0;
+            const sSize = sPos ? Math.abs(Number(sPos.contracts ?? sPos.amount ?? 0)) : 0;
 
             const info = this.marketInfo.getInfo(symbol);
             const minQty = info?.minQty || 0;
 
             // ---- 2. Execute missing closures ONLY ----
             const closePromises = [];
+            const pOpen = parseFloat(trade.primary_open_price as any);
+            const sOpen = parseFloat(trade.secondary_open_price as any);
 
-            if (bSize > 0 && bSize >= minQty) {
+            if (pSize > 0 && pSize >= minQty) {
                 closePromises.push(
-                    this.binanceClient.createMarketOrder(symbol, binanceCloseSide, bSize, { reduceOnly: true }).then(r => {
-                        bPrice = r.avgPrice;
-                        bOrder = r.orderId;
+                    this.primaryClient.createMarketOrder(symbol, primaryCloseSide, pSize, { reduceOnly: true }).then(r => {
+                        pPrice = r.avgPrice;
+                        pOrder = r.orderId;
                         closeCommission += r.commission;
                     })
                 );
             } else {
-                bPrice = parseFloat(trade.primary_open_price as any); // Fallback for reporting
+                pPrice = primaryCloseSide === 'buy' ? (prices?.primaryAsk ?? pOpen) : (prices?.primaryBid ?? pOpen);
             }
 
-            if (ySize > 0 && ySize >= minQty) {
+            if (sSize > 0 && sSize >= minQty) {
                 closePromises.push(
-                    this.bybitClient.createMarketOrder(symbol, bybitCloseSide, ySize, { reduceOnly: true }).then(r => {
-                        yPrice = r.avgPrice;
-                        yOrder = r.orderId;
+                    this.secondaryClient.createMarketOrder(symbol, secondaryCloseSide, sSize, { reduceOnly: true }).then(r => {
+                        sPrice = r.avgPrice;
+                        sOrder = r.orderId;
                         closeCommission += r.commission;
                     })
                 );
             } else {
-                yPrice = parseFloat(trade.secondary_open_price as any); // Fallback for reporting
+                sPrice = secondaryCloseSide === 'buy' ? (prices?.secondaryAsk ?? sOpen) : (prices?.secondaryBid ?? sOpen);
             }
 
             await Promise.all(closePromises);
 
-            const pOpen = parseFloat(trade.primary_open_price as any);
-            const sOpen = parseFloat(trade.secondary_open_price as any);
-
-            // ---- Fallback for Bybit testnet/market order 0.00 bug on exit ----
-            if (bPrice === 0 && bSize > 0) {
-                bPrice = binanceCloseSide === 'buy' ? (prices?.primaryAsk ?? pOpen) : (prices?.primaryBid ?? pOpen);
+            // ---- Fallback for execution bugs on exit ----
+            if (pPrice === 0 && pSize > 0) {
+                pPrice = primaryCloseSide === 'buy' ? (prices?.primaryAsk ?? pOpen) : (prices?.primaryBid ?? pOpen);
             }
-            if (yPrice === 0 && ySize > 0) {
-                yPrice = bybitCloseSide === 'buy' ? (prices?.secondaryAsk ?? sOpen) : (prices?.secondaryBid ?? sOpen);
+            if (sPrice === 0 && sSize > 0) {
+                sPrice = secondaryCloseSide === 'buy' ? (prices?.secondaryAsk ?? sOpen) : (prices?.secondaryBid ?? sOpen);
             }
 
             // ---- 3. Calculate Results & Update Django ----
@@ -540,10 +553,10 @@ export class Trader {
             const openCommission = parseFloat(trade.open_commission as any) || 0;
             const totalCommission = openCommission + closeCommission;
             const { profitUsdt, profitPercentage } = calculateRealPnL(
-                pOpen, sOpen, bPrice, yPrice, amount, orderType, totalCommission,
+                pOpen, sOpen, pPrice, sPrice, amount, orderType, totalCommission,
             );
 
-            const closeSpread = this.calculateCloseSpread(bPrice, yPrice, orderType);
+            const closeSpread = this.calculateCloseSpread(pPrice, sPrice, orderType);
             const closeStatus = reason === 'profit' ? 'closed' : 'force_closed';
 
             try {
@@ -554,10 +567,10 @@ export class Trader {
                         await api.closeTrade(trade.id, {
                             status: closeStatus as 'closed' | 'force_closed',
                             close_reason: reason === 'liquidation' ? 'error' as any : reason,
-                            primary_close_price: d(bPrice),
-                            secondary_close_price: d(yPrice),
-                            primary_close_order_id: bOrder,
-                            secondary_close_order_id: yOrder,
+                            primary_close_price: d(pPrice),
+                            secondary_close_price: d(sPrice),
+                            primary_close_order_id: pOrder,
+                            secondary_close_order_id: sOrder,
                             close_spread: d(closeSpread, 4),
                             close_commission: d(closeCommission, 6),
                             profit_usdt: d(profitUsdt, 6),
@@ -599,10 +612,10 @@ export class Trader {
 
     private calculateCloseSpread(primaryPrice: number, secondaryPrice: number, orderType: 'buy' | 'sell'): number {
         if (orderType === 'buy') {
-            // Close: sell Binance (pBid), buy Bybit (sAsk) → (pBid - sAsk) / sAsk
+            // Close: sell Primary (pBid), buy Secondary (sAsk) → (pBid - sAsk) / sAsk
             return ((primaryPrice - secondaryPrice) / secondaryPrice) * 100;
         } else {
-            // Close: buy Binance (pAsk), sell Bybit (sBid) → (sBid - pAsk) / pAsk
+            // Close: buy Primary (pAsk), sell Secondary (sBid) → (sBid - pAsk) / pAsk
             return ((secondaryPrice - primaryPrice) / primaryPrice) * 100;
         }
     }

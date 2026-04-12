@@ -3,6 +3,9 @@ import { config } from './config.js';
 import { logger } from './utils/logger.js';
 import { BinanceClient } from './exchanges/binance-client.js';
 import { BybitClient } from './exchanges/bybit-client.js';
+import { MexcClient } from './exchanges/mexc-client.js';
+import { GateClient } from './exchanges/gate-client.js';
+import type { IExchangeClient } from './exchanges/exchange-client.js';
 import { MarketInfoService } from './services/market-info.js';
 import { Trader, TradeCounter } from './classes/Trader.js';
 import { api } from './services/api.js';
@@ -19,10 +22,28 @@ async function bootstrap() {
     logger.info(TAG, `  Open Threshold: ${config.openThreshold}%, Close Threshold: ${config.closeThreshold}%`);
     logger.info(TAG, '═══════════════════════════════════════════');
 
-    // 1. Create REST exchange clients (for trading + setup)
-    logger.info(TAG, 'Creating exchange clients...');
-    const binanceClient = new BinanceClient();
-    const bybitClient = new BybitClient();
+    // 1. Create REST exchange clients dynamically based on config
+    logger.info(TAG, `Initializing exchanges... Primary: ${config.primaryExchange}, Secondary: ${config.secondaryExchange}`);
+
+    const createClient = (name: string): IExchangeClient => {
+        switch (name.toLowerCase()) {
+            case 'binance': return new BinanceClient();
+            case 'bybit': return new BybitClient();
+            case 'mexc': return new MexcClient();
+            case 'gate': return new GateClient();
+            default:
+                logger.error(TAG, `Unknown exchange: ${name}`);
+                process.exit(1);
+        }
+    };
+
+    const primaryClient = createClient(config.primaryExchange);
+    const secondaryClient = createClient(config.secondaryExchange);
+
+    if (config.primaryExchange === config.secondaryExchange) {
+        logger.error(TAG, 'Primary and secondary exchanges MUST be different.');
+        process.exit(1);
+    }
 
     // Measure ping
     try {
@@ -31,45 +52,51 @@ async function bootstrap() {
         // Warmup requests to establish DNS, TCP handshakes, and TLS negotiation
         // The first HTTP request always takes 500-1000ms just to establish secure encryption.
         await Promise.all([
-            binanceClient.ccxtInstance.fetchTime(),
-            bybitClient.ccxtInstance.fetchTime()
+            primaryClient.ccxtInstance.fetchTime().catch(() => {}),
+            secondaryClient.ccxtInstance.fetchTime().catch(() => {})
         ]);
 
         // True Application Ping (reusing the established Keep-Alive sockets)
         const [bStart, yStart] = [Date.now(), Date.now()];
 
         await Promise.all([
-            binanceClient.ccxtInstance.fetchTime().then(() => {
+            primaryClient.ccxtInstance.fetchTime().then(() => {
                 const ping = Date.now() - bStart;
-                logger.info(TAG, `📡 Binance Latency: ${ping} ms`);
-            }),
-            bybitClient.ccxtInstance.fetchTime().then(() => {
+                logger.info(TAG, `📡 ${primaryClient.name} Latency: ${ping} ms`);
+            }).catch(() => logger.warn(TAG, `Failed to measure latency for ${primaryClient.name}`)),
+            secondaryClient.ccxtInstance.fetchTime().then(() => {
                 const ping = Date.now() - yStart;
-                logger.info(TAG, `📡 Bybit Latency: ${ping} ms`);
-            })
+                logger.info(TAG, `📡 ${secondaryClient.name} Latency: ${ping} ms`);
+            }).catch(() => logger.warn(TAG, `Failed to measure latency for ${secondaryClient.name}`))
         ]);
     } catch (e: any) {
         logger.warn(TAG, `Failed to measure latency: ${e.message}`);
     }
 
     // 2. Load markets via REST
-    logger.info(TAG, 'Loading markets from Binance and Bybit...');
+    logger.info(TAG, `Loading markets from ${primaryClient.name} and ${secondaryClient.name}...`);
     await Promise.all([
-        binanceClient.loadMarkets(),
-        bybitClient.loadMarkets(),
+        primaryClient.loadMarkets(),
+        secondaryClient.loadMarkets(),
     ]);
 
     // 3. Find common USDT linear perpetual markets
-    const binanceSymbols = new Set(binanceClient.getUsdtSymbols());
-    const bybitSymbols = bybitClient.getUsdtSymbols();
-    let commonSymbols = bybitSymbols.filter(sym => binanceSymbols.has(sym));
+    const primarySymbols = new Set(primaryClient.getUsdtSymbols());
+    const secondarySymbols = secondaryClient.getUsdtSymbols();
+    let commonSymbols = secondarySymbols.filter(sym => primarySymbols.has(sym));
 
     logger.info(TAG, `Found ${commonSymbols.length} intersecting USDT futures pairs.`);
 
-    logger.info(TAG, 'Fetching 24h volume to determine top 100 liquid pairs...');
+    logger.info(TAG, `Fetching 24h volume to determine top ${config.topLiquidPairsCount} liquid pairs...`);
     try {
-        const tickers = await binanceClient.ccxtInstance.fetchTickers(commonSymbols);
+        const tickers = await primaryClient.ccxtInstance.fetchTickers();
         
+        // 🟢 EXCLUDE SHITCOINS: Require minimum $2,000,000 24h volume
+        commonSymbols = commonSymbols.filter(sym => {
+            const vol = tickers[sym]?.quoteVolume || 0;
+            return vol >= 2_000_000; 
+        });
+
         // Sort commonSymbols by quoteVolume descending
         commonSymbols.sort((a, b) => {
             const volA = tickers[a]?.quoteVolume || 0;
@@ -79,7 +106,7 @@ async function bootstrap() {
 
         const TOP_LIMIT = config.topLiquidPairsCount;
         commonSymbols = commonSymbols.slice(0, TOP_LIMIT);
-        logger.info(TAG, `Filtered down to top ${commonSymbols.length} most liquid pairs based on Binance 24h USDT volume.`);
+        logger.info(TAG, `Filtered down to top ${commonSymbols.length} most liquid pairs based on ${primaryClient.name} 24h USDT volume.`);
     } catch (e: any) {
         logger.warn(TAG, `Failed to fetch volume data, proceeding with all ${commonSymbols.length} pairs. Error: ${e.message}`);
     }
@@ -91,7 +118,7 @@ async function bootstrap() {
 
     // 4. Pre-load market info and calculate unified trade amounts (BEFORE any trading)
     const marketInfo = new MarketInfoService();
-    const tradeableSymbols = await marketInfo.initialize(binanceClient, bybitClient, commonSymbols);
+    const tradeableSymbols = await marketInfo.initialize(primaryClient, secondaryClient, commonSymbols);
 
     if (tradeableSymbols.length === 0) {
         logger.error(TAG, 'No tradeable symbols after market info validation. Exiting.');
@@ -106,10 +133,10 @@ async function bootstrap() {
     const finalTradeableSymbols: string[] = [];
 
     const setupSymbol = async (symbol: string) => {
-        // Run Binance and Bybit branches completely in parallel
+        // Run Primary and Secondary branches completely in parallel
         await Promise.all([
-            binanceClient.setIsolatedMargin(symbol).then(() => binanceClient.setLeverage(symbol, config.leverage)),
-            bybitClient.setIsolatedMargin(symbol).then(() => bybitClient.setLeverage(symbol, config.leverage))
+            primaryClient.setIsolatedMargin(symbol).then(() => primaryClient.setLeverage(symbol, config.leverage)),
+            secondaryClient.setIsolatedMargin(symbol).then(() => secondaryClient.setLeverage(symbol, config.leverage))
         ]);
     };
 
@@ -140,18 +167,25 @@ async function bootstrap() {
     logger.info(TAG, `Leverage/margin setup complete. Successful pairs: ${finalTradeableSymbols.length}. Excluded pairs: ${leverageErrors}.`);
     // 6. Create SHARED pro exchange instances for WebSocket (single WS connection each)
     logger.info(TAG, 'Creating WebSocket instances...');
-    const wsBinance = new pro.binanceusdm({
-        ...(config.useTestnet && { sandbox: true }),
-    });
-    const wsBybit = new pro.bybit({
-        ...(config.useTestnet && { sandbox: true }),
-        options: { defaultType: 'swap' },
-    });
+
+    const createWsClient = (name: string): any => {
+        const isTestnet = config.useTestnet;
+        switch (name.toLowerCase()) {
+            case 'binance': return new pro.binanceusdm({ ...(isTestnet && { sandbox: true }) });
+            case 'bybit': return new pro.bybit({ ...(isTestnet && { sandbox: true }), options: { defaultType: 'swap' } });
+            case 'mexc': return new pro.mexc({ ...(isTestnet && { sandbox: true }), options: { defaultType: 'swap' } });
+            case 'gate': return new pro.gate({ ...(isTestnet && { sandbox: true }), options: { defaultType: 'swap' } });
+            default: throw new Error(`WS client not implemented for ${name}`);
+        }
+    };
+
+    const wsPrimary = createWsClient(config.primaryExchange);
+    const wsSecondary = createWsClient(config.secondaryExchange);
 
     // Pre-load markets on WS instances
     await Promise.all([
-        wsBinance.loadMarkets(),
-        wsBybit.loadMarkets(),
+        wsPrimary.loadMarkets(),
+        wsSecondary.loadMarkets(),
     ]);
     logger.info(TAG, 'WebSocket markets loaded. Ready to stream.');
 
@@ -174,8 +208,8 @@ async function bootstrap() {
     const traders: Trader[] = chunks.map((chunk, i) =>
         new Trader(
             i + 1, chunk,
-            wsBinance, wsBybit,
-            binanceClient, bybitClient,
+            wsPrimary, wsSecondary,
+            primaryClient, secondaryClient,
             marketInfo, tradeCounter,
         ),
     );
@@ -209,8 +243,8 @@ async function bootstrap() {
         );
 
         // Close WebSocket connections
-        try { await wsBinance.close(); } catch { /* ignore */ }
-        try { await wsBybit.close(); } catch { /* ignore */ }
+        try { await wsPrimary.close(); } catch { /* ignore */ }
+        try { await wsSecondary.close(); } catch { /* ignore */ }
 
         logger.info(TAG, '✅ All traders stopped. All positions closed. Bye.');
         process.exit(0);

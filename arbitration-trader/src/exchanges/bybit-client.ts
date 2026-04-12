@@ -114,7 +114,7 @@ export class BybitClient implements IExchangeClient {
         let stepSize = 0.001;
         if (market.precision?.amount !== undefined) {
             const prec = Number(market.precision.amount);
-            if (this.exchange.precisionMode === ccxt.TICK_SIZE) {
+            if (this.exchange.precisionMode === (ccxt as any).TICK_SIZE) {
                 stepSize = prec;
             } else {
                 stepSize = Math.pow(10, -prec);

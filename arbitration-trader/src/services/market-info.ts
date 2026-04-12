@@ -18,45 +18,61 @@ export class MarketInfoService {
      * @returns Array of symbols that are tradeable on both exchanges.
      */
     async initialize(
-        binanceClient: IExchangeClient,
-        bybitClient: IExchangeClient,
+        primaryClient: IExchangeClient,
+        secondaryClient: IExchangeClient,
         commonSymbols: string[],
     ): Promise<string[]> {
         logger.info(TAG, `Initializing market info for ${commonSymbols.length} symbols...`);
 
-        // Fetch current prices from Binance to calculate stable reference volume
+        // Fetch current prices to calculate static trade amounts and protect from ticker collisions
         let currentPrices: Record<string, number> = {};
+        let secondaryPrices: Record<string, number> = {};
         try {
-            logger.info(TAG, `Fetching current prices to calculate static trade amounts...`);
-            const tickers = await binanceClient.ccxtInstance.fetchTickers(commonSymbols);
-            for (const sym in tickers) {
-                if (tickers[sym]?.last) {
-                    currentPrices[sym] = tickers[sym].last;
-                }
+            logger.info(TAG, `Fetching current prices for amount calculation and collision protection...`);
+            const [pTickers, sTickers] = await Promise.all([
+                primaryClient.ccxtInstance.fetchTickers(),
+                secondaryClient.ccxtInstance.fetchTickers()
+            ]);
+            for (const sym of commonSymbols) {
+                if (pTickers[sym]?.last) currentPrices[sym] = pTickers[sym].last;
+                if (sTickers[sym]?.last) secondaryPrices[sym] = sTickers[sym].last;
             }
         } catch (e: any) {
-            logger.warn(TAG, `Could not fetch tickers for exact amounts, will use 0 for now: ${e.message}`);
+            logger.warn(TAG, `Could not fetch tickers for exact amounts/collisions: ${e.message}`);
         }
 
         const tradeableSymbols: string[] = [];
 
         for (const symbol of commonSymbols) {
-            const binanceInfo = binanceClient.getMarketInfo(symbol);
-            const bybitInfo = bybitClient.getMarketInfo(symbol);
+            const primaryInfo = primaryClient.getMarketInfo(symbol);
+            const secondaryInfo = secondaryClient.getMarketInfo(symbol);
 
-            if (!binanceInfo || !bybitInfo) {
+            if (!primaryInfo || !secondaryInfo) {
                 logger.debug(TAG, `Skipping ${symbol}: missing market info on one exchange`);
                 continue;
             }
 
             // Use the strictest constraints from both exchanges
-            const stepSize = Math.max(binanceInfo.stepSize, bybitInfo.stepSize);
-            const minQty = Math.max(binanceInfo.minQty, bybitInfo.minQty);
-            const minNotional = Math.max(binanceInfo.minNotional, bybitInfo.minNotional);
+            const stepSize = Math.max(primaryInfo.stepSize, secondaryInfo.stepSize);
+            const minQty = Math.max(primaryInfo.minQty, secondaryInfo.minQty);
+            const minNotional = Math.max(primaryInfo.minNotional, secondaryInfo.minNotional);
 
             let tradeAmount = 0;
             const currentPrice = currentPrices[symbol];
-            
+            const secondaryPrice = secondaryPrices[symbol];
+
+            // ==== Homonym / Ticker Collision Protection ====
+            if (currentPrice && secondaryPrice) {
+                const deviation = Math.abs(currentPrice - secondaryPrice) / Math.min(currentPrice, secondaryPrice);
+                if (deviation > 0.40) {
+                    logger.warn(TAG, `🚨 HOMONYM DETECTED: Skipping ${symbol}. Deviation: ${(deviation * 100).toFixed(0)}%. (${primaryClient.name}: ${currentPrice}, ${secondaryClient.name}: ${secondaryPrice})`);
+                    continue;
+                }
+            } else if (!currentPrice) {
+                logger.debug(TAG, `Skipping ${symbol}: could not determine current price on ${primaryClient.name}`);
+                continue;
+            }
+
             if (currentPrice) {
                 const rawAmount = config.tradeAmountUsdt / currentPrice;
                 // Round DOWN to step size
@@ -72,9 +88,6 @@ export class MarketInfoService {
                 // Clean up float errors, ensuring precision is at least 0
                 const precision = Math.max(0, Math.round(-Math.log10(stepSize)));
                 tradeAmount = parseFloat(tradeAmount.toFixed(precision));
-            } else {
-                logger.debug(TAG, `Skipping ${symbol}: could not determine current price`);
-                continue;
             }
 
             const unified: UnifiedMarketInfo = {
