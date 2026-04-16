@@ -16,6 +16,10 @@ class BotConfig(models.Model):
         SELL = "sell", "Продажа"
         AUTO = "auto", "Авто"
 
+    class TradeMode(models.TextChoices):
+        EMULATOR = "emulator", "Эмулятор"
+        REAL = "real", "Реальная торговля"
+
     owner = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.CASCADE,
@@ -54,11 +58,17 @@ class BotConfig(models.Model):
         choices=OrderType.choices,
         default=OrderType.AUTO,
     )
+    trade_mode = models.CharField(
+        "trade mode",
+        max_length=20,
+        choices=TradeMode.choices,
+        default=TradeMode.EMULATOR,
+    )
     max_trades = models.PositiveIntegerField("max trades", default=10)
-    open_ticks = models.PositiveIntegerField("open ticks", default=1)
-    close_ticks = models.PositiveIntegerField("close ticks", default=1)
     primary_leverage = models.PositiveIntegerField("primary leverage", default=1)
     secondary_leverage = models.PositiveIntegerField("secondary leverage", default=1)
+    trade_on_primary_exchange = models.BooleanField("trade on primary", default=True)
+    trade_on_secondary_exchange = models.BooleanField("trade on secondary", default=True)
     is_active = models.BooleanField("active", default=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)

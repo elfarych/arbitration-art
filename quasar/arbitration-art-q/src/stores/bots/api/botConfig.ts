@@ -9,11 +9,12 @@ export interface BotConfig {
   coin: string;
   coin_amount: number;
   order_type: 'buy' | 'sell' | 'auto';
+  trade_mode: 'emulator' | 'real';
   max_trades: number;
-  open_ticks: number;
-  close_ticks: number;
   primary_leverage: number;
   secondary_leverage: number;
+  trade_on_primary_exchange: boolean;
+  trade_on_secondary_exchange: boolean;
   is_active: boolean;
   created_at: string;
   updated_at: string;

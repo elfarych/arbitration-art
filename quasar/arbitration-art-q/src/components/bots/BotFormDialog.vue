@@ -1,16 +1,16 @@
 <template>
   <q-dialog :model-value="modelValue" @update:model-value="v => emit('update:modelValue', v)" persistent transition-show="scale" transition-hide="scale">
     <q-card style="width: 500px; max-width: 90vw;" class="bg-dark text-text-color">
-      <q-card-section class="row items-center justify-between border-bottom-dark">
+      <q-card-section class="dialog-header border-bottom-dark">
         <div class="text-h6 text-title-color text-weight-bold">{{ isEdit ? 'Редактировать бота' : 'Новый бот' }}</div>
         <q-btn icon="close" flat round dense v-close-popup color="grey-5" />
       </q-card-section>
 
       <q-card-section class="q-pt-md">
-        <q-form @submit.prevent="onSubmit" class="q-gutter-md">
+        <q-form @submit.prevent="onSubmit" class="bot-form">
           
-          <div class="row q-col-gutter-sm">
-            <div class="col-12 col-sm-6">
+          <div class="grid-cols-2">
+            <div>
               <q-select 
                 v-model="form.primary_exchange" 
                 :options="exchangeOptions" 
@@ -19,7 +19,7 @@
                 :rules="[val => !!val || 'Обязательное поле']"
               />
             </div>
-            <div class="col-12 col-sm-6">
+            <div>
               <q-select 
                 v-model="form.secondary_exchange" 
                 :options="exchangeOptions" 
@@ -31,8 +31,8 @@
           </div>
 
           <!-- Валидация монеты -->
-          <div class="row q-col-gutter-sm items-start">
-            <div class="col-8">
+          <div class="grid-cols-coin">
+            <div>
               <q-input 
                 v-model="form.coin" 
                 label="Монета (напр. BTC)" 
@@ -40,7 +40,7 @@
                 :rules="[val => !!val || 'Укажите монету']"
               />
             </div>
-            <div class="col-4">
+            <div>
               <q-btn 
                 color="info" text-color="white" no-caps
                 label="Проверить" 
@@ -53,70 +53,89 @@
           </div>
 
           <div v-if="validationResults.length > 0" class="validation-box q-pa-sm bg-surface border-radius-sm">
-            <div v-for="(v, i) in validationResults" :key="i" class="row items-center q-mb-xs">
+            <div v-for="(v, i) in validationResults" :key="i" class="validation-item q-mb-xs">
               <q-icon :name="v.exists ? 'check_circle' : 'cancel'" :color="v.exists ? 'positive' : 'negative'" class="q-mr-sm" size="xs" />
               <span class="text-caption">{{ exchangeLabels[v.exchange] }}: <span class="text-weight-bold">{{ form.coin }}</span></span>
             </div>
           </div>
 
-          <div class="row q-col-gutter-sm">
-            <div class="col-12 col-sm-6">
+          <div class="grid-cols-2">
+            <div>
               <q-input v-model.number="form.entry_spread" type="number" step="0.001" label="Спред входа (%)" outlined dense dark :rules="[val => val !== null || 'Обязательно']" />
             </div>
-            <div class="col-12 col-sm-6">
+            <div>
                <q-input v-model.number="form.exit_spread" type="number" step="0.001" label="Спред выхода (%)" outlined dense dark :rules="[val => val !== null || 'Обязательно']" />
             </div>
           </div>
 
-          <div class="row q-col-gutter-sm">
-            <div class="col-12">
+          <div class="grid-cols-2">
+            <div>
               <q-input v-model.number="form.coin_amount" type="number" step="0.001" label="Кол-во монет (шт)" outlined dense dark :rules="[val => !!val || 'Обязательно']" @update:model-value="updateEstimated" autocomplete="off" />
               <div v-if="estimatedUsdt > 0" class="text-caption text-positive q-mt-xs text-right">≈ {{ estimatedUsdt.toFixed(2) }} USDT margin</div>
             </div>
-          </div>
-          
-          <div class="row q-col-gutter-sm">
-            <div class="col-12 col-sm-4">
-              <q-input v-model.number="form.max_trades" type="number" label="Max Trades" outlined dense dark />
-            </div>
-            <div class="col-12 col-sm-4">
-              <q-input v-model.number="form.open_ticks" type="number" label="Open Ticks" outlined dense dark />
-            </div>
-            <div class="col-12 col-sm-4">
-              <q-input v-model.number="form.close_ticks" type="number" label="Close Ticks" outlined dense dark />
+            <div>
+              <q-input v-model.number="form.max_trades" type="number" label="Максимальное кол-во сделок" outlined dense dark />
             </div>
           </div>
 
-          <div class="row q-col-gutter-sm">
-            <div class="col-12 col-sm-6">
-              <q-input v-model.number="form.primary_leverage" type="number" label="Плечо (осн)" outlined dense dark />
+          <div class="grid-cols-2">
+            <div>
+              <q-input v-model.number="form.primary_leverage" type="number" :label="`Плечо ${exchangeLabels[form.primary_exchange] || '(осн)'}`" outlined dense dark />
             </div>
-             <div class="col-12 col-sm-6">
-              <q-input v-model.number="form.secondary_leverage" type="number" label="Плечо (вт)" outlined dense dark />
+             <div>
+              <q-input v-model.number="form.secondary_leverage" type="number" :label="`Плечо ${exchangeLabels[form.secondary_exchange] || '(вт)'}`" outlined dense dark />
             </div>
           </div>
 
-          <div class="q-mt-sm">
-            <div class="text-caption opacity-70 q-mb-xs">Тип торговли</div>
-            <q-btn-toggle
-              v-model="form.order_type"
-              spread
-              no-caps
-              toggle-color="primary"
-              color="dark"
-              text-color="grey"
-              toggle-text-color="dark"
-              :options="[
-                {label: 'Покупка', value: 'buy'},
-                {label: 'Продажа', value: 'sell'}
-              ]"
-            />
+          <div class="grid-cols-2 q-mt-sm">
+            <div>
+              <q-toggle v-model="form.trade_on_primary_exchange" :label="`Открывать сделки на ${exchangeLabels[form.primary_exchange] || ''}`" color="positive" dark dense />
+            </div>
+            <div>
+              <q-toggle v-model="form.trade_on_secondary_exchange" :label="`Открывать сделки на ${exchangeLabels[form.secondary_exchange] || ''}`" color="positive" dark dense />
+            </div>
+          </div>
+
+          <div class="grid-cols-2 q-mt-sm">
+            <div>
+              <div class="text-caption opacity-70 q-mb-xs">Режим работы</div>
+              <q-btn-toggle
+                v-model="form.trade_mode"
+                spread
+                no-caps
+                toggle-color="primary"
+                color="dark"
+                text-color="grey"
+                toggle-text-color="dark"
+                :disable="isEdit"
+                :options="[
+                  {label: 'Эмулятор', value: 'emulator'},
+                  {label: 'Торговля', value: 'real'}
+                ]"
+              />
+            </div>
+            <div>
+              <div class="text-caption opacity-70 q-mb-xs">Направление</div>
+              <q-btn-toggle
+                v-model="form.order_type"
+                spread
+                no-caps
+                toggle-color="primary"
+                color="dark"
+                text-color="grey"
+                toggle-text-color="dark"
+                :options="[
+                  {label: 'Покупка', value: 'buy'},
+                  {label: 'Продажа', value: 'sell'}
+                ]"
+              />
+            </div>
           </div>
 
           <q-toggle v-if="isEdit" v-model="form.is_active" label="Активен" color="primary" dark class="q-mt-md" />
 
-          <div class="row justify-end q-mt-lg q-pt-sm border-top-dark">
-            <q-btn flat no-caps label="Отмена" v-close-popup color="grey-3" class="q-mr-sm" />
+          <div class="dialog-actions border-top-dark">
+            <q-btn flat no-caps label="Отмена" v-close-popup color="grey-3" />
             <q-btn type="submit" no-caps :loading="saving" color="primary" text-color="white" label="Сохранить" :disable="!isCoinValid" />
           </div>
 
@@ -170,12 +189,13 @@ const defaultForm: BotConfigPayload = {
   coin_amount: 0,
   entry_spread: 0,
   exit_spread: 0,
-  open_ticks: 3,
-  close_ticks: 3,
   max_trades: 1,
   primary_leverage: 10,
   secondary_leverage: 10,
   order_type: 'buy',
+  trade_mode: 'emulator',
+  trade_on_primary_exchange: true,
+  trade_on_secondary_exchange: true,
   is_active: true
 };
 
@@ -264,6 +284,37 @@ watch(() => props.modelValue, (isOpen) => {
 </script>
 
 <style lang="sass" scoped>
+.bot-form
+  display: grid
+  gap: 16px
+
+.dialog-header
+  display: flex
+  align-items: center
+  justify-content: space-between
+
+.grid-cols-2
+  display: grid
+  grid-template-columns: 1fr 1fr
+  gap: 16px
+
+.grid-cols-coin
+  display: grid
+  grid-template-columns: 2fr 1fr
+  gap: 16px
+  align-items: start
+
+.dialog-actions
+  display: flex
+  justify-content: flex-end
+  gap: 8px
+  margin-top: 24px
+  padding-top: 8px
+
+.validation-item
+  display: flex
+  align-items: center
+
 .border-bottom-dark
   border-bottom: 1px solid $blue-dark
 .border-top-dark

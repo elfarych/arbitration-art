@@ -5,8 +5,16 @@
       <div class="row items-center justify-between q-mb-sm">
         <div class="row items-center">
           <q-badge color="primary" class="q-mr-sm text-weight-bold" style="font-size: 13px">{{ bot.coin }}</q-badge>
-          <q-badge :color="bot.order_type === 'buy' ? 'positive' : 'negative'" text-color="dark" class="text-weight-bold" style="font-size: 11px">
+          <q-badge :color="bot.order_type === 'buy' ? 'positive' : 'negative'" text-color="dark" class="text-weight-bold q-mr-md" style="font-size: 11px">
             {{ bot.order_type === 'buy' ? 'LONG' : 'SHORT' }}
+          </q-badge>
+          <q-badge :color="bot.trade_mode === 'real' ? 'negative' : 'info'" 
+                   text-color="white" 
+                   class="text-weight-bolder q-py-xs q-px-sm shadow-1" 
+                   :class="bot.trade_mode === 'real' ? 'negative-glow' : ''"
+                   style="font-size: 11px; letter-spacing: 0.5px; border: 1px solid rgba(255,255,255,0.2);">
+            <q-icon :name="bot.trade_mode === 'real' ? 'local_fire_department' : 'science'" size="14px" class="q-mr-xs" />
+            {{ bot.trade_mode === 'real' ? 'РЕАЛЬНАЯ ТОРГОВЛЯ' : 'ЭМУЛЯТОР' }}
           </q-badge>
         </div>
         <div class="row items-center">
@@ -607,6 +615,18 @@ onUnmounted(() => {
   color: #ffb300 !important
   text-shadow: 0 0 5px #ffb300, 0 0 10px #ff9800, 0 0 20px #ff5722
   opacity: 1 !important
+
+.negative-glow
+  box-shadow: 0 0 8px rgba(193, 0, 21, 0.6), 0 0 15px rgba(193, 0, 21, 0.4) !important
+  animation: pulse-red 2s infinite
+  
+@keyframes pulse-red
+  0%
+    box-shadow: 0 0 0 0 rgba(193, 0, 21, 0.7)
+  70%
+    box-shadow: 0 0 0 6px rgba(193, 0, 21, 0)
+  100%
+    box-shadow: 0 0 0 0 rgba(193, 0, 21, 0)
 
 .opacity-70
   opacity: 0.7
