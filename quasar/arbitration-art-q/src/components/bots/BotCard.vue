@@ -265,6 +265,7 @@
     <q-card-actions align="right" class="border-top-dark q-pt-sm q-pb-sm">
       <q-btn flat round dense :icon="bot.is_active ? 'pause' : 'play_arrow'" :color="bot.is_active ? 'warning' : 'positive'" @click="emit('toggle', bot)" />
       <q-btn flat round dense icon="history" color="info" @click="showTradesHistory = true" />
+      <q-btn flat round dense icon="stop_circle" color="negative" @click="emit('force-close', bot.id)" title="Принудительно закрыть сделки" />
       <q-btn flat round dense icon="edit" color="primary" @click="emit('edit', bot)" />
       <q-btn flat round dense icon="delete" color="negative" @click="emit('delete', bot.id)" />
     </q-card-actions>
@@ -316,6 +317,7 @@ const emit = defineEmits<{
   (e: 'edit', bot: BotConfig): void;
   (e: 'history', bot: BotConfig): void;
   (e: 'delete', id: number): void;
+  (e: 'force-close', id: number): void;
 }>();
 
 const $q = useQuasar();

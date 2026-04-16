@@ -69,6 +69,8 @@ class BotConfig(models.Model):
     secondary_leverage = models.PositiveIntegerField("secondary leverage", default=1)
     trade_on_primary_exchange = models.BooleanField("trade on primary", default=True)
     trade_on_secondary_exchange = models.BooleanField("trade on secondary", default=True)
+    max_trade_duration_minutes = models.PositiveIntegerField("max trade duration (m)", default=60)
+    max_leg_drawdown_percent = models.FloatField("max leg drawdown %", default=80.0)
     is_active = models.BooleanField("active", default=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)

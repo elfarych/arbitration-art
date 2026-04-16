@@ -132,6 +132,17 @@
             </div>
           </div>
 
+          <q-separator dark class="q-my-md opacity-30" />
+          <div class="text-caption opacity-70 q-mb-sm text-weight-bold">Предохранители / Safety</div>
+          <div class="grid-cols-2">
+            <div>
+              <q-input v-model.number="form.max_trade_duration_minutes" type="number" label="Таймаут (мин)" outlined dense dark />
+            </div>
+            <div>
+              <q-input v-model.number="form.max_leg_drawdown_percent" type="number" step="0.1" label="Просадка ликвидации (%)" outlined dense dark />
+            </div>
+          </div>
+
           <q-toggle v-if="isEdit" v-model="form.is_active" label="Активен" color="primary" dark class="q-mt-md" />
 
           <div class="dialog-actions border-top-dark">
@@ -196,6 +207,8 @@ const defaultForm: BotConfigPayload = {
   trade_mode: 'emulator',
   trade_on_primary_exchange: true,
   trade_on_secondary_exchange: true,
+  max_trade_duration_minutes: 60,
+  max_leg_drawdown_percent: 80.0,
   is_active: true
 };
 

@@ -57,6 +57,15 @@ export const useBotsStore = defineStore('bots', {
       } catch (e) {
         throw e;
       }
+    },
+    async forceCloseBot(id: number) {
+      try {
+        await botConfigApi.forceClose(id);
+        // refresh list to get updated statuses if necessary
+        // or just rely on websocket / refresh
+      } catch (e) {
+        throw e;
+      }
     }
   }
 });

@@ -22,7 +22,8 @@
         @toggle="toggleBot" 
         @edit="openEditDialog" 
         @delete="deleteBot" 
-        @history="openHistory" 
+        @history="openHistory"
+        @force-close="forceCloseBot"
       />
     </div>
 
@@ -99,6 +100,24 @@ const deleteBot = (id: number) => {
       await botsStore.deleteBot(id);
     } catch (e) {
       $q.notify({ color: 'negative', message: 'Не удалось удалить бота' });
+    }
+  });
+};
+
+const forceCloseBot = (id: number) => {
+  $q.dialog({
+    title: 'Отмена сделок',
+    message: 'Принудительно закрыть все открытые сделки этого бота по рынку прямо сейчас?',
+    cancel: true,
+    persistent: true,
+    dark: true,
+    color: 'warning'
+  }).onOk(async () => {
+    try {
+      await botsStore.forceCloseBot(id);
+      $q.notify({ color: 'positive', message: 'Команда на экстренное закрытие отправлена' });
+    } catch (e) {
+      $q.notify({ color: 'negative', message: 'Не удалось отправить команду на закрытие' });
     }
   });
 };

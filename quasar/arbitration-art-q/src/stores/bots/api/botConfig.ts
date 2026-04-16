@@ -15,6 +15,8 @@ export interface BotConfig {
   secondary_leverage: number;
   trade_on_primary_exchange: boolean;
   trade_on_secondary_exchange: boolean;
+  max_trade_duration_minutes: number;
+  max_leg_drawdown_percent: number;
   is_active: boolean;
   created_at: string;
   updated_at: string;
@@ -45,6 +47,10 @@ export const botConfigApi = {
 
   async delete(id: number): Promise<void> {
     await api.delete(`/bots/${id}/`);
+  },
+
+  async forceClose(id: number): Promise<void> {
+    await api.post(`/bots/${id}/force-close/`);
   }
 };
 

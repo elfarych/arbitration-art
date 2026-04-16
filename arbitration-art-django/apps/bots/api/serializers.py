@@ -23,6 +23,8 @@ class BotConfigSerializer(serializers.ModelSerializer):
             "secondary_leverage",
             "trade_on_primary_exchange",
             "trade_on_secondary_exchange",
+            "max_trade_duration_minutes",
+            "max_leg_drawdown_percent",
             "is_active",
             "created_at",
             "updated_at",
