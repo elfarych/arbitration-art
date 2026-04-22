@@ -7,6 +7,13 @@ import type { IExchangeClient } from '../exchanges/exchange-client.js';
 import type { MarketInfoService } from '../services/market-info.js';
 import type { OrderbookPrices, TradeRecord } from '../types/index.js';
 
+/**
+ * Per-symbol mutable runtime state.
+ *
+ * This state lives only inside the Node process. Django is the durable source
+ * for trade records, while this map controls current signal calculation,
+ * cooldowns and re-entrancy protection.
+ */
 interface PairState {
     baselineBuy: number | null;
     baselineSell: number | null;
@@ -60,6 +67,13 @@ export class TradeCounter {
 const COOLDOWN_MS = 30_000; // 30s cooldown after failed order
 const TIMEOUT_CHECK_INTERVAL_MS = 10_000; // Check timeouts every 10s
 
+/**
+ * Watches a chunk of symbols and executes arbitrage trades for that chunk.
+ *
+ * Multiple Trader instances share the same exchange websocket clients, REST
+ * clients, market-info cache and TradeCounter. Each Trader owns independent
+ * PairState objects for its assigned symbols.
+ */
 export class Trader {
     private tag: string;
     private isRunning = true;
@@ -77,6 +91,8 @@ export class Trader {
         private tradeCounter: TradeCounter,
     ) {
         this.tag = `Trader-${id}`;
+        // Pre-create state for every symbol so runtime checks can use direct
+        // Map lookups without creating state while websocket callbacks are active.
         for (const sym of symbols) {
             this.states.set(sym, {
                 baselineBuy: null,
@@ -97,6 +113,8 @@ export class Trader {
             const sym = trade.coin;
             const state = this.states.get(sym);
             if (state && !state.activeTrade) {
+                // Reserve a global slot because restored trades already occupy
+                // real exchange exposure and must count toward concurrency.
                 state.activeTrade = trade;
                 state.openedAtMs = new Date(trade.opened_at).getTime();
                 this.tradeCounter.forceReserve();
@@ -112,11 +130,14 @@ export class Trader {
     public async start(): Promise<void> {
         logger.info(this.tag, `Starting loops for ${this.symbols.length} pairs...`);
 
-        // Start the timeout watchdog
+        // Start the timeout watchdog separately from websocket ticks so positions
+        // can be closed even when a symbol stops receiving frequent book updates.
         this.timeoutTimer = setInterval(() => this.checkTimeouts(), TIMEOUT_CHECK_INTERVAL_MS);
 
         const loops: Promise<void>[] = [];
         for (const symbol of this.symbols) {
+            // Every symbol is watched on both exchanges. watchLoop reads the
+            // latest orderbook from ccxt.pro's internal cache after each update.
             loops.push(this.watchLoop(this.primaryWs, symbol, this.primaryClient.name));
             loops.push(this.watchLoop(this.secondaryWs, symbol, this.secondaryClient.name));
         }
@@ -136,6 +157,8 @@ export class Trader {
         }
 
         if (closePositions) {
+            // Used during graceful shutdown to flatten all active positions before
+            // the process exits.
             await this.closeAllPositions('shutdown');
         }
 
@@ -154,6 +177,8 @@ export class Trader {
                 await this.checkSpreads(symbol);
             } catch (e: any) {
                 consecutiveErrors++;
+                // Backoff prevents a bad websocket subscription from spinning
+                // hot and flooding logs.
                 const delay = Math.min(2000 * consecutiveErrors, 30000);
                 logger.error(this.tag, `WS error ${exName} ${symbol} (attempt ${consecutiveErrors}): ${e.message}`);
                 await new Promise(r => setTimeout(r, delay));
@@ -162,6 +187,8 @@ export class Trader {
     }
 
     private getPrices(symbol: string, targetCoinsFallback?: number, isEmergency: boolean = false): OrderbookPrices | null {
+        // ccxt.pro keeps orderbooks in memory on the exchange instance. Both
+        // primary and secondary books must have at least one bid and ask.
         const bOb = (this.primaryWs as any).orderbooks?.[symbol];
         const yOb = (this.secondaryWs as any).orderbooks?.[symbol];
 
@@ -173,16 +200,19 @@ export class Trader {
         }
 
         const info = this.marketInfo.getInfo(symbol);
-        // If volume evaluates to 0, calculateVWAP gracefully falls back to absolute Top of Book
+        // Entry uses the precomputed static trade amount; close uses the exact
+        // recorded trade amount passed as targetCoinsFallback.
         const targetCoins = targetCoinsFallback ?? info?.tradeAmount ?? 0;
 
+        // Use VWAP rather than best bid/ask so signal calculations include depth
+        // needed to fill the configured trade amount.
         const pBid = calculateVWAP(bOb.bids, targetCoins, isEmergency);
         const pAsk = calculateVWAP(bOb.asks, targetCoins, isEmergency);
         const sBid = calculateVWAP(yOb.bids, targetCoins, isEmergency);
         const sAsk = calculateVWAP(yOb.asks, targetCoins, isEmergency);
 
         if (isNaN(pBid) || isNaN(pAsk) || isNaN(sBid) || isNaN(sAsk)) {
-            // Not enough liquidity in the depth to fill even this target size
+            // Not enough visible liquidity to fill this target size.
             logger.debug(this.tag, `📉 Insufficient depth on ${symbol} to fill ${targetCoins} coins. isEmergency: ${isEmergency}`);
             return null;
         }
@@ -199,6 +229,8 @@ export class Trader {
 
     private async checkSpreads(symbol: string) {
         const state = this.states.get(symbol)!;
+        // Both websocket loops can call checkSpreads for the same symbol. The
+        // busy flag prevents duplicate open/close operations.
         if (state.busy) return;
 
         const info = this.marketInfo.getInfo(symbol);
@@ -208,42 +240,46 @@ export class Trader {
         let targetCoins: number;
 
         if (isClosing) {
-            // If in trade, use exact closing volume.
+            // If in trade, use exact closing volume from Django.
             targetCoins = parseFloat(state.activeTrade!.amount as any);
         } else {
-            // Dynamic lot sizing based on current best bid
+            // Dynamic lot sizing based on current primary best bid and configured
+            // USDT budget.
             const bOb = (this.primaryWs as any).orderbooks?.[symbol];
             const currentPrice = bOb?.bids?.[0]?.[0];
             if (!currentPrice) return;
 
             const rawAmount = config.tradeAmountUsdt / currentPrice;
-            // Floor using stepSize with floating point error compensation
+            // Floor using stepSize with floating-point error compensation.
             let amount = Math.floor((rawAmount / info.stepSize) + 1e-9) * info.stepSize;
             const precision = Math.max(0, Math.round(-Math.log10(info.stepSize)));
             targetCoins = parseFloat(amount.toFixed(precision));
 
             if (targetCoins < info.minQty || (targetCoins * currentPrice) < info.minNotional) {
-                // Not enough budget to meet exchange layout requirements, wait for price change
+                // Not enough budget to meet exchange lot/notional requirements.
                 return;
             }
         }
         
         if (isClosing) {
-            // ==== 2. IN TRADE: monitor PnL for exit ====
+            // While a trade is active, do not evaluate entries. Monitor exit
+            // conditions using strict prices for profit and emergency prices for
+            // risk exits.
             const strictPrices = this.getPrices(symbol, targetCoins, false);
             const emergencyPrices = this.getPrices(symbol, targetCoins, true);
             await this.checkExit(symbol, state, strictPrices, emergencyPrices);
             return;
         }
 
-        // ==== 3. IDLE: look for entry ====
+        // Idle state: look for entry.
         const prices = this.getPrices(symbol, targetCoins, false);
         if (!prices) return;
 
         const currentBuySpread = calculateOpenSpread(prices, 'buy');
         const currentSellSpread = calculateOpenSpread(prices, 'sell');
 
-        // ==== 1. BASELINE EMA ====
+        // Baseline EMA tracks normal spread level per direction. Entries require
+        // spread expansion above baseline plus OPEN_THRESHOLD.
         const EMA_ALPHA = 0.002;
 
         if (state.baselineBuy === null) {
@@ -258,11 +294,10 @@ export class Trader {
             state.baselineSell = state.baselineSell * (1 - EMA_ALPHA) + currentSellSpread * EMA_ALPHA;
         }
 
-        // ==== 3. IDLE: look for entry ====
-        // Check global concurrent limit (read-only peek)
+        // Check global concurrent limit first as a cheap read-only guard.
         if (!this.tradeCounter.canOpen()) return;
 
-        // Check cooldown
+        // Cooldown prevents immediate re-entry after failed orders/cleanup.
         if (Date.now() < state.cooldownUntil) return;
 
         if (currentBuySpread >= state.baselineBuy + config.openThreshold) {
@@ -288,7 +323,8 @@ export class Trader {
         state.busy = true;
 
         try {
-            // Reserve a slot atomically
+            // Reserve a global slot atomically. This closes a race where multiple
+            // symbols pass canOpen() before any one of them opens.
             if (!this.tradeCounter.reserve()) {
                 logger.debug(this.tag, `Skipping ${symbol}: concurrent trade limit reached just now`);
                 return;
@@ -298,11 +334,12 @@ export class Trader {
 
             logger.info(this.tag, `🔴 OPENING ${symbol} (${orderType}), amount: ${amount}, spread: ${spread.toFixed(3)}%`);
 
-            // Determine order sides for each exchange
+            // Determine order sides for each exchange.
             const primarySide = orderType === 'buy' ? 'buy' : 'sell';
             const secondarySide = orderType === 'buy' ? 'sell' : 'buy';
 
-            // Execute both orders concurrently using Promise.allSettled for atomicity safety
+            // Execute both legs concurrently to reduce legging risk. allSettled
+            // lets us inspect partial success and flatten any filled leg.
             const [pSettled, sSettled] = await Promise.allSettled([
                 this.primaryClient.createMarketOrder(symbol, primarySide, amount),
                 this.secondaryClient.createMarketOrder(symbol, secondarySide, amount),
@@ -311,10 +348,11 @@ export class Trader {
             if (pSettled.status === 'rejected' || sSettled.status === 'rejected') {
                 logger.error(this.tag, `❌ Atomic execution failed for ${symbol}! Reverting successful legs...`);
                 
-                // Rollback the leg that ACTUALLY opened
+                // Roll back the leg that actually opened.
                 if (pSettled.status === 'fulfilled') {
                     const revSide = primarySide === 'buy' ? 'sell' : 'buy';
-                    // ReduceOnly is critical to avoid opening a new opposite margin position!
+                    // reduceOnly is critical to avoid opening a new opposite
+                    // margin position during rollback.
                     await this.primaryClient.createMarketOrder(symbol, revSide, pSettled.value.filledQty, { reduceOnly: true }).catch(console.error);
                 }
                 if (sSettled.status === 'fulfilled') {
@@ -322,25 +360,28 @@ export class Trader {
                     await this.secondaryClient.createMarketOrder(symbol, revSide, sSettled.value.filledQty, { reduceOnly: true }).catch(console.error);
                 }
 
-                // Insurance policy against Network Timeout (order fulfilled but API crashed)
+                // Insurance against network timeout: an order may have filled
+                // even if the API call rejected before returning its response.
                 await new Promise(r => setTimeout(r, 1000)); 
                 await this.handleOpenCleanup(symbol, orderType);
 
                 this.tradeCounter.release();
                 state.cooldownUntil = Date.now() + COOLDOWN_MS;
-                return; // Graceful bail out
+                return;
             }
 
             const primaryResult = pSettled.value;
             const secondaryResult = sSettled.value;
 
-            // Fallback for Bybit APIs that sometimes return 0.00 as execution price for Instant Market Orders
+            // Some exchange APIs initially return 0.00 average price for instant
+            // market orders. Fall back to pre-order VWAP for persistence.
             const pPriceSafe = primaryResult.avgPrice > 0 ? primaryResult.avgPrice : (primarySide === 'buy' ? prices.primaryAsk : prices.primaryBid);
             const sPriceSafe = secondaryResult.avgPrice > 0 ? secondaryResult.avgPrice : (secondarySide === 'buy' ? prices.secondaryAsk : prices.secondaryBid);
 
             const totalCommission = d(primaryResult.commission + secondaryResult.commission, 6);
 
-            // 🟢 Calculate real spread factoring in market order slippage
+            // Recalculate spread from actual fill prices to include market order
+            // slippage.
             let realOpenSpread = spread;
             if (pPriceSafe > 0 && sPriceSafe > 0) {
                 realOpenSpread = orderType === 'buy'
@@ -348,7 +389,8 @@ export class Trader {
                     : ((pPriceSafe - sPriceSafe) / sPriceSafe) * 100;
             }
 
-            // Record trade in Django with actual fill data
+            // Record trade in Django with actual fill data. The local slot remains
+            // reserved until executeClose releases it.
             const tradeRecord = await api.openTrade({
                 coin: symbol,
                 primary_exchange: `${this.primaryClient.name.toLowerCase()}_futures`,
@@ -367,18 +409,18 @@ export class Trader {
 
             state.activeTrade = tradeRecord;
             state.openedAtMs = Date.now();
-            // Note: slot is naturally held until close.
 
             logger.info(this.tag, `✅ Opened ${symbol} (${orderType}). DB ID: ${tradeRecord.id}, ${this.primaryClient.name}: ${pPriceSafe}, ${this.secondaryClient.name}: ${sPriceSafe}`);
 
         } catch (e: any) {
             logger.error(this.tag, `❌ Failed to open ${symbol}: ${e.message}`);
 
-            // ATOMIC SAFETY: If an order failed, or if Django API failed after orders were placed,
-            // we must close any opened positions to avoid naked exposure.
+            // Atomic safety: if an order failed, or if Django API failed after
+            // orders were placed, close any opened positions to avoid naked
+            // exposure.
             await this.handleOpenCleanup(symbol, orderType);
 
-            this.tradeCounter.release(); // release slot on fail
+            this.tradeCounter.release();
             state.baselineBuy = null;
             state.baselineSell = null;
             state.cooldownUntil = Date.now() + COOLDOWN_MS;
@@ -394,15 +436,16 @@ export class Trader {
     private async handleOpenCleanup(symbol: string, orderType: 'buy' | 'sell') {
         logger.warn(this.tag, `⚠️ Cleanup triggered for ${symbol}. Checking for dangling positions...`);
 
-        // We check positions on both exchanges and close any open ones.
+        // Query both exchanges rather than trusting local promise results. This
+        // covers the case where an API request times out after the exchange filled.
         const info = this.marketInfo.getInfo(symbol);
         const minQty = info?.minQty || 0;
         try {
-            // Try closing any position that might have been opened on Primary
+            // Try closing any position that might have been opened on primary.
             try {
                 const primaryPositions = await (this.primaryClient as any).ccxtInstance.fetchPositions([symbol]);
                 for (const pos of primaryPositions) {
-                    if (pos.symbol !== symbol) continue; // Defense against CCXT bug sending all symbols
+                    if (pos.symbol !== symbol) continue;
 
                     const size = Math.abs(Number(pos.contracts ?? pos.amount ?? 0));
                     if (size > 0 && size >= minQty) {
@@ -415,11 +458,11 @@ export class Trader {
                 logger.error(this.tag, `Failed to clean up ${this.primaryClient.name} position for ${symbol}: ${err.message}`);
             }
 
-            // Try closing any position that might have been opened on Secondary
+            // Try closing any position that might have been opened on secondary.
             try {
                 const secondaryPositions = await (this.secondaryClient as any).ccxtInstance.fetchPositions([symbol]);
                 for (const pos of secondaryPositions) {
-                    if (pos.symbol !== symbol) continue; // Defense against CCXT bug sending all symbols
+                    if (pos.symbol !== symbol) continue;
 
                     const size = Math.abs(Number(pos.contracts ?? pos.amount ?? 0));
                     if (size > 0 && size >= minQty) {
@@ -450,7 +493,8 @@ export class Trader {
         const sOpen = parseFloat(trade.secondary_open_price as any);
         const orderType = trade.order_type as 'buy' | 'sell';
 
-        // ==== LIQUIDATION PROTECTION ====
+        // Liquidation protection is checked with emergency prices so lack of full
+        // visible depth does not block a risk exit.
         if (emergencyPrices) {
             const maxDrawdown = checkLegDrawdown({ pOpen, sOpen }, emergencyPrices, orderType, config.leverage);
             if (maxDrawdown >= config.maxLegDrawdownPercent) {
@@ -462,7 +506,8 @@ export class Trader {
             }
         }
 
-        // ==== PROFIT CHECK ====
+        // Profit check requires strict full-depth pricing. If strictPrices is
+        // null, skip profit-taking until the book can support the whole size.
         if (strictPrices) {
             const currentPnL = calculateTruePnL({ pOpen, sOpen }, strictPrices, orderType);
             if (currentPnL >= config.closeThreshold) {
@@ -481,6 +526,8 @@ export class Trader {
         currentBuySpread?: number,
         currentSellSpread?: number,
     ) {
+        // Close can be triggered by profit target, timeout, shutdown or drawdown.
+        // Keep local state until exchange close and Django update both complete.
         if (state.busy) return;
         state.busy = true;
 
@@ -496,7 +543,8 @@ export class Trader {
             let pPrice = 0, sPrice = 0, pOrder = 'already_closed', sOrder = 'already_closed';
             let closeCommission = 0;
 
-            // ---- 1. Check current positions to make closing idempotent ----
+            // 1. Check current positions to make closing idempotent. If one leg is
+            // already flat, only close the remaining leg and record fallback price.
             const pPositions = await (this.primaryClient as any).ccxtInstance.fetchPositions([symbol]);
             const sPositions = await (this.secondaryClient as any).ccxtInstance.fetchPositions([symbol]);
 
@@ -509,7 +557,8 @@ export class Trader {
             const info = this.marketInfo.getInfo(symbol);
             const minQty = info?.minQty || 0;
 
-            // ---- 2. Execute missing closures ONLY ----
+            // 2. Execute missing closures only. This avoids flipping positions if
+            // a previous close attempt partially succeeded.
             const closePromises = [];
             const pOpen = parseFloat(trade.primary_open_price as any);
             const sOpen = parseFloat(trade.secondary_open_price as any);
@@ -523,6 +572,8 @@ export class Trader {
                     })
                 );
             } else {
+                // If no close order is needed, use current book price or open
+                // price for accounting fallback.
                 pPrice = primaryCloseSide === 'buy' ? (prices?.primaryAsk ?? pOpen) : (prices?.primaryBid ?? pOpen);
             }
 
@@ -535,12 +586,15 @@ export class Trader {
                     })
                 );
             } else {
+                // If no close order is needed, use current book price or open
+                // price for accounting fallback.
                 sPrice = secondaryCloseSide === 'buy' ? (prices?.secondaryAsk ?? sOpen) : (prices?.secondaryBid ?? sOpen);
             }
 
             await Promise.all(closePromises);
 
-            // ---- Fallback for execution bugs on exit ----
+            // Fallback for execution bugs on exit where an exchange returns an
+            // order id but no usable average fill price.
             if (pPrice === 0 && pSize > 0) {
                 pPrice = primaryCloseSide === 'buy' ? (prices?.primaryAsk ?? pOpen) : (prices?.primaryBid ?? pOpen);
             }
@@ -548,7 +602,7 @@ export class Trader {
                 sPrice = secondaryCloseSide === 'buy' ? (prices?.secondaryAsk ?? sOpen) : (prices?.secondaryBid ?? sOpen);
             }
 
-            // ---- 3. Calculate Results & Update Django ----
+            // 3. Calculate results and update Django.
             const amount = parseFloat(trade.amount as any);
             const openCommission = parseFloat(trade.open_commission as any) || 0;
             const totalCommission = openCommission + closeCommission;
@@ -564,6 +618,9 @@ export class Trader {
                 let retries = 0;
                 while (!isDbSaved && retries < 10) {
                     try {
+                        // Persist close details with retries. At this point
+                        // positions may already be flat, so losing the DB update
+                        // would make recovery ambiguous after restart.
                         await api.closeTrade(trade.id, {
                             status: closeStatus as 'closed' | 'force_closed',
                             close_reason: reason === 'liquidation' ? 'error' as any : reason,
@@ -593,6 +650,8 @@ export class Trader {
             this.tradeCounter.release();
 
             if (currentBuySpread !== undefined && currentSellSpread !== undefined) {
+                // Reset baselines to the latest spread after a profitable close so
+                // the bot does not immediately re-open on stale expansion.
                 state.baselineBuy = currentBuySpread;
                 state.baselineSell = currentSellSpread;
             } else {
@@ -612,10 +671,10 @@ export class Trader {
 
     private calculateCloseSpread(primaryPrice: number, secondaryPrice: number, orderType: 'buy' | 'sell'): number {
         if (orderType === 'buy') {
-            // Close: sell Primary (pBid), buy Secondary (sAsk) → (pBid - sAsk) / sAsk
+            // Close: sell primary, buy secondary.
             return ((primaryPrice - secondaryPrice) / secondaryPrice) * 100;
         } else {
-            // Close: buy Primary (pAsk), sell Secondary (sBid) → (sBid - pAsk) / pAsk
+            // Close: buy primary, sell secondary.
             return ((secondaryPrice - primaryPrice) / primaryPrice) * 100;
         }
     }
@@ -632,6 +691,7 @@ export class Trader {
 
             const elapsed = now - state.openedAtMs;
             if (elapsed >= config.maxTradeDurationMs) {
+                // Timeout is a hard risk control and uses emergency pricing.
                 logger.warn(this.tag, `⏰ Trade timeout for ${symbol} (${Math.round(elapsed / 60000)}min)`);
                 const targetCoins = parseFloat(state.activeTrade.amount as any);
                 const prices = this.getPrices(symbol, targetCoins, true);
@@ -652,6 +712,8 @@ export class Trader {
 
         for (const [symbol, state] of openTrades) {
             try {
+                // Shutdown close uses emergency prices because the process should
+                // prioritize flattening positions over strict full-depth pricing.
                 const targetCoins = parseFloat(state.activeTrade!.amount as any);
                 const prices = this.getPrices(symbol, targetCoins, true);
                 await this.executeClose(symbol, state, reason, prices);

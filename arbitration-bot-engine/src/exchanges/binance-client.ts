@@ -8,16 +8,27 @@ import { config } from '../config.js';
 const TAG = 'BinanceClient';
 
 function ccxtToBinance(symbol: string): string {
+    // Convert ccxt futures symbol format (BTC/USDT:USDT) into Binance REST API
+    // format (BTCUSDT).
     return symbol.replace(':USDT', '').replace('/', '');
 }
 
 function binanceToCcxt(binanceSymbol: string): string {
+    // Convert Binance REST symbols back into the ccxt futures format used by
+    // WebSocket orderbooks and Django bot config.
     if (binanceSymbol.endsWith('USDT')) {
         return binanceSymbol.replace('USDT', '/USDT:USDT');
     }
     return binanceSymbol;
 }
 
+/**
+ * Binance USDT-M futures REST adapter.
+ *
+ * This client uses direct signed REST calls instead of ccxt for order execution
+ * so it can control Binance-specific request signing, order polling, and fee
+ * extraction from /userTrades.
+ */
 export class BinanceClient implements IExchangeClient {
     public readonly name = 'Binance';
     private httpClient: AxiosInstance;
@@ -25,6 +36,7 @@ export class BinanceClient implements IExchangeClient {
     private markets: Map<string, any> = new Map();
 
     constructor() {
+        // Toggle between Binance Futures testnet and production using USE_TESTNET.
         this.baseUrl = config.useTestnet 
             ? 'https://testnet.binancefuture.com'
             : 'https://fapi.binance.com';
@@ -37,6 +49,8 @@ export class BinanceClient implements IExchangeClient {
         this.httpClient.interceptors.response.use(
             response => response,
             error => {
+                // Normalize Binance error payloads into Error.message so callers
+                // can log/propagate one consistent exception shape.
                 if (error.response?.data) {
                     throw new Error(`Binance API Error: ${JSON.stringify(error.response.data)}`);
                 }
@@ -46,12 +60,16 @@ export class BinanceClient implements IExchangeClient {
     }
 
     get ccxtInstance(): any {
+        // BotTrader expects a small ccxt-like surface for market data and
+        // position recovery. This adapter implements only the methods it needs.
         return {
             fetchTime: async () => {
                 const res = await this.request('GET', '/fapi/v1/time', {}, false);
                 return res.serverTime;
             },
             fetchTickers: async () => {
+                // MarketInfoService uses last prices to size trades and detect
+                // ticker collisions across exchanges.
                 const data = await this.request('GET', '/fapi/v1/ticker/24hr', {}, false);
                 const tickers: any = {};
                 for (const t of data) {
@@ -63,6 +81,8 @@ export class BinanceClient implements IExchangeClient {
                 return tickers;
             },
             fetchPositions: async (symbols: string[]) => {
+                // Return positions in a ccxt-like shape so BotTrader cleanup and
+                // close logic can be exchange-agnostic.
                 const results: any[] = [];
                 for (const symbol of symbols) {
                     try {
@@ -100,6 +120,8 @@ export class BinanceClient implements IExchangeClient {
         let queryString = '';
 
         if (auth) {
+            // Binance signed endpoints require timestamp, recvWindow and HMAC
+            // signature over the exact query string.
             params.timestamp = Date.now();
             params.recvWindow = 5000;
             
@@ -120,6 +142,7 @@ export class BinanceClient implements IExchangeClient {
 
         const headers: Record<string, string> = {};
         if (auth) {
+            // API key is sent in the header; secret is used only for the HMAC.
             headers['X-MBX-APIKEY'] = config.binance.apiKey;
         }
 
@@ -145,6 +168,8 @@ export class BinanceClient implements IExchangeClient {
     }
 
     async loadMarkets(): Promise<void> {
+        // Cache exchangeInfo once per client startup. Order sizing later reads
+        // filters from this map without making another network request.
         const info = await this.request('GET', '/fapi/v1/exchangeInfo', {}, false);
         this.markets.clear();
 
@@ -169,6 +194,8 @@ export class BinanceClient implements IExchangeClient {
             });
             logger.debug(TAG, `Leverage set to ${leverage}x for ${symbol}`);
         } catch (e: any) {
+            // Binance reports "No need to change" as an error response, but for
+            // engine setup it is an idempotent success.
             if (e.message?.includes('No need to change')) {
                 logger.debug(TAG, `Leverage already ${leverage}x for ${symbol}`);
             } else {
@@ -186,6 +213,8 @@ export class BinanceClient implements IExchangeClient {
             });
             logger.debug(TAG, `Isolated margin set for ${symbol}`);
         } catch (e: any) {
+            // Same idempotency handling as leverage: already-isolated is not a
+            // setup failure.
             if (e.message?.includes('No need to change')) {
                 logger.debug(TAG, `Margin already isolated for ${symbol}`);
             } else {
@@ -248,7 +277,8 @@ export class BinanceClient implements IExchangeClient {
             }
         }
 
-        // Commission extraction exactly using User Trades
+        // Commission extraction using User Trades. The initial order response can
+        // omit final fee details, especially immediately after a market fill.
         let commission = 0;
         try {
             // Wait 500ms to ensure trades are flushed to db
@@ -269,7 +299,8 @@ export class BinanceClient implements IExchangeClient {
                         const notional = parseFloat(t.price || '0') * parseFloat(t.qty || '0');
                         commission += (notional * 0.00045); // Approximate 0.045% VIP0 taker rate with BNB discount
                     } else {
-                        // USDT, BUSD or USDC fee
+                        // USDT, BUSD or USDC fees are treated as quote-currency
+                        // equivalents for Django reporting.
                         commission += Math.abs(fee);
                     }
                 }
@@ -293,6 +324,7 @@ export class BinanceClient implements IExchangeClient {
     }
 
     getMarketInfo(symbol: string): SymbolMarketInfo | null {
+        // Convert Binance filters into the engine's common sizing metadata.
         const binanceSymbol = ccxtToBinance(symbol);
         const market = this.markets.get(binanceSymbol);
         
@@ -327,6 +359,8 @@ export class BinanceClient implements IExchangeClient {
     }
 
     getUsdtSymbols(): string[] {
+        // Expose symbols in ccxt futures format because the rest of the engine is
+        // keyed by ccxt symbols.
         const symbols: string[] = [];
         for (const sym of this.markets.keys()) {
             symbols.push(binanceToCcxt(sym));

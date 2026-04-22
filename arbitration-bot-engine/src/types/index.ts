@@ -1,5 +1,9 @@
 // ──────────── Orderbook ────────────
 
+/**
+ * Normalized top-of-book/VWAP prices for the two legs of one arbitrage pair.
+ * "Primary" and "secondary" come from BotConfig, not from a hardcoded exchange.
+ */
 export interface OrderbookPrices {
     primaryBid: number;
     primaryAsk: number;
@@ -9,6 +13,11 @@ export interface OrderbookPrices {
 
 // ──────────── Market Info ────────────
 
+/**
+ * Exchange-specific market constraints converted into a common shape.
+ * These values are used before placing orders so the engine can round amounts
+ * down to valid lot sizes and reject trades below exchange minimums.
+ */
 export interface SymbolMarketInfo {
     symbol: string;
     /** Minimum order quantity (in coins) */
@@ -43,6 +52,11 @@ export interface UnifiedMarketInfo {
 
 // ──────────── Order Execution ────────────
 
+/**
+ * Normalized result returned by every REST exchange client after placing an
+ * order. BotTrader uses this shape to record actual fill prices and commissions
+ * in Django regardless of the exchange-specific raw response format.
+ */
 export interface OrderResult {
     orderId: string;
     avgPrice: number;
@@ -55,6 +69,12 @@ export interface OrderResult {
 
 // ──────────── Trade (Django API) ────────────
 
+/**
+ * Payload used when the engine opens a real trade in Django.
+ *
+ * Emulation trades reuse most of this shape at runtime, although Django's
+ * EmulationTrade serializer does not require all real-trade-only fields.
+ */
 export interface TradeOpenPayload {
     coin: string;
     primary_exchange: string;
@@ -73,6 +93,9 @@ export interface TradeOpenPayload {
 
 export interface TradeClosePayload {
     status: 'closed' | 'force_closed';
+    // This should stay aligned with Django Trade.CloseReason choices. At the
+    // moment BotTrader can produce some engine-only reasons and then map them
+    // before sending real-trade payloads.
     close_reason: 'profit' | 'timeout' | 'shutdown' | 'error' | 'liquidation';
     primary_close_price: number;
     secondary_close_price: number;
@@ -86,6 +109,8 @@ export interface TradeClosePayload {
 }
 
 export interface TradeRecord {
+    // Django returns DecimalField values as strings. BotTrader parses those
+    // strings at close time to avoid floating-point assumptions at the API edge.
     id: number;
     coin: string;
     primary_exchange: string;

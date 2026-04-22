@@ -6,11 +6,19 @@ import { config } from '../config.js';
 
 const TAG = 'MexcClient';
 
+/**
+ * MEXC futures REST adapter built on ccxt.
+ *
+ * MEXC behavior is less uniform than Binance/Bybit for margin setup and filled
+ * order details, so this adapter favors best-effort setup and post-order polling
+ * instead of failing early on non-critical account-configuration responses.
+ */
 export class MexcClient implements IExchangeClient {
     public readonly name = 'Mexc';
     private exchange: ccxt.mexc;
 
     constructor() {
+        // defaultType=swap tells ccxt to use futures/swap endpoints.
         this.exchange = new ccxt.mexc({
             apiKey: config.mexc.apiKey,
             secret: config.mexc.secret,
@@ -38,6 +46,8 @@ export class MexcClient implements IExchangeClient {
             await this.exchange.setLeverage(leverage, symbol);
             logger.debug(TAG, `Leverage set to ${leverage}x for ${symbol}`);
         } catch (e: any) {
+            // Current engine setup treats MEXC leverage setup failures as warnings
+            // so the bot can still run in monitoring/emulation scenarios.
             logger.warn(TAG, `Failed to set leverage to ${leverage}x on MEXC for ${symbol}: ${e.message}`);
         }
     }
@@ -52,12 +62,13 @@ export class MexcClient implements IExchangeClient {
             } else {
                 logger.warn(TAG, `Failed to set isolated margin on MEXC: ${e.message}. Trying direct explicit API fallback...`);
                 try {
-                    // Try to trigger the implicit api call fallback
+                    // Try the implicit ccxt endpoint when the unified method is
+                    // unsupported or returns an exchange-specific error.
                     const market = this.exchange.market(symbol);
                     if (market?.id) {
                         await (this.exchange as any).contractPrivatePostApiV1MarginIsolated({
                             symbol: market.id,
-                            type: 1 // 1 for isolated usually in MEXC API, or depends on endpoint spec
+                            type: 1 // MEXC commonly uses 1 for isolated margin.
                         });
                         logger.debug(TAG, `Isolated margin set for ${symbol} via fallback api.`);
                     }
@@ -79,7 +90,8 @@ export class MexcClient implements IExchangeClient {
         const order = await this.exchange.createMarketOrder(symbol, side, amount, undefined, params);
         let filled = order;
 
-        // Anti 0.00 Bug - Polling Loop for execution details. MEXC replication log lag.
+        // Poll for execution details because MEXC can initially return an order
+        // object with missing average price or open status immediately after fill.
         let retries = 0;
         while ((!filled.average || filled.status !== 'closed') && retries < 5) {
             await new Promise(r => setTimeout(r, 1000));
@@ -110,6 +122,7 @@ export class MexcClient implements IExchangeClient {
     }
 
     getMarketInfo(symbol: string): SymbolMarketInfo | null {
+        // Convert ccxt precision/limit metadata into the common market-info shape.
         const market = this.exchange.markets[symbol];
         if (!market) return null;
 
@@ -144,10 +157,13 @@ export class MexcClient implements IExchangeClient {
     }
 
     getUsdtSymbols(): string[] {
+        // Keep only USDT-settled perpetual symbols.
         return Object.keys(this.exchange.markets).filter(sym => sym.endsWith(':USDT'));
     }
 
     private extractCommission(order: any): number {
+        // MEXC may report zero-fee promotions or fees in assets that are hard to
+        // convert safely here. Only quote-stable fees are added to reported cost.
         if (order.fees && Array.isArray(order.fees)) {
             return order.fees.reduce((total: number, fee: any) => {
                 if (['USDT', 'USDC'].includes(fee.currency)) return total + (fee.cost ?? 0);

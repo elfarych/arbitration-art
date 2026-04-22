@@ -6,11 +6,18 @@ import { config } from '../config.js';
 
 const TAG = 'BybitClient';
 
+/**
+ * Bybit USDT perpetual adapter built on ccxt.
+ *
+ * ccxt handles the REST API shape, while this class normalizes order results
+ * and market metadata into the trader's exchange-agnostic interfaces.
+ */
 export class BybitClient implements IExchangeClient {
     public readonly name = 'Bybit';
     private exchange: ccxt.bybit;
 
     constructor() {
+        // defaultType=swap targets perpetual contracts instead of spot markets.
         this.exchange = new ccxt.bybit({
             apiKey: config.bybit.apiKey,
             secret: config.bybit.secret,
@@ -30,6 +37,7 @@ export class BybitClient implements IExchangeClient {
     }
 
     async loadMarkets(): Promise<void> {
+        // ccxt caches loaded markets on exchange.markets.
         await this.exchange.loadMarkets();
         logger.info(TAG, `Markets loaded: ${Object.keys(this.exchange.markets).length} symbols`);
     }
@@ -73,7 +81,8 @@ export class BybitClient implements IExchangeClient {
         const order = await this.exchange.createMarketOrder(symbol, side, amount, undefined, params);
         let filled = order;
 
-        // DB Lag fallback: Bybit API sometimes requires over 500ms to calculate fills
+        // Bybit sometimes returns an order before average price/status are final.
+        // Poll a few times before giving up and using the best available data.
         let retries = 0;
         while ((!filled.average || filled.status !== 'closed') && retries < 5) {
             await new Promise(r => setTimeout(r, 1000)); // 1000ms * 5 = up to 5s buffer
@@ -108,6 +117,8 @@ export class BybitClient implements IExchangeClient {
     }
 
     getMarketInfo(symbol: string): SymbolMarketInfo | null {
+        // ccxt may expose precision as decimal places or tick size depending on
+        // precisionMode. Convert it into a concrete step size.
         const market = this.exchange.markets[symbol];
         if (!market) return null;
 
@@ -132,10 +143,12 @@ export class BybitClient implements IExchangeClient {
     }
 
     getUsdtSymbols(): string[] {
+        // ccxt futures symbols are formatted like BTC/USDT:USDT.
         return Object.keys(this.exchange.markets).filter(sym => sym.endsWith(':USDT'));
     }
 
     private extractCommission(order: any): number {
+        // Normalize fees into an approximate USDT value for Django reporting.
         if (order.fees && Array.isArray(order.fees)) {
             return order.fees.reduce((total: number, fee: any) => {
                 if (fee.currency === 'USDT') {

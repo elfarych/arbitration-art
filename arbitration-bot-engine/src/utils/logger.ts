@@ -1,5 +1,7 @@
 type LogLevel = 'DEBUG' | 'INFO' | 'WARN' | 'ERROR';
 
+// Lower numbers are more verbose. shouldLog() compares priorities so a process
+// started with LOG_LEVEL=WARN will suppress DEBUG and INFO messages.
 const LEVEL_PRIORITY: Record<LogLevel, number> = {
     DEBUG: 0,
     INFO: 1,
@@ -10,13 +12,23 @@ const LEVEL_PRIORITY: Record<LogLevel, number> = {
 const minLevel: LogLevel = (process.env.LOG_LEVEL as LogLevel) || 'INFO';
 
 function timestamp(): string {
+    // ISO timestamps are easy to sort and correlate with Django/exchange logs.
     return new Date().toISOString();
 }
 
 function shouldLog(level: LogLevel): boolean {
+    // Unknown LOG_LEVEL values are not validated here; callers should keep env
+    // values inside the LogLevel union to avoid priority lookup returning undefined.
     return LEVEL_PRIORITY[level] >= LEVEL_PRIORITY[minLevel];
 }
 
+/**
+ * Minimal process logger.
+ *
+ * This avoids bringing in a structured logging dependency while still adding a
+ * consistent tag convention. Tags are important in this service because multiple
+ * bots can run in the same process and emit interleaved logs.
+ */
 export const logger = {
     debug(tag: string, message: string, ...args: any[]) {
         if (shouldLog('DEBUG')) {

@@ -8,11 +8,13 @@ import { logger } from './logger.js';
  */
 export function calculateOpenSpread(prices: OrderbookPrices, orderType: 'buy' | 'sell'): number {
     if (orderType === 'sell') {
+        // Sell/short primary at bid and buy/long secondary at ask.
         const pBid = prices.primaryBid;
         const sAsk = prices.secondaryAsk;
         if (!sAsk) return -Infinity;
         return ((pBid - sAsk) / sAsk) * 100;
     } else {
+        // Buy/long primary at ask and sell/short secondary at bid.
         const pAsk = prices.primaryAsk;
         const sBid = prices.secondaryBid;
         if (!pAsk) return -Infinity;
@@ -38,6 +40,8 @@ export function calculateTruePnL(
             (currentPrices.secondaryBid - currentPrices.primaryAsk);
 
         const entryPrice = openPrices.sOpen;
+        // Signal-level fee estimate only. Final accounting uses real exchange
+        // commissions in calculateRealPnL().
         const estimatedFeesUsdt = entryPrice * 0.0020;
         return ((profitUsdt - estimatedFeesUsdt) / entryPrice) * 100;
     } else {
@@ -48,6 +52,7 @@ export function calculateTruePnL(
             (currentPrices.primaryBid - currentPrices.secondaryAsk);
 
         const entryPrice = openPrices.pOpen;
+        // Keep fee assumptions symmetric across both entry directions.
         const estimatedFeesUsdt = entryPrice * 0.0020;
         return ((profitUsdt - estimatedFeesUsdt) / entryPrice) * 100;
     }
@@ -88,6 +93,7 @@ export function calculateRealPnL(
 
 /** Round a number to fit Django DecimalField constraints */
 export function d(value: number, decimals: number = 8): number {
+    // Trims binary floating-point tails before sending numeric JSON to Django.
     return parseFloat(value.toFixed(decimals));
 }
 
@@ -116,11 +122,13 @@ export function checkLegDrawdown(
         pnlSecondaryRaw = (openPrices.sOpen - currentPrices.secondaryAsk) / openPrices.sOpen;
     }
 
-    // Convert to percentage and scale by leverage
+    // Convert to percentage and scale by leverage to approximate isolated margin
+    // drawdown rather than raw asset price movement.
     const pnlPrimaryPercent = pnlPrimaryRaw * 100 * leverage;
     const pnlSecondaryPercent = pnlSecondaryRaw * 100 * leverage;
 
-    // We only care about negative PnL (drawdown)
+    // Only losing legs count toward liquidation risk; winning legs do not offset
+    // drawdown for this guard.
     const drawdownPrimary = pnlPrimaryPercent < 0 ? Math.abs(pnlPrimaryPercent) : 0;
     const drawdownSecondary = pnlSecondaryPercent < 0 ? Math.abs(pnlSecondaryPercent) : 0;
 
@@ -141,6 +149,7 @@ export function calculateVWAP(orderbookSide: [number, number][], targetCoins: nu
     let accQuoteVal = 0;
 
     for (const [price, volumeCoins] of orderbookSide) {
+        // Consume levels until the requested base-coin size is filled.
         if (accCoins + volumeCoins >= targetCoins) {
             const neededCoins = targetCoins - accCoins;
             accCoins += neededCoins;
@@ -154,11 +163,12 @@ export function calculateVWAP(orderbookSide: [number, number][], targetCoins: nu
 
     if (accCoins < targetCoins) {
         if (!isEmergency) {
-            // КРИТИЧЕСКИЙ ФИКС: Для Входа и Тейк-Профита нам НУЖЕН полный объем. 
-            // Если в стакане не хватает монет - возвращаем NaN (Отменяем сигнал!)
+            // Entry and profit-taking require full visible liquidity. Returning
+            // NaN cancels the signal instead of underestimating slippage.
             return NaN;
         }
-        // В случае экстренной ликвидации или таймаута берем что есть
+        // Emergency liquidation/timeout exits can use available depth because
+        // staying exposed may be worse than accepting an approximate VWAP.
         logger.warn('Math', `Insufficient depth to fill ${targetCoins}. Using VWAP of available ${accCoins}`);
         return accQuoteVal / accCoins;
     }

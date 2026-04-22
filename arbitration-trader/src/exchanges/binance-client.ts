@@ -8,16 +8,26 @@ import { config } from '../config.js';
 const TAG = 'BinanceClient';
 
 function ccxtToBinance(symbol: string): string {
+    // Convert ccxt futures symbol format (BTC/USDT:USDT) to Binance REST format
+    // (BTCUSDT).
     return symbol.replace(':USDT', '').replace('/', '');
 }
 
 function binanceToCcxt(binanceSymbol: string): string {
+    // Convert Binance REST symbols back to the ccxt futures format used by the
+    // rest of the trader.
     if (binanceSymbol.endsWith('USDT')) {
         return binanceSymbol.replace('USDT', '/USDT:USDT');
     }
     return binanceSymbol;
 }
 
+/**
+ * Binance USDT-M futures REST client.
+ *
+ * This adapter uses direct signed REST calls so it can control Binance-specific
+ * request signing, fill polling and commission extraction.
+ */
 export class BinanceClient implements IExchangeClient {
     public readonly name = 'Binance';
     private httpClient: AxiosInstance;
@@ -25,6 +35,7 @@ export class BinanceClient implements IExchangeClient {
     private markets: Map<string, any> = new Map();
 
     constructor() {
+        // Toggle between Binance Futures testnet and production.
         this.baseUrl = config.useTestnet 
             ? 'https://testnet.binancefuture.com'
             : 'https://fapi.binance.com';
@@ -37,6 +48,7 @@ export class BinanceClient implements IExchangeClient {
         this.httpClient.interceptors.response.use(
             response => response,
             error => {
+                // Normalize exchange error payloads into Error.message.
                 if (error.response?.data) {
                     throw new Error(`Binance API Error: ${JSON.stringify(error.response.data)}`);
                 }
@@ -46,12 +58,14 @@ export class BinanceClient implements IExchangeClient {
     }
 
     get ccxtInstance(): any {
+        // Expose only the ccxt-like methods used by main.ts and Trader.
         return {
             fetchTime: async () => {
                 const res = await this.request('GET', '/fapi/v1/time', {}, false);
                 return res.serverTime;
             },
             fetchTickers: async () => {
+                // Used for liquidity filtering, trade sizing and collision checks.
                 const data = await this.request('GET', '/fapi/v1/ticker/24hr', {}, false);
                 const tickers: any = {};
                 for (const t of data) {
@@ -63,6 +77,7 @@ export class BinanceClient implements IExchangeClient {
                 return tickers;
             },
             fetchPositions: async (symbols: string[]) => {
+                // Return a ccxt-like position shape for close/cleanup logic.
                 const results: any[] = [];
                 for (const symbol of symbols) {
                     try {
@@ -100,6 +115,8 @@ export class BinanceClient implements IExchangeClient {
         let queryString = '';
 
         if (auth) {
+            // Binance signed endpoints require timestamp, recvWindow and HMAC over
+            // the exact query string.
             params.timestamp = Date.now();
             params.recvWindow = 5000;
             
@@ -120,6 +137,7 @@ export class BinanceClient implements IExchangeClient {
 
         const headers: Record<string, string> = {};
         if (auth) {
+            // Secret is used only for HMAC signing; API key goes in the header.
             headers['X-MBX-APIKEY'] = config.binance.apiKey;
         }
 
@@ -145,6 +163,7 @@ export class BinanceClient implements IExchangeClient {
     }
 
     async loadMarkets(): Promise<void> {
+        // Cache exchangeInfo once during bootstrap.
         const info = await this.request('GET', '/fapi/v1/exchangeInfo', {}, false);
         this.markets.clear();
 
@@ -169,6 +188,8 @@ export class BinanceClient implements IExchangeClient {
             });
             logger.debug(TAG, `Leverage set to ${leverage}x for ${symbol}`);
         } catch (e: any) {
+            // Binance reports already-set leverage as an error; treat it as
+            // idempotent success.
             if (e.message?.includes('No need to change')) {
                 logger.debug(TAG, `Leverage already ${leverage}x for ${symbol}`);
             } else {
@@ -186,6 +207,8 @@ export class BinanceClient implements IExchangeClient {
             });
             logger.debug(TAG, `Isolated margin set for ${symbol}`);
         } catch (e: any) {
+            // Binance reports already-isolated margin as an error; treat it as
+            // idempotent success.
             if (e.message?.includes('No need to change')) {
                 logger.debug(TAG, `Margin already isolated for ${symbol}`);
             } else {
@@ -197,15 +220,15 @@ export class BinanceClient implements IExchangeClient {
     async createMarketOrder(
         symbol: string,
         side: 'buy' | 'sell',
-        amount: number, // Base currency
+        amount: number, // Base currency amount.
         params: any = {},
     ): Promise<OrderResult> {
         const binanceSymbol = ccxtToBinance(symbol);
         
         logger.info(TAG, `Creating ${side} order for ${symbol}, amount: ${amount}`);
 
-        // Construct formatting for Binance (usually accepts up to 5-6 digits or raw number strings)
-        // precision truncating is handled by Trader.ts before being passed here
+        // Construct quantity formatting. Trader already rounded the amount to a
+        // valid lot size before calling the client.
         const quantityStr = Number(amount).toFixed(10).replace(/\.?0+$/, '');
         
         const orderParams: any = {
@@ -229,7 +252,8 @@ export class BinanceClient implements IExchangeClient {
         let filled = orderData;
         const orderId = orderData.orderId;
 
-        // DB Lag fallback: give exchange matching engine 500ms to calculate fills before fetching
+        // Binance can return the order before final average price is available,
+        // so poll once after a short delay.
         let avgPrice = parseFloat(filled.avgPrice || filled.price || '0');
         
         if (avgPrice === 0 || filled.status !== 'FILLED') {
@@ -248,10 +272,11 @@ export class BinanceClient implements IExchangeClient {
             }
         }
 
-        // Commission extraction exactly using User Trades
+        // Extract commission from User Trades because order responses can omit
+        // final fee details.
         let commission = 0;
         try {
-            // Wait 500ms to ensure trades are flushed to db
+            // Give Binance time to flush fills into userTrades.
             await new Promise(r => setTimeout(r, 500));
             
             const trades = await this.request('GET', '/fapi/v1/userTrades', {
@@ -269,7 +294,7 @@ export class BinanceClient implements IExchangeClient {
                         const notional = parseFloat(t.price || '0') * parseFloat(t.qty || '0');
                         commission += (notional * 0.00045); // Approximate 0.045% VIP0 taker rate with BNB discount
                     } else {
-                        // USDT, BUSD or USDC fee
+                        // USDT, BUSD or USDC fees are treated as quote-equivalent.
                         commission += Math.abs(fee);
                     }
                 }
@@ -293,6 +318,7 @@ export class BinanceClient implements IExchangeClient {
     }
 
     getMarketInfo(symbol: string): SymbolMarketInfo | null {
+        // Convert Binance filters into the common SymbolMarketInfo shape.
         const binanceSymbol = ccxtToBinance(symbol);
         const market = this.markets.get(binanceSymbol);
         
@@ -327,6 +353,7 @@ export class BinanceClient implements IExchangeClient {
     }
 
     getUsdtSymbols(): string[] {
+        // Expose symbols in ccxt futures format.
         const symbols: string[] = [];
         for (const sym of this.markets.keys()) {
             symbols.push(binanceToCcxt(sym));

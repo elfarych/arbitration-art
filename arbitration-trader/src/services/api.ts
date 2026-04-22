@@ -5,6 +5,8 @@ import { logger } from '../utils/logger.js';
 
 const TAG = 'API';
 
+// Shared Django API client. These endpoints are used only for trade persistence
+// and recovery; exchange execution happens in Trader through REST clients.
 const client: AxiosInstance = axios.create({
     baseURL: config.djangoApiUrl,
     headers: {
@@ -13,6 +15,12 @@ const client: AxiosInstance = axios.create({
     timeout: 15000,
 });
 
+/**
+ * Thin adapter around the Django real-trades API.
+ *
+ * Keeping endpoint paths here prevents Trader from mixing trading decisions with
+ * persistence details and DRF pagination handling.
+ */
 export const api = {
     async openTrade(payload: TradeOpenPayload): Promise<TradeRecord> {
         try {
@@ -41,6 +49,7 @@ export const api = {
             const { data } = await client.get('/bots/real-trades/', {
                 params: { status: 'open' },
             });
+            // Support both DRF paginated responses and a raw array response.
             const trades = data.results || data || [];
             logger.info(TAG, `Fetched ${trades.length} open trades from Django`);
             return trades;

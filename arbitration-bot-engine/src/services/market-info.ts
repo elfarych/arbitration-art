@@ -8,6 +8,11 @@ const TAG = 'MarketInfo';
 /**
  * Pre-loads and caches unified market info for all tradeable symbols.
  * Called ONCE at bootstrap — never during trade execution.
+ *
+ * The service deliberately computes conservative constraints: for each pair it
+ * picks the strictest amount and notional rules from both exchanges. That keeps
+ * BotTrader from opening an amount that is valid on one leg and rejected on the
+ * other.
  */
 export class MarketInfoService {
     private cache: Map<string, UnifiedMarketInfo> = new Map();
@@ -34,6 +39,8 @@ export class MarketInfoService {
                 secondaryClient.ccxtInstance.fetchTickers()
             ]);
             for (const sym of commonSymbols) {
+                // ccxt symbols are used as stable keys throughout the engine,
+                // even when a REST client internally uses native exchange IDs.
                 if (pTickers[sym]?.last) currentPrices[sym] = pTickers[sym].last;
                 if (sTickers[sym]?.last) secondaryPrices[sym] = sTickers[sym].last;
             }
@@ -63,6 +70,9 @@ export class MarketInfoService {
 
             // ==== Homonym / Ticker Collision Protection ====
             if (currentPrice && secondaryPrice) {
+                // Some exchanges list different assets under the same ticker. A
+                // large cross-exchange last-price deviation is treated as a strong
+                // signal that the pair is not the same underlying instrument.
                 const deviation = Math.abs(currentPrice - secondaryPrice) / Math.min(currentPrice, secondaryPrice);
                 if (deviation > 0.40) {
                     logger.warn(TAG, `🚨 HOMONYM DETECTED: Skipping ${symbol}. Deviation: ${(deviation * 100).toFixed(0)}%. (${primaryClient.name}: ${currentPrice}, ${secondaryClient.name}: ${secondaryPrice})`);
@@ -74,6 +84,9 @@ export class MarketInfoService {
             }
 
             if (currentPrice) {
+                // tradeAmountUsdt is intended to be a fixed notional budget per
+                // trade. The current config.ts does not define it yet, which is
+                // one reason the project currently fails TypeScript compilation.
                 const rawAmount = config.tradeAmountUsdt / currentPrice;
                 // Round DOWN to step size
                 tradeAmount = Math.floor(rawAmount / stepSize) * stepSize;
@@ -85,7 +98,7 @@ export class MarketInfoService {
                     continue; // exclude from tradeable
                 }
 
-                // Clean up float errors, ensuring precision is at least 0
+                // Clean up float errors, ensuring precision is at least 0.
                 const precision = Math.max(0, Math.round(-Math.log10(stepSize)));
                 tradeAmount = parseFloat(tradeAmount.toFixed(precision));
             }

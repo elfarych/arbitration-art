@@ -8,13 +8,24 @@ import { config } from '../config.js';
 const TAG = 'GateClient';
 
 function ccxtToGate(symbol: string): string {
+    // Convert ccxt futures symbol format (BTC/USDT:USDT) into Gate contract
+    // format (BTC_USDT).
     return symbol.replace(':USDT', '').replace('/', '_');
 }
 
 function gateToCcxt(gateSymbol: string): string {
+    // Convert Gate contract names back into the ccxt futures format used by
+    // orderbooks, Django bot config and MarketInfoService.
     return gateSymbol.replace('_', '/') + ':USDT';
 }
 
+/**
+ * Gate USDT futures REST adapter.
+ *
+ * Gate uses a native contract-size model, so this client performs explicit
+ * conversion between base-coin amounts and Gate contract sizes. It also signs
+ * requests directly because the engine needs predictable request formatting.
+ */
 export class GateClient implements IExchangeClient {
     public readonly name = 'Gate';
     private httpClient: AxiosInstance;
@@ -22,6 +33,7 @@ export class GateClient implements IExchangeClient {
     private markets: Map<string, any> = new Map();
 
     constructor() {
+        // Gate has separate base URLs for futures testnet and production.
         this.baseUrl = config.useTestnet 
             ? 'https://fx-api-testnet.gateio.ws/api/v4'
             : 'https://api.gateio.ws/api/v4';
@@ -31,7 +43,8 @@ export class GateClient implements IExchangeClient {
             timeout: 10000,
         });
 
-        // Error interceptor for debugging
+        // Normalize Gate error payloads into Error.message for consistent caller
+        // handling.
         this.httpClient.interceptors.response.use(
             response => response,
             error => {
@@ -43,11 +56,15 @@ export class GateClient implements IExchangeClient {
         );
     }
 
-    // Required by logic checking fetchPositions on ccxtInstance in Trader.ts!
+    // BotTrader expects a small ccxt-like surface for price and position data.
+    // GateClient supplies only the methods currently used by MarketInfoService
+    // and BotTrader cleanup/close logic.
     get ccxtInstance(): any {
         return {
             fetchTime: async () => Date.now(),
             fetchTickers: async () => {
+                // Gate tickers are converted to ccxt symbols so they align with
+                // the commonSymbols list and market info cache keys.
                 const data = await this.request('GET', '/futures/usdt/tickers');
                 const tickers: any = {};
                 for (const t of data) {
@@ -66,6 +83,8 @@ export class GateClient implements IExchangeClient {
                         const data = await this.request('GET', `/futures/usdt/positions/${gateSymbol}`);
                         if (data && data.size !== undefined && Number(data.size) !== 0) {
                             const market = this.markets.get(gateSymbol);
+                            // Gate position size is reported in contracts. Convert
+                            // it back to base coin using the contract multiplier.
                             const multiplier = Number(market?.quanto_multiplier || 1);
                             const baseAmount = Math.abs(Number(data.size)) * multiplier;
 
@@ -87,6 +106,8 @@ export class GateClient implements IExchangeClient {
     }
 
     private sign(method: string, endpoint: string, query: string, payload: string) {
+        // Gate v4 signatures include method, full /api/v4 path, query string,
+        // SHA512 payload hash and timestamp separated by newlines.
         const t = Math.floor(Date.now() / 1000).toString();
         const hashedPayload = crypto.createHash('sha512').update(payload).digest('hex');
         const signatureString = [method, endpoint, query, hashedPayload, t].join('\n');
@@ -126,6 +147,8 @@ export class GateClient implements IExchangeClient {
     }
 
     async loadMarkets(): Promise<void> {
+        // Cache futures contract metadata. Later methods use it for symbol
+        // conversion, contract multiplier and order-size constraints.
         const contracts = await this.request('GET', '/futures/usdt/contracts');
         this.markets.clear();
         for (const contract of contracts) {
@@ -178,11 +201,11 @@ export class GateClient implements IExchangeClient {
             throw new Error(`Market not loaded for ${symbol}`);
         }
 
-        // Convert base currency (BTC) to contract size
+        // Convert base currency amount (for example BTC) to Gate contract count.
         const quantoMultiplier = Number(market.quanto_multiplier);
         let sizeInContracts = Math.round(amount / quantoMultiplier);
         
-        // Size positive for buy, negative for sell
+        // Gate uses positive size for buy/long and negative size for sell/short.
         if (side === 'sell') {
             sizeInContracts = -sizeInContracts;
         }
@@ -210,7 +233,8 @@ export class GateClient implements IExchangeClient {
         let filled = orderData;
         const orderId = orderData.id;
 
-        // Anti 0.00 Bug - Polling Loop for execution details.
+        // Poll for final execution details because the initial Gate order
+        // response can show fill_price=0 or status=open right after submission.
         let retries = 0;
         let avgPrice = parseFloat(filled.fill_price || '0');
         
@@ -263,6 +287,8 @@ export class GateClient implements IExchangeClient {
     }
 
     getMarketInfo(symbol: string): SymbolMarketInfo | null {
+        // Convert Gate contract constraints into base-coin quantities so they can
+        // be compared with Binance/Bybit/MEXC limits.
         const gateSymbol = ccxtToGate(symbol);
         const market = this.markets.get(gateSymbol);
         

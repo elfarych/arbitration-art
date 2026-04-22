@@ -12,6 +12,13 @@ import { api } from './services/api.js';
 
 const TAG = 'Trader';
 
+/**
+ * Bootstrap the standalone scanner/trader process.
+ *
+ * This service does not wait for Django to start individual bots. It owns the
+ * full runtime: choose exchanges, discover common liquid symbols, set account
+ * parameters, stream orderbooks, and launch Trader chunks.
+ */
 async function bootstrap() {
     logger.info(TAG, '═══════════════════════════════════════════');
     logger.info(TAG, '  Arbitration Trader — Real Trading Mode');
@@ -22,7 +29,9 @@ async function bootstrap() {
     logger.info(TAG, `  Open Threshold: ${config.openThreshold}%, Close Threshold: ${config.closeThreshold}%`);
     logger.info(TAG, '═══════════════════════════════════════════');
 
-    // 1. Create REST exchange clients dynamically based on config
+    // 1. Create REST exchange clients dynamically based on config.
+    // REST clients are responsible for market metadata, account setup and order
+    // execution. WebSocket clients are created later for orderbook streaming.
     logger.info(TAG, `Initializing exchanges... Primary: ${config.primaryExchange}, Secondary: ${config.secondaryExchange}`);
 
     const createClient = (name: string): IExchangeClient => {
@@ -49,14 +58,14 @@ async function bootstrap() {
     try {
         logger.info(TAG, 'Measuring latency to exchange matching engines...');
         
-        // Warmup requests to establish DNS, TCP handshakes, and TLS negotiation
-        // The first HTTP request always takes 500-1000ms just to establish secure encryption.
+        // Warmup requests establish DNS, TCP handshakes and TLS sessions. The
+        // second request is a better approximation of steady-state API latency.
         await Promise.all([
             primaryClient.ccxtInstance.fetchTime().catch(() => {}),
             secondaryClient.ccxtInstance.fetchTime().catch(() => {})
         ]);
 
-        // True Application Ping (reusing the established Keep-Alive sockets)
+        // Application-level ping reusing established keep-alive sockets.
         const [bStart, yStart] = [Date.now(), Date.now()];
 
         await Promise.all([
@@ -73,14 +82,16 @@ async function bootstrap() {
         logger.warn(TAG, `Failed to measure latency: ${e.message}`);
     }
 
-    // 2. Load markets via REST
+    // 2. Load markets via REST. Exchange clients cache this metadata for symbol
+    // discovery and order-size validation.
     logger.info(TAG, `Loading markets from ${primaryClient.name} and ${secondaryClient.name}...`);
     await Promise.all([
         primaryClient.loadMarkets(),
         secondaryClient.loadMarkets(),
     ]);
 
-    // 3. Find common USDT linear perpetual markets
+    // 3. Find common USDT linear perpetual markets. The rest of the process uses
+    // ccxt futures symbols such as BTC/USDT:USDT.
     const primarySymbols = new Set(primaryClient.getUsdtSymbols());
     const secondarySymbols = secondaryClient.getUsdtSymbols();
     let commonSymbols = secondarySymbols.filter(sym => primarySymbols.has(sym));
@@ -91,17 +102,19 @@ async function bootstrap() {
     try {
         const tickers = await primaryClient.ccxtInstance.fetchTickers();
         
-        // 🟢 EXCLUDE SHITCOINS: Require minimum $2,000,000 24h volume
+        // Exclude illiquid markets. Low-depth symbols can show large spreads that
+        // are not executable at the configured trade size.
         commonSymbols = commonSymbols.filter(sym => {
             const vol = tickers[sym]?.quoteVolume || 0;
             return vol >= 2_000_000; 
         });
 
-        // Sort commonSymbols by quoteVolume descending
+        // Sort by quote volume descending so the trader focuses on the most
+        // liquid markets first.
         commonSymbols.sort((a, b) => {
             const volA = tickers[a]?.quoteVolume || 0;
             const volB = tickers[b]?.quoteVolume || 0;
-            return volB - volA; // Highest volume first
+            return volB - volA;
         });
 
         const TOP_LIMIT = config.topLiquidPairsCount;
@@ -116,7 +129,8 @@ async function bootstrap() {
         process.exit(1);
     }
 
-    // 4. Pre-load market info and calculate unified trade amounts (BEFORE any trading)
+    // 4. Pre-load market info and calculate unified trade amounts before any
+    // order setup. This avoids discovering lot-size incompatibilities mid-trade.
     const marketInfo = new MarketInfoService();
     const tradeableSymbols = await marketInfo.initialize(primaryClient, secondaryClient, commonSymbols);
 
@@ -125,15 +139,19 @@ async function bootstrap() {
         process.exit(1);
     }
 
-    // 5. Set leverage and isolated margin on ALL USDT pairs on both exchanges
+    // 5. Set leverage and isolated margin on every validated pair on both
+    // exchanges. Pairs that fail setup are excluded from trading.
     logger.info(TAG, `Setting leverage ${config.leverage}x and isolated margin on ${tradeableSymbols.length} pairs...`);
 
     let leverageErrors = 0;
-    const batchSize = 5; // Reduced from 10: Bybit allows exactly 10 req/s. 5 pairs * 2 req = 10 req.
+    // Bybit allows about 10 account-setting requests per second. Each pair needs
+    // two requests per exchange branch, so a small batch plus delay is safer.
+    const batchSize = 5;
     const finalTradeableSymbols: string[] = [];
 
     const setupSymbol = async (symbol: string) => {
-        // Run Primary and Secondary branches completely in parallel
+        // Run primary and secondary setup branches in parallel because they touch
+        // independent exchange accounts.
         await Promise.all([
             primaryClient.setIsolatedMargin(symbol).then(() => primaryClient.setLeverage(symbol, config.leverage)),
             secondaryClient.setIsolatedMargin(symbol).then(() => secondaryClient.setLeverage(symbol, config.leverage))
@@ -153,7 +171,7 @@ async function bootstrap() {
             }
         });
 
-        // Strict 1.2s delay to prevent Bybit "Too many visits" HTTP 429
+        // Delay between batches to prevent Bybit "Too many visits" HTTP 429.
         if (i + batchSize < tradeableSymbols.length) {
             await new Promise(r => setTimeout(r, 1200));
         }
@@ -165,7 +183,8 @@ async function bootstrap() {
     }
 
     logger.info(TAG, `Leverage/margin setup complete. Successful pairs: ${finalTradeableSymbols.length}. Excluded pairs: ${leverageErrors}.`);
-    // 6. Create SHARED pro exchange instances for WebSocket (single WS connection each)
+    // 6. Create shared ccxt.pro exchange instances for WebSocket streaming.
+    // All Trader chunks share the same exchange objects and their orderbook cache.
     logger.info(TAG, 'Creating WebSocket instances...');
 
     const createWsClient = (name: string): any => {
@@ -182,29 +201,32 @@ async function bootstrap() {
     const wsPrimary = createWsClient(config.primaryExchange);
     const wsSecondary = createWsClient(config.secondaryExchange);
 
-    // Pre-load markets on WS instances
+    // Pre-load markets on WS instances before subscribing to orderbooks.
     await Promise.all([
         wsPrimary.loadMarkets(),
         wsSecondary.loadMarkets(),
     ]);
     logger.info(TAG, 'WebSocket markets loaded. Ready to stream.');
 
-    // 7. Create shared trade counter
+    // 7. Create shared trade counter. This enforces a global concurrent-trade
+    // limit across all Trader chunks.
     const tradeCounter = new TradeCounter();
 
-    // 8. Chunk pairs into Trader groups
+    // 8. Chunk pairs into Trader groups to avoid putting all symbols into one
+    // huge state map and to keep logs grouped by trader id.
     const chunks: string[][] = [];
     for (let i = 0; i < finalTradeableSymbols.length; i += config.chunkSize) {
         chunks.push(finalTradeableSymbols.slice(i, i + config.chunkSize));
     }
     logger.info(TAG, `Split into ${chunks.length} chunks of ${config.chunkSize}.`);
 
-    // 9. Recover open trades from Django (crash resilience)
+    // 9. Recover open trades from Django for crash resilience. The trader will
+    // continue monitoring exits for positions that were opened before restart.
     logger.info(TAG, 'Checking for open trades from previous session...');
     const openTrades = await api.getOpenTrades();
     logger.info(TAG, `Found ${openTrades.length} open trades to restore.`);
 
-    // 10. Create traders
+    // 10. Create traders.
     const traders: Trader[] = chunks.map((chunk, i) =>
         new Trader(
             i + 1, chunk,
@@ -214,7 +236,7 @@ async function bootstrap() {
         ),
     );
 
-    // 11. Distribute recovered trades
+    // 11. Distribute recovered trades to the chunk that owns each symbol.
     for (const trade of openTrades) {
         const coin = trade.coin;
         const trader = traders.find(t => t.symbols.includes(coin));
@@ -225,7 +247,8 @@ async function bootstrap() {
         }
     }
 
-    // 12. Graceful shutdown handler — CLOSE ALL POSITIONS before exit
+    // 12. Graceful shutdown handler. A normal signal attempts to close all active
+    // positions before exiting the Node process.
     let isShuttingDown = false;
 
     const shutdown = async () => {
@@ -237,12 +260,12 @@ async function bootstrap() {
 
         logger.info(TAG, '\n🛑 Graceful shutdown initiated. Closing all positions...');
 
-        // Stop all traders and close their positions
+        // Stop all traders and close their positions.
         await Promise.allSettled(
-            traders.map(t => t.stop(true)), // true = close positions
+            traders.map(t => t.stop(true)),
         );
 
-        // Close WebSocket connections
+        // Close WebSocket connections after traders stop reading orderbooks.
         try { await wsPrimary.close(); } catch { /* ignore */ }
         try { await wsSecondary.close(); } catch { /* ignore */ }
 
@@ -253,7 +276,7 @@ async function bootstrap() {
     process.on('SIGINT', shutdown);
     process.on('SIGTERM', shutdown);
 
-    // Catch uncaught errors to prevent silent crashes
+    // Catch uncaught errors to prevent silent crashes and attempt a safe shutdown.
     process.on('uncaughtException', (err) => {
         logger.error(TAG, `Uncaught exception: ${err.message}`);
         logger.error(TAG, err.stack || '');
@@ -264,7 +287,7 @@ async function bootstrap() {
         logger.error(TAG, `Unhandled rejection: ${reason?.message || reason}`);
     });
 
-    // 13. Start all traders (this blocks forever)
+    // 13. Start all traders. This promise normally never resolves.
     logger.info(TAG, `🚀 Starting ${traders.length} traders...`);
     await Promise.all(traders.map(t => t.start()));
 }

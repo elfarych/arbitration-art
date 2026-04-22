@@ -6,6 +6,13 @@ import type { IExchangeClient } from '../exchanges/exchange-client.js';
 import type { MarketInfoService } from '../services/market-info.js';
 import type { OrderbookPrices, TradeRecord } from '../types/index.js';
 
+/**
+ * Mutable runtime state for one arbitrage pair.
+ *
+ * BotConfig is persisted in Django, but these values are process-local and are
+ * rebuilt from Django open trades only on startup. The busy flag serializes open
+ * and close operations so two websocket ticks cannot submit overlapping orders.
+ */
 interface PairState {
     baselineBuy: number | null;
     baselineSell: number | null;
@@ -18,6 +25,14 @@ interface PairState {
 const COOLDOWN_MS = 30_000;
 const TIMEOUT_CHECK_INTERVAL_MS = 10_000;
 
+/**
+ * Executes one BotConfig.
+ *
+ * A BotTrader watches both exchange orderbooks, calculates entry/exit signals,
+ * places market orders through REST clients in real mode, and mirrors trade
+ * state back to Django. It is intentionally pair-scoped: one instance manages
+ * one configured coin and at most one active trade at a time.
+ */
 export class BotTrader {
     private tag: string;
     private isRunning = true;
@@ -44,11 +59,16 @@ export class BotTrader {
     }
 
     public syncConfig(newConfig: any) {
+        // Sync is hot: Django can change thresholds or activity flags while the
+        // websocket loops are running. Existing open trades keep being monitored
+        // with the new exit/drawdown/duration values.
         logger.info(this.tag, `Syncing config changes (Active: ${newConfig.is_active})`);
         this.bot = newConfig;
     }
 
     public restoreOpenTrades(openTrades: TradeRecord[]): void {
+        // The engine only restores the first matching open trade for this coin.
+        // This matches the one-active-trade-per-bot design used by state.activeTrade.
         const trade = openTrades.find(t => t.coin === this.bot.coin && t.status === 'open');
         if (trade && !this.state.activeTrade) {
             this.state.activeTrade = trade;
@@ -59,8 +79,13 @@ export class BotTrader {
 
     public async start(): Promise<void> {
         logger.info(this.tag, `Starting loops for ${this.bot.coin}...`);
+        // Timeout checks are timer-based because they must still run when spreads
+        // are quiet and websocket updates are sparse.
         this.timeoutTimer = setInterval(() => this.checkTimeouts(), TIMEOUT_CHECK_INTERVAL_MS);
 
+        // Each watchLoop blocks forever while isRunning=true. Promise.all keeps
+        // the trader alive until both loops end or one throws outside its own
+        // retry handling.
         await Promise.all([
             this.watchLoop(this.primaryWs, this.bot.coin, this.primaryClient.name),
             this.watchLoop(this.secondaryWs, this.bot.coin, this.secondaryClient.name)
@@ -75,6 +100,7 @@ export class BotTrader {
         }
 
         if (closePositions && this.state.activeTrade) {
+            // Used by Engine.stopBot during delete/stop commands from Django.
             await this.closeAllPositions('shutdown');
         }
         logger.info(this.tag, 'Stopped.');
@@ -84,6 +110,8 @@ export class BotTrader {
         if (!this.state.activeTrade) return;
         logger.warn(this.tag, '!!! FORCE CLOSE REQUESTED !!!');
         const targetCoins = parseFloat(this.state.activeTrade.amount as any);
+        // Force close uses emergency VWAP so the engine can close with available
+        // depth even when the full configured size is no longer visible.
         const prices = this.getPrices(this.bot.coin, targetCoins, true);
         await this.executeClose('force_close' as any, prices);
     }
@@ -94,11 +122,16 @@ export class BotTrader {
         
         while (this.isRunning) {
             try {
+                // ccxt.pro stores the latest orderbook internally on the exchange
+                // instance. getPrices() reads that cached orderbook after each
+                // successful watch update.
                 await exchange.watchOrderBook(symbol, limit);
                 consecutiveErrors = 0;
                 await this.checkSpreads();
             } catch (e: any) {
                 consecutiveErrors++;
+                // Simple linear backoff capped at 30s prevents a bad websocket
+                // connection from spinning the CPU or flooding logs.
                 const delay = Math.min(2000 * consecutiveErrors, 30000);
                 logger.error(this.tag, `WS error ${exName} ${symbol}: ${e.message}`);
                 await new Promise(r => setTimeout(r, delay));
@@ -107,13 +140,20 @@ export class BotTrader {
     }
 
     private getPrices(symbol: string, targetCoinsFallback?: number, isEmergency: boolean = false): OrderbookPrices | null {
+        // ccxt.pro keeps orderbooks in exchange.orderbooks keyed by ccxt symbol.
+        // The code intentionally reads both books only after both sides have at
+        // least one bid and ask.
         const bOb = (this.primaryWs as any).orderbooks?.[symbol];
         const yOb = (this.secondaryWs as any).orderbooks?.[symbol];
         if (!bOb?.bids?.length || !bOb?.asks?.length || !yOb?.bids?.length || !yOb?.asks?.length) return null;
 
         const info = this.marketInfo.getInfo(symbol);
+        // Entry uses the precomputed/validated trade amount; close uses the
+        // actual recorded trade amount so partial or rounded fills are respected.
         const targetCoins = targetCoinsFallback ?? info?.tradeAmount ?? 0;
 
+        // VWAP is used instead of best bid/ask so spread signals account for the
+        // amount this bot intends to trade through the book.
         const pBid = calculateVWAP(bOb.bids, targetCoins, isEmergency);
         const pAsk = calculateVWAP(bOb.asks, targetCoins, isEmergency);
         const sBid = calculateVWAP(yOb.bids, targetCoins, isEmergency);
@@ -125,6 +165,8 @@ export class BotTrader {
     }
 
     private async checkSpreads() {
+        // Avoid re-entrancy: both websocket loops call checkSpreads(), so one
+        // loop may receive an update while another is already opening/closing.
         if (this.state.busy) return;
         
         const symbol = this.bot.coin;
@@ -135,6 +177,7 @@ export class BotTrader {
         let targetCoins: number;
 
         if (isClosing) {
+            // Closing always targets the amount persisted on the open trade.
             targetCoins = parseFloat(this.state.activeTrade!.amount as any);
         } else {
             const bOb = (this.primaryWs as any).orderbooks?.[symbol];
@@ -142,7 +185,8 @@ export class BotTrader {
             if (!currentPrice) return;
 
             const rawAmount = this.bot.coin_amount || (50 / currentPrice); 
-            // the new bot config has direct coin_amount! Yes, from form: form.coin_amount
+            // Newer Django bot configs send coin_amount directly. The fallback
+            // keeps older configs usable by deriving about 50 USDT of notional.
             let amount = Math.floor((rawAmount / info.stepSize) + 1e-9) * info.stepSize;
             const precision = Math.max(0, Math.round(-Math.log10(info.stepSize)));
             targetCoins = parseFloat(amount.toFixed(precision));
@@ -151,13 +195,17 @@ export class BotTrader {
         }
         
         if (isClosing) {
+            // Strict prices require enough depth for the full close amount and
+            // are used for profit-taking. Emergency prices may use partial depth
+            // and are used for risk exits.
             const strictPrices = this.getPrices(symbol, targetCoins, false);
             const emergencyPrices = this.getPrices(symbol, targetCoins, true);
             await this.checkExit(strictPrices, emergencyPrices);
             return;
         }
 
-        // If inactive, skip entry
+        // Inactive bots keep monitoring an existing trade for exit conditions but
+        // never open a new one.
         if (!this.bot.is_active) return;
 
         const prices = this.getPrices(symbol, targetCoins, false);
@@ -167,6 +215,8 @@ export class BotTrader {
         const currentSellSpread = calculateOpenSpread(prices, 'sell');
 
         const EMA_ALPHA = 0.002;
+        // Baselines are currently tracked but not used for signal decisions.
+        // They are useful future hooks for adaptive spread thresholds.
         if (this.state.baselineBuy === null) this.state.baselineBuy = currentBuySpread;
         else this.state.baselineBuy = this.state.baselineBuy * (1 - EMA_ALPHA) + currentBuySpread * EMA_ALPHA;
 
@@ -203,9 +253,14 @@ export class BotTrader {
 
             const isReal = this.bot.trade_mode === 'real';
 
+            // These flags support one-sided live execution while still recording
+            // synthetic prices for the disabled leg. That is useful during staged
+            // rollout or when one exchange leg should only be monitored.
             const runPrimary = isReal && this.bot.trade_on_primary_exchange;
             const runSecondary = isReal && this.bot.trade_on_secondary_exchange;
 
+            // Open both legs concurrently to reduce legging risk. Promise.allSettled
+            // lets the engine inspect partial success and attempt compensation.
             const [pSettled, sSettled] = await Promise.allSettled([
                 runPrimary ? this.primaryClient.createMarketOrder(symbol, primarySide, targetCoins) : Promise.resolve({ avgPrice: 0, orderId: runPrimary ? undefined : 'skipped', commission: 0, filledQty: targetCoins }),
                 runSecondary ? this.secondaryClient.createMarketOrder(symbol, secondarySide, targetCoins) : Promise.resolve({ avgPrice: 0, orderId: runSecondary ? undefined : 'skipped', commission: 0, filledQty: targetCoins }),
@@ -213,6 +268,8 @@ export class BotTrader {
 
             if (pSettled.status === 'rejected' || sSettled.status === 'rejected') {
                 logger.error(this.tag, `❌ Atomic execution failed! Reverting successful legs...`);
+                // If only one real leg filled, immediately submit a reduce-only
+                // opposite order to flatten the accidental exposure.
                 if (pSettled.status === 'fulfilled' && runPrimary) {
                     const revSide = primarySide === 'buy' ? 'sell' : 'buy';
                     await this.primaryClient.createMarketOrder(symbol, revSide, pSettled.value.filledQty, { reduceOnly: true }).catch(console.error);
@@ -223,6 +280,8 @@ export class BotTrader {
                 }
                 
                 if (isReal) {
+                    // After compensation, fetch exchange positions and close any
+                    // residue that still meets the exchange minimum quantity.
                     await new Promise(r => setTimeout(r, 1000));
                     await this.handleOpenCleanup(primarySide, secondarySide);
                 }
@@ -233,6 +292,8 @@ export class BotTrader {
             const primaryResult = pSettled.value;
             const secondaryResult = sSettled.value;
 
+            // In emulator mode, or when a leg is intentionally skipped, exchange
+            // results contain 0 prices. Use orderbook VWAP as the recorded price.
             const pPriceSafe = primaryResult.avgPrice > 0 ? primaryResult.avgPrice : (primarySide === 'buy' ? prices.primaryAsk : prices.primaryBid);
             const sPriceSafe = secondaryResult.avgPrice > 0 ? secondaryResult.avgPrice : (secondarySide === 'buy' ? prices.secondaryAsk : prices.secondaryBid);
 
@@ -240,12 +301,16 @@ export class BotTrader {
 
             let realOpenSpread = spread;
             if (pPriceSafe > 0 && sPriceSafe > 0) {
+                // Recalculate spread from actual fill prices when available. This
+                // is more accurate than the pre-order signal spread.
                 realOpenSpread = orderType === 'buy'
                     ? ((sPriceSafe - pPriceSafe) / pPriceSafe) * 100
                     : ((pPriceSafe - sPriceSafe) / sPriceSafe) * 100;
             }
 
             const payload: any = {
+                // EmulationTrade requires bot; real Trade ignores it because the
+                // current Django real-trade model has no bot relation.
                 bot: this.bot.id,
                 coin: symbol,
                 order_type: orderType,
@@ -258,6 +323,8 @@ export class BotTrader {
             };
 
             if (isReal) {
+                // Real trades need full exchange metadata and order IDs so Django
+                // can audit the execution cycle.
                 payload.primary_exchange = `${this.primaryClient.name.toLowerCase()}_futures`;
                 payload.secondary_exchange = `${this.secondaryClient.name.toLowerCase()}_futures`;
                 payload.primary_open_order_id = primaryResult.orderId;
@@ -286,6 +353,8 @@ export class BotTrader {
         const info = this.marketInfo.getInfo(symbol);
         const minQty = info?.minQty || 0;
         try {
+            // Cleanup does not trust local order results alone. It asks both
+            // exchanges for current positions and closes whatever exposure remains.
             if (this.bot.trade_on_primary_exchange) {
                 const primaryPositions = await (this.primaryClient as any).ccxtInstance.fetchPositions([symbol]);
                 for (const pos of primaryPositions) {
@@ -317,7 +386,8 @@ export class BotTrader {
         const sOpen = parseFloat(trade.secondary_open_price as any);
         const orderType = trade.order_type as 'buy' | 'sell';
 
-        // Liquid drawdown limit from BotConfig
+        // Liquidation protection: close if either leg's leveraged drawdown is
+        // above the configured per-leg threshold.
         const drawdownLimit = this.bot.max_leg_drawdown_percent || 80.0;
 
         if (emergencyPrices) {
@@ -330,6 +400,9 @@ export class BotTrader {
         }
 
         if (strictPrices) {
+            // Profit exit uses strict liquidity. If the full amount cannot be
+            // priced from the current book, skip the profit signal rather than
+            // closing on an unreliable partial VWAP.
             const currentPnL = calculateTruePnL({ pOpen, sOpen }, strictPrices, orderType);
             if (currentPnL >= this.bot.exit_spread) {
                 await this.executeClose('profit', strictPrices);
@@ -338,6 +411,8 @@ export class BotTrader {
     }
 
     private async executeClose(reason: 'profit' | 'timeout' | 'shutdown' | 'error' | 'liquidation' | 'force_close', prices: OrderbookPrices | null) {
+        // Close can be triggered by spread, timeout, shutdown, liquidation guard
+        // or manual force close. The busy flag prevents duplicate close orders.
         if (this.state.busy) return;
         this.state.busy = true;
 
@@ -361,6 +436,9 @@ export class BotTrader {
             const amount = parseFloat(trade.amount as any);
 
             if (isReal) {
+                // Before closing, fetch current exchange positions and close the
+                // actual position sizes. This handles partial fills and cleanup
+                // residue more accurately than blindly using the original amount.
                 const info = this.marketInfo.getInfo(symbol);
                 const minQty = info?.minQty || 0;
                 
@@ -381,10 +459,14 @@ export class BotTrader {
                 const closePromises = [];
 
                 if (this.bot.trade_on_primary_exchange && pSize >= minQty) {
+                    // reduceOnly avoids accidentally flipping direction if the
+                    // exchange position changed between fetch and order submit.
                     closePromises.push(this.primaryClient.createMarketOrder(symbol, primaryCloseSide, pSize, { reduceOnly: true }).then(r => {
                         pPrice = r.avgPrice; pOrder = r.orderId; closeCommission += r.commission;
                     }));
                 } else {
+                    // If the leg was disabled or too small to close, use current
+                    // orderbook price or fall back to the open price for reporting.
                     pPrice = primaryCloseSide === 'buy' ? (prices?.primaryAsk ?? pOpen) : (prices?.primaryBid ?? pOpen);
                 }
 
@@ -409,6 +491,8 @@ export class BotTrader {
             const openCommission = parseFloat(trade.open_commission as any) || 0;
             const totalCommission = openCommission + closeCommission;
             
+            // calculateRealPnL is used for both real and emulation closes so the
+            // persisted PnL formula stays consistent across modes.
             const { profitUsdt, profitPercentage } = calculateRealPnL(pOpen, sOpen, pPrice, sPrice, amount, orderType, totalCommission);
             const closeSpread = this.calculateCloseSpread(pPrice, sPrice, orderType);
             const closeStatus = (reason === 'profit' || reason === 'shutdown') ? 'closed' : 'force_closed';
@@ -423,6 +507,8 @@ export class BotTrader {
             };
             
             if (isReal) {
+               // Django does not have a "liquidation" close_reason choice, so the
+               // engine records it as error while retaining force_closed status.
                payload.close_reason = reason === 'liquidation' ? 'error' : reason;
                payload.primary_close_order_id = pOrder;
                payload.secondary_close_order_id = sOrder;
@@ -448,11 +534,15 @@ export class BotTrader {
     }
 
     private calculateCloseSpread(primaryPrice: number, secondaryPrice: number, orderType: 'buy' | 'sell'): number {
+        // Close spread is the reverse of the entry direction. The formula mirrors
+        // how calculateOpenSpread chooses bid/ask relationships for each side.
         if (orderType === 'buy') return ((primaryPrice - secondaryPrice) / secondaryPrice) * 100;
         else return ((secondaryPrice - primaryPrice) / primaryPrice) * 100;
     }
 
     private async checkTimeouts() {
+        // Timeouts are a hard risk control. They do not require profit conditions
+        // and use emergency prices so stale/partial depth does not block exit.
         if (!this.isRunning || !this.state.activeTrade || !this.state.openedAtMs || this.state.busy) return;
 
         const maxDurationMinutes = this.bot.max_trade_duration_minutes || 60;

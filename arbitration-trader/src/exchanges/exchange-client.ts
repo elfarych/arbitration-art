@@ -2,7 +2,9 @@ import type { OrderResult, SymbolMarketInfo } from '../types/index.js';
 
 /**
  * Unified interface for exchange operations.
- * Both Binance and Bybit clients implement this contract.
+ * All REST exchange clients implement this contract so Trader can place orders,
+ * set account parameters and read market constraints without exchange-specific
+ * branching in the trading loop.
  */
 export interface IExchangeClient {
     readonly name: string;

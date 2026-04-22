@@ -6,11 +6,19 @@ import { config } from '../config.js';
 
 const TAG = 'BybitClient';
 
+/**
+ * Bybit USDT perpetual REST adapter built on ccxt.
+ *
+ * Unlike Binance/Gate, Bybit can use ccxt directly for market loading, order
+ * placement and position queries. The adapter still normalizes results into the
+ * engine-wide OrderResult shape.
+ */
 export class BybitClient implements IExchangeClient {
     public readonly name = 'Bybit';
     private exchange: ccxt.bybit;
 
     constructor() {
+        // defaultType=swap makes ccxt target perpetual contracts rather than spot.
         this.exchange = new ccxt.bybit({
             apiKey: config.bybit.apiKey,
             secret: config.bybit.secret,
@@ -30,6 +38,7 @@ export class BybitClient implements IExchangeClient {
     }
 
     async loadMarkets(): Promise<void> {
+        // ccxt stores loaded market metadata on exchange.markets.
         await this.exchange.loadMarkets();
         logger.info(TAG, `Markets loaded: ${Object.keys(this.exchange.markets).length} symbols`);
     }
@@ -108,6 +117,8 @@ export class BybitClient implements IExchangeClient {
     }
 
     getMarketInfo(symbol: string): SymbolMarketInfo | null {
+        // ccxt exchanges can report amount precision either as decimal places or
+        // as a tick size. Check precisionMode before deriving stepSize.
         const market = this.exchange.markets[symbol];
         if (!market) return null;
 
@@ -132,10 +143,13 @@ export class BybitClient implements IExchangeClient {
     }
 
     getUsdtSymbols(): string[] {
+        // ccxt futures symbols usually end with :USDT, e.g. BTC/USDT:USDT.
         return Object.keys(this.exchange.markets).filter(sym => sym.endsWith(':USDT'));
     }
 
     private extractCommission(order: any): number {
+        // Normalize fee objects into an approximate USDT value. If the exchange
+        // charges non-USDT fees, this fallback multiplies by the order price.
         if (order.fees && Array.isArray(order.fees)) {
             return order.fees.reduce((total: number, fee: any) => {
                 if (fee.currency === 'USDT') {

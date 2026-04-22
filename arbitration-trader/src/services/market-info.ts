@@ -8,6 +8,9 @@ const TAG = 'MarketInfo';
 /**
  * Pre-loads and caches unified market info for all tradeable symbols.
  * Called ONCE at bootstrap — never during trade execution.
+ *
+ * The service merges both exchanges' constraints and keeps the strictest values
+ * so the same trade amount should be valid on both legs.
  */
 export class MarketInfoService {
     private cache: Map<string, UnifiedMarketInfo> = new Map();
@@ -24,7 +27,9 @@ export class MarketInfoService {
     ): Promise<string[]> {
         logger.info(TAG, `Initializing market info for ${commonSymbols.length} symbols...`);
 
-        // Fetch current prices to calculate static trade amounts and protect from ticker collisions
+        // Fetch current prices to calculate static trade amounts and protect from
+        // ticker collisions where two exchanges list different assets under the
+        // same symbol.
         let currentPrices: Record<string, number> = {};
         let secondaryPrices: Record<string, number> = {};
         try {
@@ -34,6 +39,7 @@ export class MarketInfoService {
                 secondaryClient.ccxtInstance.fetchTickers()
             ]);
             for (const sym of commonSymbols) {
+                // Keep ccxt symbols as keys throughout the service.
                 if (pTickers[sym]?.last) currentPrices[sym] = pTickers[sym].last;
                 if (sTickers[sym]?.last) secondaryPrices[sym] = sTickers[sym].last;
             }
@@ -52,7 +58,7 @@ export class MarketInfoService {
                 continue;
             }
 
-            // Use the strictest constraints from both exchanges
+            // Use the strictest constraints from both exchanges.
             const stepSize = Math.max(primaryInfo.stepSize, secondaryInfo.stepSize);
             const minQty = Math.max(primaryInfo.minQty, secondaryInfo.minQty);
             const minNotional = Math.max(primaryInfo.minNotional, secondaryInfo.minNotional);
@@ -63,6 +69,8 @@ export class MarketInfoService {
 
             // ==== Homonym / Ticker Collision Protection ====
             if (currentPrice && secondaryPrice) {
+                // A very large cross-exchange price deviation usually means this
+                // is not the same underlying asset, even if the ticker matches.
                 const deviation = Math.abs(currentPrice - secondaryPrice) / Math.min(currentPrice, secondaryPrice);
                 if (deviation > 0.40) {
                     logger.warn(TAG, `🚨 HOMONYM DETECTED: Skipping ${symbol}. Deviation: ${(deviation * 100).toFixed(0)}%. (${primaryClient.name}: ${currentPrice}, ${secondaryClient.name}: ${secondaryPrice})`);
@@ -74,18 +82,19 @@ export class MarketInfoService {
             }
 
             if (currentPrice) {
+                // Convert configured USDT budget into base-coin amount and then
+                // round down to a lot size that is valid on both exchanges.
                 const rawAmount = config.tradeAmountUsdt / currentPrice;
-                // Round DOWN to step size
                 tradeAmount = Math.floor(rawAmount / stepSize) * stepSize;
                 
-                // Validate against minimums
+                // Validate against both quantity and notional minimums.
                 const notionalValue = tradeAmount * currentPrice;
                 if (tradeAmount < minQty || notionalValue < minNotional) {
                     logger.debug(TAG, `Skipping ${symbol}: calculated amount ${tradeAmount} does not meet minimums. (${tradeAmount} < ${minQty} or ${notionalValue} < ${minNotional})`);
-                    continue; // exclude from tradeable
+                    continue;
                 }
 
-                // Clean up float errors, ensuring precision is at least 0
+                // Clean up float errors, ensuring precision is at least 0.
                 const precision = Math.max(0, Math.round(-Math.log10(stepSize)));
                 tradeAmount = parseFloat(tradeAmount.toFixed(precision));
             }
@@ -95,7 +104,7 @@ export class MarketInfoService {
                 stepSize,
                 minQty,
                 minNotional,
-                tradeAmount, // Pre-calculated fixed amount!
+                tradeAmount,
                 tradeable: true,
             };
 

@@ -8,13 +8,22 @@ import { config } from '../config.js';
 const TAG = 'GateClient';
 
 function ccxtToGate(symbol: string): string {
+    // Convert ccxt futures symbol format (BTC/USDT:USDT) to Gate contract format
+    // (BTC_USDT).
     return symbol.replace(':USDT', '').replace('/', '_');
 }
 
 function gateToCcxt(gateSymbol: string): string {
+    // Convert Gate contract names back to ccxt futures format.
     return gateSymbol.replace('_', '/') + ':USDT';
 }
 
+/**
+ * Gate USDT futures REST client.
+ *
+ * Gate uses contract sizes rather than raw base-coin amounts for order payloads,
+ * so this adapter performs explicit conversion through quanto_multiplier.
+ */
 export class GateClient implements IExchangeClient {
     public readonly name = 'Gate';
     private httpClient: AxiosInstance;
@@ -22,6 +31,7 @@ export class GateClient implements IExchangeClient {
     private markets: Map<string, any> = new Map();
 
     constructor() {
+        // Gate exposes separate base URLs for futures testnet and production.
         this.baseUrl = config.useTestnet 
             ? 'https://fx-api-testnet.gateio.ws/api/v4'
             : 'https://api.gateio.ws/api/v4';
@@ -31,7 +41,7 @@ export class GateClient implements IExchangeClient {
             timeout: 10000,
         });
 
-        // Error interceptor for debugging
+        // Normalize Gate API error payloads into Error.message.
         this.httpClient.interceptors.response.use(
             response => response,
             error => {
@@ -43,11 +53,12 @@ export class GateClient implements IExchangeClient {
         );
     }
 
-    // Required by logic checking fetchPositions on ccxtInstance in Trader.ts!
+    // Trader expects a small ccxt-like surface for tickers and position fetches.
     get ccxtInstance(): any {
         return {
             fetchTime: async () => Date.now(),
             fetchTickers: async () => {
+                // Convert Gate ticker contract names into ccxt symbols.
                 const data = await this.request('GET', '/futures/usdt/tickers');
                 const tickers: any = {};
                 for (const t of data) {
@@ -66,6 +77,8 @@ export class GateClient implements IExchangeClient {
                         const data = await this.request('GET', `/futures/usdt/positions/${gateSymbol}`);
                         if (data && data.size !== undefined && Number(data.size) !== 0) {
                             const market = this.markets.get(gateSymbol);
+                            // Gate reports futures position size in contracts.
+                            // Convert it back to base coin amount for Trader.
                             const multiplier = Number(market?.quanto_multiplier || 1);
                             const baseAmount = Math.abs(Number(data.size)) * multiplier;
 
@@ -87,6 +100,8 @@ export class GateClient implements IExchangeClient {
     }
 
     private sign(method: string, endpoint: string, query: string, payload: string) {
+        // Gate v4 signs method, full API path, query string, SHA512 payload hash
+        // and timestamp separated by newlines.
         const t = Math.floor(Date.now() / 1000).toString();
         const hashedPayload = crypto.createHash('sha512').update(payload).digest('hex');
         const signatureString = [method, endpoint, query, hashedPayload, t].join('\n');
@@ -126,6 +141,7 @@ export class GateClient implements IExchangeClient {
     }
 
     async loadMarkets(): Promise<void> {
+        // Cache futures contract metadata for conversion and sizing.
         const contracts = await this.request('GET', '/futures/usdt/contracts');
         this.markets.clear();
         for (const contract of contracts) {
@@ -150,8 +166,8 @@ export class GateClient implements IExchangeClient {
     async setIsolatedMargin(symbol: string): Promise<void> {
         const gateSymbol = ccxtToGate(symbol);
         try {
-            // Gate typically configures isolated mode dynamically when passing margin
-            // Try to force position into isolated if api supports it, or just ignore (as Gate isolates by default if not set to cross)
+            // Gate typically configures isolated mode dynamically when margin is
+            // set. This call is best-effort and skipped if unsupported.
             await this.request('POST', `/futures/usdt/positions/${gateSymbol}/margin`, {
                 size: "0" 
             });
@@ -168,7 +184,7 @@ export class GateClient implements IExchangeClient {
     async createMarketOrder(
         symbol: string,
         side: 'buy' | 'sell',
-        amount: number, // Base currency (BTC)
+        amount: number, // Base currency amount.
         params: any = {},
     ): Promise<OrderResult> {
         const gateSymbol = ccxtToGate(symbol);
@@ -178,11 +194,11 @@ export class GateClient implements IExchangeClient {
             throw new Error(`Market not loaded for ${symbol}`);
         }
 
-        // Convert base currency (BTC) to contract size
+        // Convert base currency amount to Gate contract count.
         const quantoMultiplier = Number(market.quanto_multiplier);
         let sizeInContracts = Math.round(amount / quantoMultiplier);
         
-        // Size positive for buy, negative for sell
+        // Gate uses positive size for buy/long and negative size for sell/short.
         if (side === 'sell') {
             sizeInContracts = -sizeInContracts;
         }
@@ -210,7 +226,8 @@ export class GateClient implements IExchangeClient {
         let filled = orderData;
         const orderId = orderData.id;
 
-        // Anti 0.00 Bug - Polling Loop for execution details.
+        // Gate can return fill_price=0 or status=open immediately after submit,
+        // so poll for final execution details.
         let retries = 0;
         let avgPrice = parseFloat(filled.fill_price || '0');
         
@@ -229,7 +246,8 @@ export class GateClient implements IExchangeClient {
             }
         }
 
-        // Commission is extracted from Gate's native response (negative for paid fees in USDT)
+        // Commission is extracted from Gate trade records; paid fees are negative
+        // in native responses, so use absolute value.
         let commission = 0;
         try {
             // Wait 500ms to ensure trades are flushed to db
@@ -244,7 +262,7 @@ export class GateClient implements IExchangeClient {
             logger.warn(TAG, `Failed to extract trades for order ${orderId}, fee left 0: ${e.message}`);
         }
 
-        // Compute actual filled base currency quantity
+        // Compute actual filled base currency quantity.
         const filledContracts = Math.abs(Number(filled.size) - Number(filled.left || 0));
         const filledQty = filledContracts * quantoMultiplier;
 
@@ -263,6 +281,7 @@ export class GateClient implements IExchangeClient {
     }
 
     getMarketInfo(symbol: string): SymbolMarketInfo | null {
+        // Convert Gate contract constraints into base-coin constraints.
         const gateSymbol = ccxtToGate(symbol);
         const market = this.markets.get(gateSymbol);
         
@@ -273,8 +292,7 @@ export class GateClient implements IExchangeClient {
         // Gate precision in API response: order_price_round (e.g. "0.1")
         const priceStep = Number(market.order_price_round);
         
-        // Gate order size step is in contracts (order_size_round). 
-        // We convert contract step size back to base currency.
+        // Gate order size step is in contracts. Convert it back to base currency.
         const sizeStepContracts = Number(market.order_size_round || '1');
         const stepSizeBase = sizeStepContracts * quantoMultiplier;
 

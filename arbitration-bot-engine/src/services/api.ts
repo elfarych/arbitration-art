@@ -5,6 +5,9 @@ import { logger } from '../utils/logger.js';
 
 const TAG = 'API';
 
+// Shared Django API client. The engine currently relies on Django endpoints that
+// are intentionally unauthenticated for service-to-service writes, so no JWT
+// header is attached here.
 const client: AxiosInstance = axios.create({
     baseURL: config.djangoApiUrl,
     headers: {
@@ -13,6 +16,12 @@ const client: AxiosInstance = axios.create({
     timeout: 15000,
 });
 
+/**
+ * Thin adapter around Django trade endpoints.
+ *
+ * BotTrader should not know endpoint URLs or pagination formats; it calls this
+ * module with normalized payloads and receives normalized TradeRecord objects.
+ */
 export const api = {
     async openTrade(payload: TradeOpenPayload): Promise<TradeRecord> {
         try {
@@ -38,6 +47,9 @@ export const api = {
 
     async getOpenTrades(): Promise<TradeRecord[]> {
         try {
+            // Django REST Framework may return paginated results. Support both
+            // paginated and raw-array responses so this client survives settings
+            // changes without breaking recovery.
             const { data } = await client.get('/bots/real-trades/', { params: { status: 'open' } });
             return data.results || data || [];
         } catch (e: any) {
@@ -48,6 +60,8 @@ export const api = {
 
     async openEmulationTrade(payload: TradeOpenPayload): Promise<TradeRecord> {
         try {
+            // Emulation trades are stored separately from real trades in Django,
+            // but BotTrader reuses the same internal payload shape.
             const { data } = await client.post('/bots/trades/', payload);
             return data;
         } catch (e: any) {
@@ -68,6 +82,8 @@ export const api = {
 
     async getOpenEmulationTrades(): Promise<TradeRecord[]> {
         try {
+            // Used during engine startup to recover a bot's active emulation
+            // trade after a process restart.
             const { data } = await client.get('/bots/trades/', { params: { status: 'open' } });
             return data.results || data || [];
         } catch (e: any) {

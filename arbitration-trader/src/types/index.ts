@@ -1,5 +1,9 @@
 // ──────────── Orderbook ────────────
 
+/**
+ * Normalized VWAP/top-of-book prices for one symbol across the configured
+ * primary and secondary exchanges.
+ */
 export interface OrderbookPrices {
     primaryBid: number;
     primaryAsk: number;
@@ -9,6 +13,9 @@ export interface OrderbookPrices {
 
 // ──────────── Market Info ────────────
 
+/**
+ * Exchange-specific market constraints converted into a common internal shape.
+ */
 export interface SymbolMarketInfo {
     symbol: string;
     /** Minimum order quantity (in coins) */
@@ -43,6 +50,9 @@ export interface UnifiedMarketInfo {
 
 // ──────────── Order Execution ────────────
 
+/**
+ * Unified result returned by all exchange clients after market order execution.
+ */
 export interface OrderResult {
     orderId: string;
     avgPrice: number;
@@ -55,6 +65,9 @@ export interface OrderResult {
 
 // ──────────── Trade (Django API) ────────────
 
+/**
+ * Payload used to create a real Trade record in Django after both legs open.
+ */
 export interface TradeOpenPayload {
     coin: string;
     primary_exchange: string;
@@ -73,6 +86,8 @@ export interface TradeOpenPayload {
 
 export interface TradeClosePayload {
     status: 'closed' | 'force_closed';
+    // Keep this union aligned with Django Trade.CloseReason choices. The trader
+    // maps liquidation to error before sending it to Django.
     close_reason: 'profit' | 'timeout' | 'shutdown' | 'error' | 'liquidation';
     primary_close_price: number;
     secondary_close_price: number;
@@ -86,6 +101,8 @@ export interface TradeClosePayload {
 }
 
 export interface TradeRecord {
+    // Django serializes DecimalField values as strings, so close logic parses
+    // numeric fields explicitly before PnL calculations.
     id: number;
     coin: string;
     primary_exchange: string;

@@ -1,6 +1,12 @@
 import * as dotenv from 'dotenv';
 dotenv.config();
 
+/**
+ * Read a required environment variable and fail during bootstrap if it is absent.
+ *
+ * The trader places real exchange orders, so missing credentials should stop the
+ * process before any market data or order setup starts.
+ */
 function requireEnv(name: string): string {
     const value = process.env[name];
     if (!value) {
@@ -9,6 +15,13 @@ function requireEnv(name: string): string {
     return value;
 }
 
+/**
+ * Process-wide runtime configuration.
+ *
+ * Unlike arbitration-bot-engine, this standalone trader uses global exchange
+ * credentials from .env and scans many symbols by itself. Values are parsed once
+ * at startup and then treated as immutable by the rest of the process.
+ */
 export const config = {
     // === Exchange credentials ===
     binance: {
@@ -29,8 +42,7 @@ export const config = {
     },
 
     // === Exchange Routing ===
-    // Выбор активных бирж для арбитража.
-    // Доступные варианты: binance, bybit, mexc, gate
+    // Active arbitrage route. Supported values: binance, bybit, mexc, gate.
     primaryExchange: process.env.PRIMARY_EXCHANGE?.toLowerCase() || 'binance',
     secondaryExchange: process.env.SECONDARY_EXCHANGE?.toLowerCase() || 'bybit',
 

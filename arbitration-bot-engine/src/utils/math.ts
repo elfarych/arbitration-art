@@ -8,11 +8,15 @@ import { logger } from './logger.js';
  */
 export function calculateOpenSpread(prices: OrderbookPrices, orderType: 'buy' | 'sell'): number {
     if (orderType === 'sell') {
+        // Entry for a sell-type arbitrage: sell/short primary at bid and buy/long
+        // secondary at ask. Positive spread means primary is richer than secondary.
         const pBid = prices.primaryBid;
         const sAsk = prices.secondaryAsk;
         if (!sAsk) return -Infinity;
         return ((pBid - sAsk) / sAsk) * 100;
     } else {
+        // Entry for a buy-type arbitrage: buy/long primary at ask and sell/short
+        // secondary at bid. Positive spread means secondary is richer than primary.
         const pAsk = prices.primaryAsk;
         const sBid = prices.secondaryBid;
         if (!pAsk) return -Infinity;
@@ -38,6 +42,9 @@ export function calculateTruePnL(
             (currentPrices.secondaryBid - currentPrices.primaryAsk);
 
         const entryPrice = openPrices.sOpen;
+        // This is an estimated fee model used for signal evaluation, not the
+        // final accounting metric. Real closes use calculateRealPnL with actual
+        // commissions from exchange responses.
         const estimatedFeesUsdt = entryPrice * 0.0020;
         return ((profitUsdt - estimatedFeesUsdt) / entryPrice) * 100;
     } else {
@@ -48,6 +55,8 @@ export function calculateTruePnL(
             (currentPrices.primaryBid - currentPrices.secondaryAsk);
 
         const entryPrice = openPrices.pOpen;
+        // Keep the same fee estimate as the sell direction so exit signals are
+        // directionally comparable.
         const estimatedFeesUsdt = entryPrice * 0.0020;
         return ((profitUsdt - estimatedFeesUsdt) / entryPrice) * 100;
     }
@@ -88,6 +97,8 @@ export function calculateRealPnL(
 
 /** Round a number to fit Django DecimalField constraints */
 export function d(value: number, decimals: number = 8): number {
+    // Django DecimalField accepts JSON numbers, but trimming precision here
+    // avoids sending values with long binary floating-point tails.
     return parseFloat(value.toFixed(decimals));
 }
 
@@ -116,11 +127,13 @@ export function checkLegDrawdown(
         pnlSecondaryRaw = (openPrices.sOpen - currentPrices.secondaryAsk) / openPrices.sOpen;
     }
 
-    // Convert to percentage and scale by leverage
+    // Convert to percentage and scale by leverage so the result approximates
+    // isolated margin drawdown rather than raw asset-price movement.
     const pnlPrimaryPercent = pnlPrimaryRaw * 100 * leverage;
     const pnlSecondaryPercent = pnlSecondaryRaw * 100 * leverage;
 
-    // We only care about negative PnL (drawdown)
+    // Only negative PnL contributes to drawdown. Profitable legs do not offset a
+    // losing leg for liquidation-risk purposes.
     const drawdownPrimary = pnlPrimaryPercent < 0 ? Math.abs(pnlPrimaryPercent) : 0;
     const drawdownSecondary = pnlSecondaryPercent < 0 ? Math.abs(pnlSecondaryPercent) : 0;
 
@@ -141,6 +154,8 @@ export function calculateVWAP(orderbookSide: [number, number][], targetCoins: nu
     let accQuoteVal = 0;
 
     for (const [price, volumeCoins] of orderbookSide) {
+        // Consume each level until the target size is filled. If the next level
+        // has more volume than needed, use only the remaining required amount.
         if (accCoins + volumeCoins >= targetCoins) {
             const neededCoins = targetCoins - accCoins;
             accCoins += neededCoins;
@@ -154,11 +169,13 @@ export function calculateVWAP(orderbookSide: [number, number][], targetCoins: nu
 
     if (accCoins < targetCoins) {
         if (!isEmergency) {
-            // КРИТИЧЕСКИЙ ФИКС: Для Входа и Тейк-Профита нам НУЖЕН полный объем. 
-            // Если в стакане не хватает монет - возвращаем NaN (Отменяем сигнал!)
+            // Entry and profit-taking require full visible liquidity. Returning
+            // NaN cancels the signal instead of letting the bot trade on a partial
+            // book and underestimate slippage.
             return NaN;
         }
-        // В случае экстренной ликвидации или таймаута берем что есть
+        // Emergency exits can use available depth because leaving risk open may
+        // be worse than accepting a less accurate VWAP estimate.
         logger.warn('Math', `Insufficient depth to fill ${targetCoins}. Using VWAP of available ${accCoins}`);
         return accQuoteVal / accCoins;
     }
