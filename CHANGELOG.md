@@ -5,6 +5,7 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- **`arbitration-bot-engine/`** — New Node.js/Fastify service providing an internal API to remotely control bot process lifecycles (start, stop, sync, force-close).
 - **`arbitration-trader/`** — New Node.js/TypeScript real trading service for Binance Futures + Bybit Futures arbitrage.
   - Configurable trade amount (USDT), leverage, max concurrent trades, trade timeout.
   - Pre-calculates unified coin amounts at startup (identical for both exchanges).

@@ -6,6 +6,7 @@ The **Arbitration Art** architecture follows a strictly decoupled client-server 
 2. **Backend (API):** A monolithic Django REST Framework application providing stateless JSON APIs.
 3. **Arbitration Scanner** (`arbitration-scanner/`): Node.js/TypeScript service that monitors price spreads between Binance Futures and Bybit Futures and records emulated trades to Django.
 4. **Arbitration Trader** (`arbitration-trader/`): Node.js/TypeScript service that performs **real arbitrage trading** on Binance Futures and Bybit Futures. Uses CCXT for exchange communication, WebSocket for orderbook monitoring, and records actual trade data (order IDs, fill prices, commissions) to Django.
+5. **Arbitration Bot Engine** (`arbitration-bot-engine/`): Node.js/Fastify service that provides internal API endpoints `/engine/bot/*` to manage the lifecycle of trading bot instances (start, stop, sync, force-close).
 
 ## Layers & Components
 

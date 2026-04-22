@@ -93,3 +93,21 @@ CRUD for real arbitrage trades (from `arbitration-trader`). No authentication re
 - **PATCH** `/bots/real-trades/{id}/` — Update a trade (close with actual fill data).
   - Body includes: `status`, `close_reason`, `primary_close_price`, `secondary_close_price`, `primary_close_order_id`, `secondary_close_order_id`, `close_spread`, `close_commission`, `profit_usdt`, `profit_percentage`, `closed_at`.
 
+## 5. Bot Engine API (`/engine/bot/`)
+Internal endpoints exposed by the Fastify **Arbitration Bot Engine** (`arbitration-bot-engine/src/main.ts`). Typically called by the Django backend to manage bot lifecycles. All endpoints return `{ "success": true }` on success or an error object.
+
+- **POST** `/engine/bot/start`
+  - Body: `{"bot_id": "<string|number>", "config": {...}, "keys": {...}}`
+  - Starts a new bot instance with the given configuration and exchange API keys.
+
+- **POST** `/engine/bot/stop`
+  - Body: `{"bot_id": "<string|number>"}`
+  - Gracefully stops the running bot process.
+
+- **POST** `/engine/bot/sync`
+  - Body: `{"bot_id": "<string|number>", "config": {...}}`
+  - Synchronizes a running bot instance with an updated configuration without full restart.
+
+- **POST** `/engine/bot/force-close`
+  - Body: `{"bot_id": "<string|number>"}`
+  - Forcefully and immediately terminates the bot process.
