@@ -265,6 +265,8 @@ export class BotTrader {
                 payload.open_commission = totalCommission;
             }
 
+            logger.info(this.tag, `📝 Open Payload Details:\n${JSON.stringify(payload, null, 2)}`);
+
             const tradeRecord = isReal ? await api.openTrade(payload) : await api.openEmulationTrade(payload);
 
             this.state.activeTrade = tradeRecord;
@@ -427,6 +429,8 @@ export class BotTrader {
                payload.close_commission = d(closeCommission, 6);
                payload.profit_usdt = d(profitUsdt, 6);
             }
+
+            logger.info(this.tag, `📝 Close Payload Details:\n${JSON.stringify(payload, null, 2)}`);
 
             if (isReal) await api.closeTrade(trade.id, payload);
             else await api.closeEmulationTrade(trade.id, payload);

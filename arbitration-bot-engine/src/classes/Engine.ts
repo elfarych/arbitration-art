@@ -91,9 +91,12 @@ export class Engine {
     }
 
     public syncBot(botId: number, config: any) {
+        logger.info('Engine', `Syncing config for Bot ${botId}: ${JSON.stringify(config)}`);
         const trader = this.traders.get(botId);
         if (trader) {
             trader.syncConfig(config);
+        } else {
+            logger.warn('Engine', `Bot ${botId} not found in this engine instance during sync.`);
         }
     }
 
