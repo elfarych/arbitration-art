@@ -5,7 +5,16 @@ import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
 import type { IExchangeClient } from '../exchanges/exchange-client.js';
 import type { MarketInfoService } from '../services/market-info.js';
-import type { OrderbookPrices, TradeRecord } from '../types/index.js';
+import type { OrderbookPrices, TradeClosePayload, TradeRecord } from '../types/index.js';
+
+type CloseTriggerReason = 'profit' | 'timeout' | 'shutdown' | 'error' | 'liquidation';
+
+interface PendingCloseSync {
+    payload: TradeClosePayload;
+    reason: CloseTriggerReason;
+    nextBaselineBuy: number | null;
+    nextBaselineSell: number | null;
+}
 
 /**
  * Per-symbol mutable runtime state.
@@ -24,6 +33,8 @@ interface PairState {
     busy: boolean;
     /** Cooldown timestamp: prevents rapid re-entry after failed orders */
     cooldownUntil: number;
+    /** Persisted exchange close data waiting to be synced into Django */
+    pendingCloseSync: PendingCloseSync | null;
 }
 
 /**
@@ -101,6 +112,7 @@ export class Trader {
                 openedAtMs: null,
                 busy: false,
                 cooldownUntil: 0,
+                pendingCloseSync: null,
             });
         }
     }
@@ -232,6 +244,11 @@ export class Trader {
         // Both websocket loops can call checkSpreads for the same symbol. The
         // busy flag prevents duplicate open/close operations.
         if (state.busy) return;
+
+        if (state.pendingCloseSync) {
+            await this.flushPendingClose(symbol, state);
+            return;
+        }
 
         const info = this.marketInfo.getInfo(symbol);
         if (!info) return;
@@ -392,6 +409,7 @@ export class Trader {
             // Record trade in Django with actual fill data. The local slot remains
             // reserved until executeClose releases it.
             const tradeRecord = await api.openTrade({
+                runtime_config: config.runtimeConfigId,
                 coin: symbol,
                 primary_exchange: `${this.primaryClient.name.toLowerCase()}_futures`,
                 secondary_exchange: `${this.secondaryClient.name.toLowerCase()}_futures`,
@@ -521,7 +539,7 @@ export class Trader {
     private async executeClose(
         symbol: string,
         state: PairState,
-        reason: 'profit' | 'timeout' | 'shutdown' | 'error' | 'liquidation',
+        reason: CloseTriggerReason,
         prices: OrderbookPrices | null,
         currentBuySpread?: number,
         currentSellSpread?: number,
@@ -613,51 +631,33 @@ export class Trader {
             const closeSpread = this.calculateCloseSpread(pPrice, sPrice, orderType);
             const closeStatus = reason === 'profit' ? 'closed' : 'force_closed';
 
-            try {
-                let isDbSaved = false;
-                let retries = 0;
-                while (!isDbSaved && retries < 10) {
-                    try {
-                        // Persist close details with retries. At this point
-                        // positions may already be flat, so losing the DB update
-                        // would make recovery ambiguous after restart.
-                        await api.closeTrade(trade.id, {
-                            status: closeStatus as 'closed' | 'force_closed',
-                            close_reason: reason === 'liquidation' ? 'error' as any : reason,
-                            primary_close_price: d(pPrice),
-                            secondary_close_price: d(sPrice),
-                            primary_close_order_id: pOrder,
-                            secondary_close_order_id: sOrder,
-                            close_spread: d(closeSpread, 4),
-                            close_commission: d(closeCommission, 6),
-                            profit_usdt: d(profitUsdt, 6),
-                            profit_percentage: d(profitPercentage, 4),
-                            closed_at: new Date().toISOString(),
-                        });
-                        isDbSaved = true;
-                    } catch (dbErr: any) {
-                        retries++;
-                        logger.error(this.tag, `❌ CRITICAL: Django update failed (ID: ${trade.id}): ${dbErr.message}. Attempt ${retries}/10. Retrying in 5s...`);
-                        if (retries < 10) await new Promise(r => setTimeout(r, 5000));
-                    }
-                }
-            } catch (err: any) {
-                logger.error(this.tag, `Unexpected error in DB saving loop: ${err.message}`);
+            const closePayload: TradeClosePayload = {
+                status: closeStatus as 'closed' | 'force_closed',
+                close_reason: reason === 'liquidation' ? 'error' : reason,
+                primary_close_price: d(pPrice),
+                secondary_close_price: d(sPrice),
+                primary_close_order_id: pOrder,
+                secondary_close_order_id: sOrder,
+                close_spread: d(closeSpread, 4),
+                close_commission: d(closeCommission, 6),
+                profit_usdt: d(profitUsdt, 6),
+                profit_percentage: d(profitPercentage, 4),
+                closed_at: new Date().toISOString(),
+            };
+
+            const isDbSaved = await this.persistCloseTrade(trade.id, closePayload);
+            if (!isDbSaved) {
+                state.pendingCloseSync = {
+                    payload: closePayload,
+                    reason,
+                    nextBaselineBuy: currentBuySpread ?? null,
+                    nextBaselineSell: currentSellSpread ?? null,
+                };
+                logger.error(this.tag, `❌ Close persisted on exchanges for ${symbol}, but Django sync is still pending. Runtime will retry until it succeeds.`);
+                return;
             }
 
-            state.activeTrade = null;
-            state.openedAtMs = null;
-            this.tradeCounter.release();
-
-            if (currentBuySpread !== undefined && currentSellSpread !== undefined) {
-                // Reset baselines to the latest spread after a profitable close so
-                // the bot does not immediately re-open on stale expansion.
-                state.baselineBuy = currentBuySpread;
-                state.baselineSell = currentSellSpread;
-            } else {
-                state.baselineBuy = null;
-                state.baselineSell = null;
-            }
+            this.finalizeClosedTrade(state, currentBuySpread ?? null, currentSellSpread ?? null);
 
             logger.info(this.tag, `✅ Closed ${symbol} (${reason}). PnL: ${profitUsdt.toFixed(4)} USDT (${profitPercentage.toFixed(3)}%)`);
 
@@ -687,6 +687,11 @@ export class Trader {
         const now = Date.now();
 
         for (const [symbol, state] of this.states) {
+            if (state.pendingCloseSync && !state.busy) {
+                await this.flushPendingClose(symbol, state);
+                continue;
+            }
+
             if (!state.activeTrade || !state.openedAtMs || state.busy) continue;
 
             const elapsed = now - state.openedAtMs;
@@ -704,7 +709,7 @@ export class Trader {
 
     private async closeAllPositions(reason: 'shutdown' | 'error') {
         const openTrades = [...this.states.entries()]
-            .filter(([_, state]) => state.activeTrade !== null);
+            .filter(([_, state]) => state.activeTrade !== null || state.pendingCloseSync !== null);
 
         if (openTrades.length === 0) return;
 
@@ -712,6 +717,11 @@ export class Trader {
 
         for (const [symbol, state] of openTrades) {
             try {
+                if (state.pendingCloseSync) {
+                    await this.flushPendingClose(symbol, state);
+                    continue;
+                }
+
                 // Shutdown close uses emergency prices because the process should
                 // prioritize flattening positions over strict full-depth pricing.
                 const targetCoins = parseFloat(state.activeTrade!.amount as any);
@@ -720,6 +730,72 @@ export class Trader {
             } catch (e: any) {
                 logger.error(this.tag, `Failed to close ${symbol} during ${reason}: ${e.message}`);
             }
+        }
+    }
+
+    private async persistCloseTrade(tradeId: number, payload: TradeClosePayload): Promise<boolean> {
+        let retries = 0;
+
+        while (retries < 10) {
+            try {
+                // Persist close details with retries. At this point positions may
+                // already be flat, so losing the DB update would make recovery
+                // ambiguous after restart.
+                await api.closeTrade(tradeId, payload);
+                return true;
+            } catch (dbErr: any) {
+                retries++;
+                logger.error(this.tag, `❌ CRITICAL: Django update failed (ID: ${tradeId}): ${dbErr.message}. Attempt ${retries}/10. Retrying in 5s...`);
+                if (retries < 10) {
+                    await new Promise(r => setTimeout(r, 5000));
+                }
+            }
+        }
+
+        return false;
+    }
+
+    private finalizeClosedTrade(
+        state: PairState,
+        nextBaselineBuy: number | null,
+        nextBaselineSell: number | null,
+    ): void {
+        state.activeTrade = null;
+        state.openedAtMs = null;
+        state.pendingCloseSync = null;
+        this.tradeCounter.release();
+
+        if (nextBaselineBuy !== null && nextBaselineSell !== null) {
+            // Reset baselines to the latest spread after a profitable close so
+            // the bot does not immediately re-open on stale expansion.
+            state.baselineBuy = nextBaselineBuy;
+            state.baselineSell = nextBaselineSell;
+            return;
+        }
+
+        state.baselineBuy = null;
+        state.baselineSell = null;
+    }
+
+    private async flushPendingClose(symbol: string, state: PairState): Promise<void> {
+        if (!state.activeTrade || !state.pendingCloseSync || state.busy) {
+            return;
+        }
+
+        state.busy = true;
+
+        try {
+            const isDbSaved = await this.persistCloseTrade(state.activeTrade.id, state.pendingCloseSync.payload);
+            if (!isDbSaved) {
+                logger.error(this.tag, `❌ Django close sync is still pending for ${symbol}. Exchange positions stay flat, local state remains locked.`);
+                return;
+            }
+
+            const { reason, nextBaselineBuy, nextBaselineSell } = state.pendingCloseSync;
+            this.finalizeClosedTrade(state, nextBaselineBuy, nextBaselineSell);
+            logger.info(this.tag, `✅ Pending Django close sync completed for ${symbol} (${reason}).`);
+        } finally {
+            state.busy = false;
         }
     }
 }

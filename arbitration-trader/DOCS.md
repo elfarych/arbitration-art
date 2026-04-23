@@ -8,10 +8,12 @@
 
 `arbitration-trader` - standalone TypeScript/Node.js процесс для реальной арбитражной торговли между двумя выбранными futures/derivatives биржами.
 
-В отличие от `arbitration-bot-engine`, этот проект не принимает команды от Django для запуска отдельных ботов. Он сам:
+Сервис поднимает HTTP control plane, принимает `POST /engine/trader/{start|sync|stop}` от Django, держит в одном процессе только один активный `TraderRuntimeConfig` и получает биржевые ключи/торговые параметры в payload.
 
-- читает `.env`;
-- выбирает primary/secondary exchanges;
+Сервис:
+
+- читает из `.env` только инфраструктурные переменные (`DJANGO_API_URL`, `PORT`, `SERVICE_SHARED_TOKEN`);
+- получает runtime-конфиг и ключи пользователя из Django;
 - загружает markets;
 - находит пересечение USDT perpetual symbols;
 - фильтрует самые ликвидные пары;
@@ -29,6 +31,7 @@
 - Открытие cross-exchange arbitrage сделки при расширении spread относительно EMA baseline.
 - Закрытие по profit threshold, timeout, shutdown или liquidation/drawdown guard.
 - Восстановление открытых сделок из Django после рестарта.
+- Восстановление только тех открытых сделок, которые относятся к текущему `runtime_config_id`.
 
 Это real-trading сервис. Ошибки конфигурации, ключей, времени сервера, закрытия позиций или синхронизации с Django могут приводить к реальным финансовым потерям.
 
@@ -88,6 +91,7 @@ arbitration-trader/
     ├── main.ts
     ├── config.ts
     ├── classes/
+    │   ├── RuntimeManager.ts
     │   └── Trader.ts
     ├── exchanges/
     │   ├── exchange-client.ts
@@ -117,14 +121,16 @@ arbitration-trader/
 Высокоуровневый поток:
 
 ```text
-.env
+Django
+  |
+  | POST /engine/trader/{start|sync|stop}
+  v
+main.ts control plane
   |
   v
-config.ts
+RuntimeManager
   |
-  v
-main.ts bootstrap
-  |
+  +--> active runtime payload in config.ts
   +--> REST exchange clients
   +--> market discovery/filtering
   +--> MarketInfoService
@@ -137,7 +143,7 @@ main.ts bootstrap
               +--> calculate spreads / VWAP / PnL
               +--> place market orders
               +--> cleanup partial failures
-              +--> persist trades to Django
+              +--> persist trades to Django via service token
 ```
 
 Ключевые особенности:
@@ -345,6 +351,12 @@ If setup fails for a symbol, that symbol is excluded from final tradable list.
 
 If no symbols remain after setup, process exits.
 
+Additional guarantees:
+
+- startup aborts if open-trade recovery from Django fails;
+- Gate/MEXC setup warnings are not treated as successful setup;
+- a symbol is allowed into scanning only after both exchanges confirmed the requested margin/leverage state.
+
 ### 6.9. WebSocket clients
 
 `createWsClient(name)` returns ccxt.pro exchange instance:
@@ -401,6 +413,8 @@ const openTrades = await api.getOpenTrades();
 Then each open trade is assigned to the `Trader` whose `symbols` include `trade.coin`.
 
 If no matching trader chunk exists, trade is ignored with warning.
+
+If `getOpenTrades()` fails, runtime startup is aborted. The trader does not continue with an empty in-memory state while exchange exposure may still exist.
 
 ### 6.13. Shutdown
 
@@ -707,10 +721,16 @@ Flow:
 10. Update Django with retries:
    - up to 10 attempts;
    - 5s delay between attempts.
-11. Clear active trade and opened timestamp.
-12. Release trade slot.
-13. Reset or update baselines.
-14. On exchange close error, do not clear local state; next tick will retry.
+11. If Django still does not accept the close payload:
+   - keep `activeTrade` in local state;
+   - keep the trade slot reserved;
+   - store the exact close payload in pending sync state;
+   - retry Django close sync until it succeeds.
+12. Only after successful close persistence:
+   - clear active trade and opened timestamp;
+   - release trade slot;
+   - reset or update baselines.
+13. On exchange close error, do not clear local state; next tick will retry.
 
 Close status:
 
@@ -745,10 +765,20 @@ For each active trade:
 `closeAllPositions(reason)`:
 
 - finds all states with active trades;
+- retries pending Django close sync first if positions are already flat;
 - closes each using emergency prices;
 - logs errors but continues.
 
 Used by `stop(true)`.
+
+### 8.14. Runtime crash handling
+
+If any `Trader` loop rejects unexpectedly:
+
+- runtime crash is logged;
+- `RuntimeManager` marks the runtime as inactive;
+- graceful stop is triggered automatically;
+- `/health` no longer reports the crashed runtime as active.
 
 ## 9. Math utilities
 
@@ -1249,3 +1279,265 @@ Fix `DEPLOY_LINUX.md` secret variable names before production deployment.
 9. Add health metrics: active trades, WS errors, close retries, cleanup count.
 10. Add lock/lease if more than one process can run.
 
+## 24. Workflow summary
+
+This section consolidates the operational flow that was previously kept in `WORKFLOW.md`.
+
+### 24.1. Service purpose
+
+`arbitration-trader` is a standalone real-trading process that:
+
+- accepts lifecycle commands from Django over HTTP;
+- keeps only one active runtime in a process;
+- receives exchange keys and trading parameters from Django payloads;
+- connects to two futures exchanges;
+- scans a shared set of liquid USDT perpetual symbols;
+- opens two opposite market legs when spread expands beyond baseline;
+- closes by profit, timeout, shutdown, or drawdown/liquidation guard;
+- persists real trades into Django through service-token-authenticated requests.
+
+### 24.2. What comes from `.env`
+
+The service reads only infrastructure variables from `.env`:
+
+- `DJANGO_API_URL`
+- `SERVICE_SHARED_TOKEN`
+- `PORT`
+
+Trading configuration and user exchange keys arrive from Django runtime payloads sent to:
+
+- `POST /engine/trader/start`
+- `POST /engine/trader/sync`
+
+### 24.3. Control plane
+
+The HTTP server exposes:
+
+- `GET /health`
+- `POST /engine/trader/start`
+- `POST /engine/trader/sync`
+- `POST /engine/trader/stop`
+
+All endpoints except `/health` require `X-Service-Token`.
+
+Command behavior:
+
+1. `start`
+   - stop current runtime if one is active;
+   - start a new runtime from payload.
+2. `sync`
+   - perform a controlled restart with a fresh payload.
+3. `stop`
+   - stop the active runtime;
+   - if `runtime_config_id` is provided, it must match the active runtime.
+
+### 24.4. Runtime bootstrap sequence
+
+`RuntimeManager.startRuntime()` performs the following steps:
+
+1. Store runtime payload in `config.ts`.
+2. Create primary and secondary REST clients.
+3. Validate that exchanges differ.
+4. Measure approximate latency.
+5. Load markets on both exchanges.
+6. Build the intersection of USDT futures symbols.
+7. Filter by primary-exchange liquidity.
+8. Initialize `MarketInfoService`.
+9. Merge and validate market constraints.
+10. Configure isolated margin and leverage on both exchanges.
+11. Create shared WebSocket clients.
+12. Split symbols into chunks.
+13. Fetch open Django trades for the current `runtime_config_id`.
+14. Create `Trader` instances for chunks.
+15. Restore open trades into matching traders.
+16. Start all `Trader` workers.
+
+If recovery of open trades from Django fails at step 13, runtime startup is aborted.
+
+### 24.5. Symbol selection logic
+
+The runtime trades only symbols that pass all of the following:
+
+1. Present on both exchanges as USDT perpetual/futures symbols.
+2. Have primary-exchange `quoteVolume >= 2_000_000`.
+3. Fit within `top_liquid_pairs_count`.
+4. Pass `MarketInfoService` validation:
+   - merged `stepSize`
+   - merged `minQty`
+   - merged `minNotional`
+5. Are not filtered by homonym detection:
+   - if cross-exchange price deviation exceeds 40%, symbol is skipped.
+6. Successfully confirm isolated margin and leverage setup on both exchanges.
+
+Warnings from exchange setup are not treated as successful configuration.
+
+### 24.6. Trader runtime state
+
+Each `Trader` owns a chunk of symbols and keeps per-symbol mutable state:
+
+- `baselineBuy`
+- `baselineSell`
+- `activeTrade`
+- `openedAtMs`
+- `busy`
+- `cooldownUntil`
+- `pendingCloseSync`
+
+Two watch loops run per symbol, one per exchange WebSocket feed. `busy` acts as a local mutex to prevent duplicate open/close handling from concurrent book updates.
+
+### 24.7. Price and size calculation
+
+The strategy uses VWAP instead of top-of-book:
+
+1. Read both orderbooks from ccxt.pro in-memory cache.
+2. Determine target size:
+   - entry uses current configured trade size;
+   - close uses exact stored Django trade amount.
+3. Build four prices:
+   - `primaryBid`
+   - `primaryAsk`
+   - `secondaryBid`
+   - `secondaryAsk`
+
+If depth is insufficient:
+
+- entry and profit-close are skipped;
+- emergency exits can use approximate VWAP over available visible depth.
+
+Entry amount is:
+
+1. derived from `trade_amount_usdt`;
+2. converted using current primary best bid;
+3. rounded down by unified `stepSize`;
+4. validated against merged `minQty` and `minNotional`.
+
+### 24.8. Entry workflow
+
+When a symbol has no active trade:
+
+1. Compute `currentBuySpread` and `currentSellSpread`.
+2. Update separate EMA baselines for buy and sell directions.
+3. Check global `TradeCounter`.
+4. Enforce per-symbol cooldown.
+5. Open when:
+   - `currentBuySpread >= baselineBuy + openThreshold`, or
+   - `currentSellSpread >= baselineSell + openThreshold`.
+
+Direction semantics:
+
+- `buy`
+  - long primary
+  - short secondary
+- `sell`
+  - short primary
+  - long secondary
+
+`executeOpen()`:
+
+1. Locks the symbol with `busy`.
+2. Reserves a trade slot atomically.
+3. Sends both market orders concurrently.
+4. On partial failure:
+   - attempt reverse reduce-only rollback;
+   - run full position cleanup;
+   - release slot;
+   - apply cooldown.
+5. On success:
+   - use actual fill prices or VWAP fallback;
+   - sum fees;
+   - recompute real open spread;
+   - create Django trade;
+   - store `activeTrade` and `openedAtMs`.
+
+### 24.9. Recovery behavior
+
+At startup, open trades are loaded from Django for the current runtime only and distributed by `trade.coin` to the matching `Trader`.
+
+`restoreOpenTrades()`:
+
+- restores local `activeTrade`;
+- restores `openedAtMs`;
+- increments shared `TradeCounter`.
+
+This ensures:
+
+- restored exposure still counts against concurrency;
+- timeout and drawdown guards continue after restart;
+- runtime does not open new trades over restored positions.
+
+### 24.10. Exit workflow
+
+When a symbol has `activeTrade`, no new entry is evaluated. Exit checks run in this order:
+
+1. Drawdown/liquidation guard using emergency prices.
+2. Profit close using strict prices and `calculateTruePnL`.
+3. Timeout close via watchdog every 10 seconds.
+
+`executeClose()`:
+
+1. Lock symbol with `busy`.
+2. Determine close side per exchange.
+3. Fetch real positions from both exchanges.
+4. Close only legs that are still open.
+5. Use reduce-only market orders.
+6. Use fallback prices if a leg is already flat or execution price is missing.
+7. Compute:
+   - close commission
+   - total commission
+   - real PnL
+   - close spread
+   - final status
+8. Persist close into Django with retry loop.
+
+If exchange close succeeded but Django close sync still failed after retries:
+
+- keep `activeTrade` locally;
+- keep the trade slot reserved;
+- store close payload in `pendingCloseSync`;
+- retry Django close sync until it succeeds.
+
+Only after successful close persistence:
+
+- clear `activeTrade`;
+- clear `openedAtMs`;
+- clear `pendingCloseSync`;
+- release `TradeCounter` slot;
+- reset or refresh baselines.
+
+Close status mapping:
+
+- `profit` -> `closed`
+- all other close triggers -> `force_closed`
+
+Close reason mapping to Django:
+
+- `liquidation` -> `error`
+- `profit`, `timeout`, `shutdown`, `error` are sent unchanged
+
+### 24.11. Shutdown and crash handling
+
+On `SIGINT`, `SIGTERM`, or runtime stop:
+
+1. `RuntimeManager` clears active runtime handle.
+2. Each `Trader` runs `stop(true)`.
+3. Active trades are closed with emergency pricing.
+4. If only Django close sync is pending, it is retried first.
+5. Shared WebSocket clients are closed.
+
+If a `Trader` worker rejects unexpectedly:
+
+- the crash is logged;
+- runtime is marked inactive;
+- controlled stop is triggered automatically;
+- `/health` no longer reports the crashed runtime as active.
+
+### 24.12. Key operational nuances
+
+1. Only one runtime can be active in a process.
+2. Market constraints are preloaded at bootstrap and not recomputed during trading.
+3. WebSocket clients are shared across all trader chunks.
+4. Entry/profit checks require full visible depth; emergency exits prioritize flattening over exact pricing.
+5. Cleanup after failed opens relies on real `fetchPositions`, not only local assumptions.
+6. Close persistence in Django is treated as required state synchronization, not best-effort logging.
+7. Dust positions below `minQty` may be ignored by close logic.
+8. `profitPercentage` is calculated against notional capital, not isolated margin after leverage.

@@ -1,27 +1,28 @@
 # Arbitration Art Django Backend - внутренняя документация
 
-Дата анализа: 2026-04-22.
+Дата анализа: 2026-04-23.
 
 Документ описывает фактическое состояние проекта `arbitration-art-django`: структуру, настройки, модели, API, интеграции, команды запуска и важные инженерные замечания. Это не пользовательский README, а рабочая карта проекта для быстрого восстановления контекста.
 
 ## 1. Краткое резюме
 
-`arbitration-art-django` - Django/DRF backend для Arbitration Art. Проект хранит пользователей, настройки арбитражных ботов, эмуляционные сделки и реальные сделки. API работает через JWT, а часть торговых endpoints открыта для внешнего движка/сканера.
+`arbitration-art-django` - Django/DRF backend для Arbitration Art. Проект хранит пользователей, настройки арбитражных ботов, runtime-конфиги standalone trader, эмуляционные сделки и реальные сделки. Пользовательские API работают через JWT, а service-to-service записи и recovery защищены общим `X-Service-Token`.
 
 Основные роли backend:
 
 - Аутентификация пользователей через Simple JWT.
-- Хранение пользовательских API-ключей бирж в модели `UserExchangeKeys`.
-- CRUD настроек ботов `BotConfig` с привязкой к владельцу.
-- Синхронизация созданных/обновленных/удаленных ботов с внешним bot-engine по HTTP.
+- Хранение пользовательских API-ключей бирж в модели `UserExchangeKeys`, включая MEXC.
+- CRUD настроек ботов `BotConfig` с привязкой к владельцу и per-record `service_url`.
+- CRUD `TraderRuntimeConfig` для управляемого из Django standalone `arbitration-trader`.
+- Сигнальную синхронизацию lifecycle-команд с внешними runtime-сервисами через service layer и `transaction.on_commit(...)`.
 - Хранение истории эмуляционных сделок `EmulationTrade`.
-- Хранение истории реальных сделок `Trade`.
+- Хранение истории реальных сделок `Trade` с привязкой к `owner` и источнику запуска (`bot` или `runtime_config`).
 - Django admin для ручного просмотра и редактирования основных сущностей.
 
 Текущие приложения:
 
 - `apps.users` - кастомная модель пользователя, exchange keys, auth API.
-- `apps.bots` - настройки ботов, сделки, bot-engine sync, API.
+- `apps.bots` - настройки ботов, runtime-конфиги standalone trader, сделки, lifecycle sync, API.
 
 ## 2. Технологический стек
 
@@ -1334,4 +1335,3 @@ venv/bin/python manage.py check --deploy --settings=arbitration_art_django.setti
 - `/api/bots/{id}/force-close/`;
 - `/api/bots/trades/?status=open`;
 - `/api/bots/real-trades/?status=open`.
-

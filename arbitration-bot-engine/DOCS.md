@@ -1,8 +1,8 @@
 # Arbitration Bot Engine - внутренняя документация
 
-Дата анализа: 2026-04-22.
+Дата анализа: 2026-04-23.
 
-Документ описывает фактическое состояние проекта `arbitration-bot-engine`: назначение сервиса, архитектуру, HTTP API, торговый цикл, exchange-адаптеры, интеграцию с Django, команды запуска, текущие блокеры сборки и технические риски. Это рабочая документация для быстрого восстановления контекста перед изменениями.
+Документ описывает фактическое состояние проекта `arbitration-bot-engine`: назначение сервиса, архитектуру, HTTP API, торговый цикл, exchange-адаптеры, интеграцию с Django и технические риски. Это рабочая документация для быстрого восстановления контекста перед изменениями.
 
 ## 1. Краткое резюме
 
@@ -11,16 +11,27 @@
 Главные обязанности engine:
 
 - Поднять Fastify HTTP API на порту `3001`.
-- Получать от Django команды `start`, `sync`, `stop`, `force-close`.
+- Получать от Django команды `start`, `sync`, `stop`, `force-close` только при валидном `X-Service-Token`.
 - Создавать REST-клиенты бирж для account/order операций.
 - Создавать WebSocket-клиенты `ccxt.pro` для live orderbook данных.
 - Рассчитывать VWAP, spread, PnL, drawdown и timeout exits.
 - Открывать/закрывать сделки в real mode через exchange REST API.
 - В emulator mode не трогать биржи, а писать сделки в Django как эмуляционные.
-- Синхронизировать trade state в Django через `/api/bots/real-trades/` и `/api/bots/trades/`.
-- Восстанавливать открытые сделки из Django при старте бота.
+- Синхронизировать trade state в Django через `/api/bots/real-trades/` и `/api/bots/trades/` с service token.
+- Восстанавливать открытые сделки из Django при старте бота только в scope конкретного `bot_id`.
 
 Текущий проект небольшой, но он работает в высокорисковой зоне: real trading, API keys, market orders, cross-exchange exposure, partial fills, liquidation/timeout exits.
+
+## 1.1. Обновление от 2026-04-23
+
+Ключевые изменения:
+
+- `src/main.ts` проверяет `X-Service-Token` на всех control-plane endpoints.
+- `src/services/api.ts` отправляет тот же service token обратно в Django и фильтрует recovery по `bot_id`.
+- `src/config.ts` больше не находится в сломанном состоянии: в нем появились `serviceToken` и `tradeAmountUsdt`, сборка `pnpm build` проходит.
+- REST exchange clients теперь принимают credentials через constructor, что соответствует текущему `Engine.createRestClient(...)`.
+
+Важно: ниже по документу могут встречаться исторические упоминания `AllowAny`, отсутствующего service token и сломанной сборки `config.ts`. Их нужно читать как описание состояния до обновления 2026-04-23; актуальное поведение зафиксировано в этом разделе и в коде `src/{main.ts,config.ts,services/api.ts,classes/Engine.ts}`.
 
 ## 2. Технологический стек
 
@@ -1592,4 +1603,3 @@ Comments focus on:
 - risk-control logic;
 - Django API assumptions;
 - current contract gaps.
-

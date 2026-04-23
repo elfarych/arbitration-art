@@ -1,5 +1,42 @@
 from django.conf import settings
 from django.db import models
+from django.db.models import F, Q
+from django.utils import timezone
+
+
+def default_bot_service_url() -> str:
+    """Return the default control-plane URL for bot-engine instances."""
+
+    return getattr(settings, "BOT_ENGINE_SERVICE_URL_DEFAULT", "http://127.0.0.1:3001")
+
+
+class SyncStatus(models.TextChoices):
+    """Status of the latest lifecycle sync attempt."""
+
+    IDLE = "idle", "Idle"
+    PENDING = "pending", "Pending"
+    SUCCESS = "success", "Success"
+    FAILED = "failed", "Failed"
+
+
+class RuntimeStatus(models.TextChoices):
+    """Best-effort runtime state tracked by Django."""
+
+    STOPPED = "stopped", "Stopped"
+    STARTING = "starting", "Starting"
+    RUNNING = "running", "Running"
+    STOPPING = "stopping", "Stopping"
+    ERROR = "error", "Error"
+    ARCHIVED = "archived", "Archived"
+
+
+class LifecycleCommand(models.TextChoices):
+    """Lifecycle commands sent from Django to external services."""
+
+    START = "start", "Start"
+    SYNC = "sync", "Sync"
+    STOP = "stop", "Stop"
+    FORCE_CLOSE = "force-close", "Force close"
 
 
 class BotConfig(models.Model):
@@ -9,6 +46,7 @@ class BotConfig(models.Model):
         BINANCE_FUTURES = "binance_futures", "Binance Futures"
         BINANCE_SPOT = "binance_spot", "Binance Spot"
         BYBIT_FUTURES = "bybit_futures", "Bybit Futures"
+        GATE_FUTURES = "gate_futures", "Gate Futures"
         MEXC_FUTURES = "mexc_futures", "Mexc Futures"
 
     class OrderType(models.TextChoices):
@@ -25,6 +63,11 @@ class BotConfig(models.Model):
         on_delete=models.CASCADE,
         related_name="bot_configs",
         verbose_name="owner",
+    )
+    service_url = models.URLField(
+        "service url",
+        max_length=500,
+        default=default_bot_service_url,
     )
     primary_exchange = models.CharField(
         "primary exchange",
@@ -72,6 +115,26 @@ class BotConfig(models.Model):
     max_trade_duration_minutes = models.PositiveIntegerField("max trade duration (m)", default=60)
     max_leg_drawdown_percent = models.FloatField("max leg drawdown %", default=80.0)
     is_active = models.BooleanField("active", default=True)
+    status = models.CharField(
+        "runtime status",
+        max_length=20,
+        choices=RuntimeStatus.choices,
+        default=RuntimeStatus.STOPPED,
+    )
+    sync_status = models.CharField(
+        "sync status",
+        max_length=20,
+        choices=SyncStatus.choices,
+        default=SyncStatus.IDLE,
+    )
+    last_command = models.CharField(
+        "last command",
+        max_length=20,
+        choices=LifecycleCommand.choices,
+        blank=True,
+    )
+    last_sync_error = models.TextField("last sync error", blank=True)
+    last_synced_at = models.DateTimeField("last synced at", null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -82,6 +145,134 @@ class BotConfig(models.Model):
 
     def __str__(self) -> str:
         return f"{self.coin} | {self.primary_exchange} → {self.secondary_exchange}"
+
+
+class TraderRuntimeConfig(models.Model):
+    """Managed runtime configuration for the standalone trader service."""
+
+    class Exchange(models.TextChoices):
+        BINANCE = "binance", "Binance"
+        BYBIT = "bybit", "Bybit"
+        GATE = "gate", "Gate"
+        MEXC = "mexc", "MEXC"
+
+    owner = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="trader_runtime_configs",
+        verbose_name="owner",
+    )
+    name = models.CharField("name", max_length=255)
+    service_url = models.URLField("service url", max_length=500)
+    primary_exchange = models.CharField(
+        "primary exchange",
+        max_length=20,
+        choices=Exchange.choices,
+    )
+    secondary_exchange = models.CharField(
+        "secondary exchange",
+        max_length=20,
+        choices=Exchange.choices,
+    )
+    use_testnet = models.BooleanField("use testnet", default=False)
+    trade_amount_usdt = models.DecimalField(
+        "trade amount (USDT)",
+        max_digits=18,
+        decimal_places=8,
+    )
+    leverage = models.PositiveIntegerField("leverage", default=10)
+    max_concurrent_trades = models.PositiveIntegerField("max concurrent trades", default=3)
+    top_liquid_pairs_count = models.PositiveIntegerField("top liquid pairs count", default=100)
+    max_trade_duration_minutes = models.PositiveIntegerField("max trade duration (m)", default=60)
+    max_leg_drawdown_percent = models.DecimalField(
+        "max leg drawdown %",
+        max_digits=6,
+        decimal_places=2,
+        default=80,
+    )
+    open_threshold = models.DecimalField("open threshold", max_digits=10, decimal_places=4)
+    close_threshold = models.DecimalField("close threshold", max_digits=10, decimal_places=4)
+    orderbook_limit = models.PositiveIntegerField("orderbook limit", default=50)
+    chunk_size = models.PositiveIntegerField("chunk size", default=10)
+    is_active = models.BooleanField("active", default=True)
+    status = models.CharField(
+        "runtime status",
+        max_length=20,
+        choices=RuntimeStatus.choices,
+        default=RuntimeStatus.STOPPED,
+    )
+    sync_status = models.CharField(
+        "sync status",
+        max_length=20,
+        choices=SyncStatus.choices,
+        default=SyncStatus.IDLE,
+    )
+    last_command = models.CharField(
+        "last command",
+        max_length=20,
+        choices=LifecycleCommand.choices,
+        blank=True,
+    )
+    last_sync_error = models.TextField("last sync error", blank=True)
+    last_synced_at = models.DateTimeField("last synced at", null=True, blank=True)
+    is_deleted = models.BooleanField("is deleted", default=False)
+    archived_at = models.DateTimeField("archived at", null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "trader runtime configuration"
+        verbose_name_plural = "trader runtime configurations"
+        ordering = ["-created_at"]
+        constraints = [
+            models.CheckConstraint(
+                condition=~Q(primary_exchange=F("secondary_exchange")),
+                name="trader_runtime_config_distinct_exchanges",
+            ),
+            models.UniqueConstraint(
+                fields=("owner",),
+                condition=Q(is_deleted=False),
+                name="unique_active_trader_runtime_config_per_owner",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.name} [{self.owner}]"
+
+    def archive(self) -> None:
+        """Archive the runtime config instead of deleting it physically."""
+
+        if self.is_deleted:
+            return
+
+        if self.pk is None:
+            raise ValueError("TraderRuntimeConfig must be saved before archive().")
+
+        should_stop_runtime = self.is_active or self.status not in {
+            RuntimeStatus.STOPPED,
+            RuntimeStatus.ARCHIVED,
+        }
+        if should_stop_runtime:
+            from apps.bots.services.lifecycle import sync_trader_runtime_lifecycle
+
+            sync_trader_runtime_lifecycle(self.pk, LifecycleCommand.STOP)
+
+        archived_at = self.archived_at or timezone.now()
+        updated_at = timezone.now()
+
+        type(self).objects.filter(pk=self.pk).update(
+            is_active=False,
+            is_deleted=True,
+            archived_at=archived_at,
+            status=RuntimeStatus.ARCHIVED,
+            updated_at=updated_at,
+        )
+
+        self.is_active = False
+        self.is_deleted = True
+        self.archived_at = archived_at
+        self.status = RuntimeStatus.ARCHIVED
+        self.updated_at = updated_at
 
 
 class EmulationTrade(models.Model):
@@ -128,7 +319,7 @@ class EmulationTrade(models.Model):
         default=Status.OPEN,
     )
     amount = models.DecimalField("trade amount", max_digits=18, decimal_places=8)
-    
+
     # Open details
     primary_open_price = models.DecimalField("primary open price", max_digits=20, decimal_places=8)
     secondary_open_price = models.DecimalField("secondary open price", max_digits=20, decimal_places=8)
@@ -153,7 +344,7 @@ class EmulationTrade(models.Model):
 
 
 class Trade(models.Model):
-    """Stores the execution cycle of a real arbitrage trade on Binance/Bybit Futures."""
+    """Stores the execution cycle of a real arbitrage trade."""
 
     class Status(models.TextChoices):
         OPEN = "open", "Open"
@@ -167,6 +358,30 @@ class Trade(models.Model):
         SHUTDOWN = "shutdown", "Graceful shutdown"
         ERROR = "error", "Error during monitoring"
 
+    owner = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        related_name="trades",
+        verbose_name="owner",
+        null=True,
+        blank=True,
+    )
+    bot = models.ForeignKey(
+        BotConfig,
+        on_delete=models.SET_NULL,
+        related_name="real_trades",
+        verbose_name="bot configuration",
+        null=True,
+        blank=True,
+    )
+    runtime_config = models.ForeignKey(
+        TraderRuntimeConfig,
+        on_delete=models.SET_NULL,
+        related_name="trades",
+        verbose_name="runtime configuration",
+        null=True,
+        blank=True,
+    )
     coin = models.CharField("coin", max_length=50)
     primary_exchange = models.CharField(
         "primary exchange",
@@ -265,6 +480,12 @@ class Trade(models.Model):
         verbose_name = "trade"
         verbose_name_plural = "trades"
         ordering = ["-opened_at"]
+        constraints = [
+            models.CheckConstraint(
+                condition=~(Q(bot__isnull=False) & Q(runtime_config__isnull=False)),
+                name="trade_single_runtime_source",
+            ),
+        ]
 
     def __str__(self) -> str:
         return f"Trade #{self.id} {self.coin} ({self.status})"

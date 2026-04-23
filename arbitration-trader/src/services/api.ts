@@ -1,6 +1,6 @@
 import axios, { AxiosInstance } from 'axios';
 import { config } from '../config.js';
-import type { TradeOpenPayload, TradeClosePayload, TradeRecord } from '../types/index.js';
+import type { TradeClosePayload, TradeOpenPayload, TradeRecord } from '../types/index.js';
 import { logger } from '../utils/logger.js';
 
 const TAG = 'API';
@@ -11,6 +11,7 @@ const client: AxiosInstance = axios.create({
     baseURL: config.djangoApiUrl,
     headers: {
         'Content-Type': 'application/json',
+        'X-Service-Token': config.serviceToken,
     },
     timeout: 15000,
 });
@@ -44,18 +45,21 @@ export const api = {
         }
     },
 
-    async getOpenTrades(): Promise<TradeRecord[]> {
+    async getOpenTrades(runtimeConfigId: number): Promise<TradeRecord[]> {
         try {
             const { data } = await client.get('/bots/real-trades/', {
-                params: { status: 'open' },
+                params: {
+                    status: 'open',
+                    runtime_config_id: runtimeConfigId,
+                },
             });
             // Support both DRF paginated responses and a raw array response.
             const trades = data.results || data || [];
-            logger.info(TAG, `Fetched ${trades.length} open trades from Django`);
+            logger.info(TAG, `Fetched ${trades.length} open trades from Django for runtime ${runtimeConfigId}`);
             return trades;
         } catch (e: any) {
             logger.error(TAG, `getOpenTrades failed: ${e?.response?.status} ${JSON.stringify(e?.response?.data) || e.message}`);
-            return [];
+            throw new Error(`Failed to restore open trades for runtime ${runtimeConfigId}`);
         }
     },
 };

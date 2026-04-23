@@ -1,17 +1,17 @@
 import axios, { AxiosInstance } from 'axios';
 import { config } from '../config.js';
-import type { TradeOpenPayload, TradeClosePayload, TradeRecord } from '../types/index.js';
+import type { TradeClosePayload, TradeOpenPayload, TradeRecord } from '../types/index.js';
 import { logger } from '../utils/logger.js';
 
 const TAG = 'API';
 
-// Shared Django API client. The engine currently relies on Django endpoints that
-// are intentionally unauthenticated for service-to-service writes, so no JWT
-// header is attached here.
+// Shared Django API client used for service-to-service trade persistence and
+// recovery. JWT is not used here; the runtime authenticates with a service token.
 const client: AxiosInstance = axios.create({
     baseURL: config.djangoApiUrl,
     headers: {
         'Content-Type': 'application/json',
+        'X-Service-Token': config.serviceToken,
     },
     timeout: 15000,
 });
@@ -45,28 +45,28 @@ export const api = {
         }
     },
 
-    async getOpenTrades(): Promise<TradeRecord[]> {
+    async getOpenTrades(botId: number): Promise<TradeRecord[]> {
         try {
-            // Django REST Framework may return paginated results. Support both
-            // paginated and raw-array responses so this client survives settings
-            // changes without breaking recovery.
-            const { data } = await client.get('/bots/real-trades/', { params: { status: 'open' } });
+            const { data } = await client.get('/bots/real-trades/', {
+                params: {
+                    status: 'open',
+                    bot_id: botId,
+                },
+            });
             return data.results || data || [];
         } catch (e: any) {
-             logger.error(TAG, `getOpenTrades failed: ${e.message}`);
-             return [];
+            logger.error(TAG, `getOpenTrades failed: ${e.message}`);
+            return [];
         }
     },
 
     async openEmulationTrade(payload: TradeOpenPayload): Promise<TradeRecord> {
         try {
-            // Emulation trades are stored separately from real trades in Django,
-            // but BotTrader reuses the same internal payload shape.
             const { data } = await client.post('/bots/trades/', payload);
             return data;
         } catch (e: any) {
-             logger.error(TAG, `openEmulationTrade failed: ${e.message}`);
-             throw e;
+            logger.error(TAG, `openEmulationTrade failed: ${e.message}`);
+            throw e;
         }
     },
 
@@ -75,20 +75,23 @@ export const api = {
             const { data } = await client.patch(`/bots/trades/${id}/`, payload);
             return data;
         } catch (e: any) {
-             logger.error(TAG, `closeEmulationTrade failed: ${e.message}`);
-             throw e;
+            logger.error(TAG, `closeEmulationTrade failed: ${e.message}`);
+            throw e;
         }
     },
 
-    async getOpenEmulationTrades(): Promise<TradeRecord[]> {
+    async getOpenEmulationTrades(botId: number): Promise<TradeRecord[]> {
         try {
-            // Used during engine startup to recover a bot's active emulation
-            // trade after a process restart.
-            const { data } = await client.get('/bots/trades/', { params: { status: 'open' } });
+            const { data } = await client.get('/bots/trades/', {
+                params: {
+                    status: 'open',
+                    bot_id: botId,
+                },
+            });
             return data.results || data || [];
         } catch (e: any) {
-             logger.error(TAG, `getOpenEmulationTrades failed: ${e.message}`);
-             return [];
+            logger.error(TAG, `getOpenEmulationTrades failed: ${e.message}`);
+            return [];
         }
-    }
+    },
 };

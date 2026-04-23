@@ -1,3 +1,42 @@
+// ──────────── Control Plane ────────────
+
+export interface RuntimeKeysPayload {
+    binance_api_key?: string;
+    binance_secret?: string;
+    bybit_api_key?: string;
+    bybit_secret?: string;
+    gate_api_key?: string;
+    gate_secret?: string;
+    mexc_api_key?: string;
+    mexc_secret?: string;
+}
+
+export interface RuntimeConfigPayload {
+    id: number;
+    name: string;
+    primary_exchange: string;
+    secondary_exchange: string;
+    use_testnet: boolean;
+    trade_amount_usdt: number | string;
+    leverage: number;
+    max_concurrent_trades: number;
+    top_liquid_pairs_count: number;
+    max_trade_duration_minutes: number;
+    max_leg_drawdown_percent: number | string;
+    open_threshold: number | string;
+    close_threshold: number | string;
+    orderbook_limit: number;
+    chunk_size: number;
+    is_active: boolean;
+}
+
+export interface RuntimeCommandPayload {
+    runtime_config_id: number;
+    owner_id: number;
+    config: RuntimeConfigPayload;
+    keys: RuntimeKeysPayload;
+}
+
 // ──────────── Orderbook ────────────
 
 /**
@@ -69,6 +108,7 @@ export interface OrderResult {
  * Payload used to create a real Trade record in Django after both legs open.
  */
 export interface TradeOpenPayload {
+    runtime_config: number;
     coin: string;
     primary_exchange: string;
     secondary_exchange: string;
@@ -104,6 +144,7 @@ export interface TradeRecord {
     // Django serializes DecimalField values as strings, so close logic parses
     // numeric fields explicitly before PnL calculations.
     id: number;
+    runtime_config: number | null;
     coin: string;
     primary_exchange: string;
     secondary_exchange: string;

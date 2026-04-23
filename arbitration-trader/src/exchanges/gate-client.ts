@@ -159,7 +159,7 @@ export class GateClient implements IExchangeClient {
             });
             logger.debug(TAG, `Leverage set to ${leverage}x for ${symbol}`);
         } catch (e: any) {
-            logger.warn(TAG, `Failed to set leverage to ${leverage}x on Gate for ${symbol}: ${e.message}`);
+            throw new Error(`Failed to set leverage to ${leverage}x on Gate for ${symbol}: ${e.message}`);
         }
     }
 
@@ -176,7 +176,7 @@ export class GateClient implements IExchangeClient {
             if (e.message.includes('already in isolated')) {
                 logger.debug(TAG, `Margin already isolated for ${symbol}`);
             } else {
-                logger.debug(TAG, `Gate fallback isolated margin skipped for ${symbol}: ${e.message}`);
+                throw new Error(`Failed to confirm isolated margin on Gate for ${symbol}: ${e.message}`);
             }
         }
     }

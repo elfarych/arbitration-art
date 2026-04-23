@@ -31,12 +31,16 @@ export class GateClient implements IExchangeClient {
     private httpClient: AxiosInstance;
     private baseUrl: string;
     private markets: Map<string, any> = new Map();
+    private apiKey: string;
+    private secret: string;
 
-    constructor() {
+    constructor(apiKey: string, secret: string) {
         // Gate has separate base URLs for futures testnet and production.
         this.baseUrl = config.useTestnet 
             ? 'https://fx-api-testnet.gateio.ws/api/v4'
             : 'https://api.gateio.ws/api/v4';
+        this.apiKey = apiKey;
+        this.secret = secret;
 
         this.httpClient = axios.create({
             baseURL: this.baseUrl,
@@ -112,9 +116,9 @@ export class GateClient implements IExchangeClient {
         const hashedPayload = crypto.createHash('sha512').update(payload).digest('hex');
         const signatureString = [method, endpoint, query, hashedPayload, t].join('\n');
         
-        const sign = crypto.createHmac('sha512', config.gate.secret).update(signatureString).digest('hex');
+        const sign = crypto.createHmac('sha512', this.secret).update(signatureString).digest('hex');
         return {
-            'KEY': config.gate.apiKey,
+            'KEY': this.apiKey,
             'Timestamp': t,
             'SIGN': sign,
         };

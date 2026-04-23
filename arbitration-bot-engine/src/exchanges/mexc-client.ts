@@ -17,11 +17,11 @@ export class MexcClient implements IExchangeClient {
     public readonly name = 'Mexc';
     private exchange: ccxt.mexc;
 
-    constructor() {
+    constructor(apiKey: string, secret: string) {
         // defaultType=swap tells ccxt to use futures/swap endpoints.
         this.exchange = new ccxt.mexc({
-            apiKey: config.mexc.apiKey,
-            secret: config.mexc.secret,
+            apiKey,
+            secret,
             enableRateLimit: true,
             ...(config.useTestnet && {
                 sandbox: true,

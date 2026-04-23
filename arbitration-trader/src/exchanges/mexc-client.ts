@@ -46,7 +46,7 @@ export class MexcClient implements IExchangeClient {
             await this.exchange.setLeverage(leverage, symbol);
             logger.debug(TAG, `Leverage set to ${leverage}x for ${symbol}`);
         } catch (e: any) {
-            logger.warn(TAG, `Failed to set leverage to ${leverage}x on MEXC for ${symbol}: ${e.message}`);
+            throw new Error(`Failed to set leverage to ${leverage}x on MEXC for ${symbol}: ${e.message}`);
         }
     }
 
@@ -69,10 +69,13 @@ export class MexcClient implements IExchangeClient {
                             type: 1 // MEXC commonly uses 1 for isolated margin.
                         });
                         logger.debug(TAG, `Isolated margin set for ${symbol} via fallback api.`);
+                        return;
                     }
                 } catch (fallbackE: any) {
-                    logger.error(TAG, `Fallback failed: ${fallbackE.message}`);
+                    throw new Error(`Failed to set isolated margin on MEXC for ${symbol}: ${fallbackE.message}`);
                 }
+
+                throw new Error(`Failed to set isolated margin on MEXC for ${symbol}: ${e.message}`);
             }
         }
     }

@@ -118,7 +118,7 @@ export const binanceApi = {
 
   streamTicker(coin: string, onMessage: (data: TickerData) => void, onError?: (err: Error) => void): () => void {
     const symbol = coin.toLowerCase() + 'usdt';
-    const url = `wss://fstream.binance.com/ws/${symbol}@bookTicker`;
+    const url = `wss://fstream.binance.com/market/ws/${symbol}@bookTicker`;
     const ws = new WebSocket(url);
 
     ws.onmessage = (event) => {
@@ -144,7 +144,7 @@ export const binanceApi = {
 
   streamDepth(coin: string, onMessage: (data: DepthData) => void, onError?: (err: Error) => void): () => void {
     const symbol = coin.toLowerCase() + 'usdt';
-    const url = `wss://fstream.binance.com/ws/${symbol}@depth20@100ms`;
+    const url = `wss://fstream.binance.com/market/ws/${symbol}@depth20@100ms`;
     const ws = new WebSocket(url);
 
     ws.onmessage = (event) => {

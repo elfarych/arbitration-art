@@ -76,6 +76,8 @@ export interface OrderResult {
  * EmulationTrade serializer does not require all real-trade-only fields.
  */
 export interface TradeOpenPayload {
+    bot?: number;
+    runtime_config?: number;
     coin: string;
     primary_exchange: string;
     secondary_exchange: string;
@@ -112,6 +114,9 @@ export interface TradeRecord {
     // Django returns DecimalField values as strings. BotTrader parses those
     // strings at close time to avoid floating-point assumptions at the API edge.
     id: number;
+    owner?: number | null;
+    bot?: number | null;
+    runtime_config?: number | null;
     coin: string;
     primary_exchange: string;
     secondary_exchange: string;

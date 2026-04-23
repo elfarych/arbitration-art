@@ -26,7 +26,7 @@ class User(AbstractUser):
 
 class UserExchangeKeys(models.Model):
     """Secure storage for user exchange API keys."""
-    
+
     user = models.OneToOneField(User, on_delete=models.CASCADE, related_name="exchange_keys")
     binance_api_key = models.CharField(max_length=255, blank=True)
     binance_secret = models.CharField(max_length=255, blank=True)
@@ -34,6 +34,8 @@ class UserExchangeKeys(models.Model):
     bybit_secret = models.CharField(max_length=255, blank=True)
     gate_api_key = models.CharField(max_length=255, blank=True)
     gate_secret = models.CharField(max_length=255, blank=True)
+    mexc_api_key = models.CharField(max_length=255, blank=True)
+    mexc_secret = models.CharField(max_length=255, blank=True)
 
     class Meta:
         verbose_name = "user exchange keys"

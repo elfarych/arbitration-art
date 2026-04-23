@@ -17,11 +17,11 @@ export class BybitClient implements IExchangeClient {
     public readonly name = 'Bybit';
     private exchange: ccxt.bybit;
 
-    constructor() {
+    constructor(apiKey: string, secret: string) {
         // defaultType=swap makes ccxt target perpetual contracts rather than spot.
         this.exchange = new ccxt.bybit({
-            apiKey: config.bybit.apiKey,
-            secret: config.bybit.secret,
+            apiKey,
+            secret,
             enableRateLimit: true,
             ...(config.useTestnet && {
                 sandbox: true,

@@ -15,6 +15,17 @@ const engine = new Engine();
 // access controls, not as a public browser-facing API.
 fastify.register(cors, { origin: '*' });
 
+fastify.addHook('preHandler', async (request, reply) => {
+    if (request.method === 'OPTIONS') {
+        return;
+    }
+
+    const token = request.headers['x-service-token'];
+    if (token !== config.serviceToken) {
+        return reply.status(401).send({ success: false, error: 'Unauthorized' });
+    }
+});
+
 fastify.post('/engine/bot/start', async (request, reply) => {
     // Payload shape is produced by Django's apps.bots.api.views.get_engine_payload:
     // { bot_id, config, keys }. The engine trusts Django as the source of bot

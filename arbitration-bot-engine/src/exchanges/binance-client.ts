@@ -34,12 +34,16 @@ export class BinanceClient implements IExchangeClient {
     private httpClient: AxiosInstance;
     private baseUrl: string;
     private markets: Map<string, any> = new Map();
+    private apiKey: string;
+    private secret: string;
 
-    constructor() {
+    constructor(apiKey: string, secret: string) {
         // Toggle between Binance Futures testnet and production using USE_TESTNET.
         this.baseUrl = config.useTestnet 
             ? 'https://testnet.binancefuture.com'
             : 'https://fapi.binance.com';
+        this.apiKey = apiKey;
+        this.secret = secret;
 
         this.httpClient = axios.create({
             baseURL: this.baseUrl,
@@ -129,7 +133,7 @@ export class BinanceClient implements IExchangeClient {
                 .map(k => `${k}=${encodeURIComponent(params[k])}`)
                 .join('&');
             
-            const signature = crypto.createHmac('sha256', config.binance.secret)
+            const signature = crypto.createHmac('sha256', this.secret)
                 .update(queryString)
                 .digest('hex');
                 
@@ -143,7 +147,7 @@ export class BinanceClient implements IExchangeClient {
         const headers: Record<string, string> = {};
         if (auth) {
             // API key is sent in the header; secret is used only for the HMAC.
-            headers['X-MBX-APIKEY'] = config.binance.apiKey;
+            headers['X-MBX-APIKEY'] = this.apiKey;
         }
 
         let url = endpoint;

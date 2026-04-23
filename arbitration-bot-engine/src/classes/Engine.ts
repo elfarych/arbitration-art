@@ -111,7 +111,9 @@ export class Engine {
         // Recover existing open trades from Django so a restarted engine can keep
         // monitoring exit conditions for positions already recorded as open.
         try {
-            const openTrades = config.trade_mode === 'real' ? await api.getOpenTrades() : await api.getOpenEmulationTrades();
+            const openTrades = config.trade_mode === 'real'
+                ? await api.getOpenTrades(botId)
+                : await api.getOpenEmulationTrades(botId);
             trader.restoreOpenTrades(openTrades);
         } catch (e) {
             logger.warn('Engine', `Could not fetch open trades for bot ${botId}`);
@@ -125,7 +127,7 @@ export class Engine {
     }
 
     public syncBot(botId: number, config: any) {
-        logger.info('Engine', `Syncing config for Bot ${botId}: ${JSON.stringify(config)}`);
+        logger.info('Engine', `Syncing config for Bot ${botId}`);
         const trader = this.traders.get(botId);
         if (trader) {
             trader.syncConfig(config);

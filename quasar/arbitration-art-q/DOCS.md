@@ -1087,8 +1087,8 @@ Methods:
 
 WebSocket:
 
-- `wss://fstream.binance.com/ws/{symbol}@bookTicker`
-- `wss://fstream.binance.com/ws/{symbol}@depth20@100ms`
+- `wss://fstream.binance.com/market/ws/{symbol}@bookTicker`
+- `wss://fstream.binance.com/market/ws/{symbol}@depth20@100ms`
 
 ### 22.2. Binance Spot
 
