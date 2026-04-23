@@ -28,6 +28,19 @@ async function readJsonBody(request: IncomingMessage): Promise<any> {
     return JSON.parse(body);
 }
 
+function parseRuntimeConfigId(value: string | null): number | undefined {
+    if (value === null) {
+        return undefined;
+    }
+
+    const parsed = Number(value);
+    if (!Number.isInteger(parsed) || parsed <= 0) {
+        throw new Error('runtime_config_id must be a positive integer.');
+    }
+
+    return parsed;
+}
+
 function hasValidServiceToken(request: IncomingMessage): boolean {
     const headerValue = request.headers['x-service-token'];
     const token = Array.isArray(headerValue) ? headerValue[0] : headerValue;
@@ -69,6 +82,44 @@ const server = createServer(async (request, reply) => {
             const payload = await readJsonBody(request) as { runtime_config_id?: number };
             await runtimeManager.stop(payload.runtime_config_id);
             sendJson(reply, 200, { success: true });
+            return;
+        }
+
+        if (request.method === 'POST' && url.pathname === '/engine/trader/runtime/exchange-health') {
+            const payload = await readJsonBody(request) as RuntimeCommandPayload;
+            const data = await runtimeManager.checkExchangeHealth(payload);
+            sendJson(reply, 200, data);
+            return;
+        }
+
+        if (request.method === 'GET' && url.pathname === '/engine/trader/runtime/active-coins') {
+            const runtimeConfigId = parseRuntimeConfigId(url.searchParams.get('runtime_config_id'));
+            const data = runtimeManager.getActiveTradesDiagnostics(runtimeConfigId);
+            sendJson(reply, 200, {
+                requested_runtime_config_id: data.requested_runtime_config_id,
+                active_runtime_config_id: data.active_runtime_config_id,
+                is_requested_runtime_active: data.is_requested_runtime_active,
+                trade_count: data.trade_count,
+                active_coins: data.active_coins,
+            });
+            return;
+        }
+
+        if (request.method === 'GET' && url.pathname === '/engine/trader/runtime/open-trades-pnl') {
+            const runtimeConfigId = parseRuntimeConfigId(url.searchParams.get('runtime_config_id'));
+            const data = runtimeManager.getActiveTradesDiagnostics(runtimeConfigId);
+            sendJson(reply, 200, data);
+            return;
+        }
+
+        if (request.method === 'GET' && url.pathname === '/engine/trader/runtime/system-load') {
+            const runtimeConfigId = parseRuntimeConfigId(url.searchParams.get('runtime_config_id'));
+            const data = await runtimeManager.getSystemLoad();
+            sendJson(reply, 200, {
+                requested_runtime_config_id: runtimeConfigId ?? null,
+                active_runtime_config_id: runtimeManager.getStatus().activeRuntimeConfigId,
+                ...data,
+            });
             return;
         }
 

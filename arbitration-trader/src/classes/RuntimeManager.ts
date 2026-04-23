@@ -5,10 +5,16 @@ import { BinanceClient } from '../exchanges/binance-client.js';
 import { BybitClient } from '../exchanges/bybit-client.js';
 import { GateClient } from '../exchanges/gate-client.js';
 import { MexcClient } from '../exchanges/mexc-client.js';
-import type { IExchangeClient } from '../exchanges/exchange-client.js';
+import type { ExchangeClientOptions, IExchangeClient } from '../exchanges/exchange-client.js';
 import { api } from '../services/api.js';
+import { getSystemLoadSnapshot } from '../services/diagnostics.js';
 import { MarketInfoService } from '../services/market-info.js';
-import type { RuntimeCommandPayload } from '../types/index.js';
+import type {
+    ExchangeHealthCheckResult,
+    RuntimeCommandPayload,
+    RuntimeTradesDiagnostics,
+    SystemLoadSnapshot,
+} from '../types/index.js';
 import { logger } from '../utils/logger.js';
 
 const TAG = 'RuntimeManager';
@@ -16,6 +22,8 @@ const TAG = 'RuntimeManager';
 interface ActiveRuntimeHandle {
     payload: RuntimeCommandPayload;
     traders: Trader[];
+    primaryClient: IExchangeClient;
+    secondaryClient: IExchangeClient;
     wsPrimary: any;
     wsSecondary: any;
     runPromise: Promise<void>;
@@ -86,6 +94,78 @@ export class RuntimeManager {
     public getStatus(): { activeRuntimeConfigId: number | null } {
         return {
             activeRuntimeConfigId: this.activeRuntime?.payload.runtime_config_id ?? null,
+        };
+    }
+
+    public getActiveTradesDiagnostics(runtimeConfigId?: number): RuntimeTradesDiagnostics {
+        const activeRuntimeConfigId = this.activeRuntime?.payload.runtime_config_id ?? null;
+        const isRequestedRuntimeActive = Boolean(
+            this.activeRuntime
+            && (runtimeConfigId === undefined || activeRuntimeConfigId === runtimeConfigId),
+        );
+
+        if (!this.activeRuntime || !isRequestedRuntimeActive) {
+            return {
+                requested_runtime_config_id: runtimeConfigId ?? null,
+                active_runtime_config_id: activeRuntimeConfigId,
+                is_requested_runtime_active: false,
+                trade_count: 0,
+                active_coins: [],
+                trades: [],
+            };
+        }
+
+        const trades = this.activeRuntime.traders.flatMap(trader => trader.getActiveTradeSnapshots());
+
+        return {
+            requested_runtime_config_id: runtimeConfigId ?? activeRuntimeConfigId,
+            active_runtime_config_id: activeRuntimeConfigId,
+            is_requested_runtime_active: true,
+            trade_count: trades.length,
+            active_coins: trades.map(trade => trade.coin),
+            trades,
+        };
+    }
+
+    public async getSystemLoad(): Promise<SystemLoadSnapshot> {
+        return getSystemLoadSnapshot();
+    }
+
+    public async checkExchangeHealth(payload: RuntimeCommandPayload): Promise<{
+        requested_runtime_config_id: number;
+        active_runtime_config_id: number | null;
+        exchanges: ExchangeHealthCheckResult[];
+    }> {
+        const exchanges = [
+            payload.config.primary_exchange.toLowerCase(),
+            payload.config.secondary_exchange.toLowerCase(),
+        ].filter((value, index, arr) => arr.indexOf(value) === index);
+
+        const results = await Promise.all(
+            exchanges.map(async exchange => {
+                try {
+                    const client = this.createClient(exchange, this.buildClientOptions(exchange, payload));
+                    await client.pingPrivate();
+                    return {
+                        exchange,
+                        available: true,
+                        error: null,
+                    } satisfies ExchangeHealthCheckResult;
+                } catch (error: any) {
+                    logger.warn(TAG, `Exchange health check failed for ${exchange}: ${error.message}`);
+                    return {
+                        exchange,
+                        available: false,
+                        error: error.message,
+                    } satisfies ExchangeHealthCheckResult;
+                }
+            }),
+        );
+
+        return {
+            requested_runtime_config_id: payload.runtime_config_id,
+            active_runtime_config_id: this.activeRuntime?.payload.runtime_config_id ?? null,
+            exchanges: results,
         };
     }
 
@@ -296,6 +376,8 @@ export class RuntimeManager {
             this.activeRuntime = {
                 payload,
                 traders,
+                primaryClient,
+                secondaryClient,
                 wsPrimary,
                 wsSecondary,
                 runPromise,
@@ -359,16 +441,49 @@ export class RuntimeManager {
         logger.info(TAG, `Runtime ${current.payload.runtime_config_id} stopped.`);
     }
 
-    private createClient(name: string): IExchangeClient {
+    private buildClientOptions(name: string, payload: RuntimeCommandPayload): ExchangeClientOptions {
+        const commonOptions = { useTestnet: payload.config.use_testnet };
+
         switch (name.toLowerCase()) {
             case 'binance':
-                return new BinanceClient();
+                return {
+                    ...commonOptions,
+                    apiKey: payload.keys.binance_api_key,
+                    secret: payload.keys.binance_secret,
+                };
             case 'bybit':
-                return new BybitClient();
+                return {
+                    ...commonOptions,
+                    apiKey: payload.keys.bybit_api_key,
+                    secret: payload.keys.bybit_secret,
+                };
             case 'mexc':
-                return new MexcClient();
+                return {
+                    ...commonOptions,
+                    apiKey: payload.keys.mexc_api_key,
+                    secret: payload.keys.mexc_secret,
+                };
             case 'gate':
-                return new GateClient();
+                return {
+                    ...commonOptions,
+                    apiKey: payload.keys.gate_api_key,
+                    secret: payload.keys.gate_secret,
+                };
+            default:
+                throw new Error(`Unknown exchange: ${name}`);
+        }
+    }
+
+    private createClient(name: string, options?: ExchangeClientOptions): IExchangeClient {
+        switch (name.toLowerCase()) {
+            case 'binance':
+                return new BinanceClient(options);
+            case 'bybit':
+                return new BybitClient(options);
+            case 'mexc':
+                return new MexcClient(options);
+            case 'gate':
+                return new GateClient(options);
             default:
                 throw new Error(`Unknown exchange: ${name}`);
         }

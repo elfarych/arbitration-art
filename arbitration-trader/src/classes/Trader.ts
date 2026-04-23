@@ -5,7 +5,7 @@ import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
 import type { IExchangeClient } from '../exchanges/exchange-client.js';
 import type { MarketInfoService } from '../services/market-info.js';
-import type { OrderbookPrices, TradeClosePayload, TradeRecord } from '../types/index.js';
+import type { OrderbookPrices, RuntimeTradePnlSnapshot, TradeClosePayload, TradeRecord } from '../types/index.js';
 
 type CloseTriggerReason = 'profit' | 'timeout' | 'shutdown' | 'error' | 'liquidation';
 
@@ -133,6 +133,66 @@ export class Trader {
                 logger.info(this.tag, `♻️ Restored open trade ${sym} (ID: ${trade.id}, ${trade.order_type})`);
             }
         }
+    }
+
+    public getActiveTradeSnapshots(): RuntimeTradePnlSnapshot[] {
+        const snapshots: RuntimeTradePnlSnapshot[] = [];
+
+        for (const [symbol, state] of this.states.entries()) {
+            const trade = state.activeTrade;
+            if (!trade) {
+                continue;
+            }
+
+            const amount = parseFloat(trade.amount as any);
+            const strictPrices = this.getPrices(symbol, amount, false);
+            const emergencyPrices = strictPrices ? null : this.getPrices(symbol, amount, true);
+            const prices = strictPrices || emergencyPrices;
+            const pricingMode = strictPrices ? 'strict' : emergencyPrices ? 'emergency' : 'unavailable';
+
+            let currentPnlPercent: number | null = null;
+            let estimatedPnlUsdt: number | null = null;
+            let estimatedPnlPercentage: number | null = null;
+
+            if (prices) {
+                const orderType = trade.order_type as 'buy' | 'sell';
+                const pOpen = parseFloat(trade.primary_open_price as any);
+                const sOpen = parseFloat(trade.secondary_open_price as any);
+                const openCommission = parseFloat(trade.open_commission as any) || 0;
+                const closePrimary = orderType === 'buy' ? prices.primaryBid : prices.primaryAsk;
+                const closeSecondary = orderType === 'buy' ? prices.secondaryAsk : prices.secondaryBid;
+                const estimated = calculateRealPnL(
+                    pOpen,
+                    sOpen,
+                    closePrimary,
+                    closeSecondary,
+                    amount,
+                    orderType,
+                    openCommission,
+                );
+
+                currentPnlPercent = d(
+                    calculateTruePnL({ pOpen, sOpen }, prices, orderType),
+                    4,
+                );
+                estimatedPnlUsdt = d(estimated.profitUsdt, 6);
+                estimatedPnlPercentage = d(estimated.profitPercentage, 4);
+            }
+
+            snapshots.push({
+                trade_id: trade.id,
+                coin: trade.coin,
+                order_type: trade.order_type as 'buy' | 'sell',
+                amount,
+                opened_at: trade.opened_at,
+                current_pnl_percent: currentPnlPercent,
+                estimated_pnl_usdt: estimatedPnlUsdt,
+                estimated_pnl_percentage: estimatedPnlPercentage,
+                pricing_mode: pricingMode,
+            });
+        }
+
+        return snapshots;
     }
 
     /**

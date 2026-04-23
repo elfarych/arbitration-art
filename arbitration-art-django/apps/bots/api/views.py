@@ -12,6 +12,13 @@ from apps.bots.api.serializers import (
 from apps.bots.models import BotConfig, EmulationTrade, Trade, TraderRuntimeConfig
 from apps.bots.permissions import ServiceTokenWriteOrAuthenticatedRead, is_service_request
 from apps.bots.services.lifecycle import LifecycleSyncError, sync_bot_lifecycle
+from apps.bots.services.trader_runtime_info import (
+    TraderRuntimeInfoError,
+    fetch_trader_runtime_active_coins,
+    fetch_trader_runtime_exchange_health,
+    fetch_trader_runtime_open_trades_pnl,
+    fetch_trader_runtime_system_load,
+)
 
 
 class BotConfigViewSet(viewsets.ModelViewSet):
@@ -79,6 +86,58 @@ class TraderRuntimeConfigViewSet(viewsets.ModelViewSet):
             )
 
         return Response(status=status.HTTP_204_NO_CONTENT)
+
+    @action(detail=True, methods=["get"], url_path="exchange-health")
+    def exchange_health(self, request, pk=None):
+        runtime_config = self.get_object()
+        try:
+            payload = fetch_trader_runtime_exchange_health(runtime_config.id)
+        except TraderRuntimeInfoError as exc:
+            return Response(
+                {"detail": str(exc)},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+
+        return Response(payload)
+
+    @action(detail=True, methods=["get"], url_path="active-coins")
+    def active_coins(self, request, pk=None):
+        runtime_config = self.get_object()
+        try:
+            payload = fetch_trader_runtime_active_coins(runtime_config.id)
+        except TraderRuntimeInfoError as exc:
+            return Response(
+                {"detail": str(exc)},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+
+        return Response(payload)
+
+    @action(detail=True, methods=["get"], url_path="open-trades-pnl")
+    def open_trades_pnl(self, request, pk=None):
+        runtime_config = self.get_object()
+        try:
+            payload = fetch_trader_runtime_open_trades_pnl(runtime_config.id)
+        except TraderRuntimeInfoError as exc:
+            return Response(
+                {"detail": str(exc)},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+
+        return Response(payload)
+
+    @action(detail=True, methods=["get"], url_path="system-load")
+    def system_load(self, request, pk=None):
+        runtime_config = self.get_object()
+        try:
+            payload = fetch_trader_runtime_system_load(runtime_config.id)
+        except TraderRuntimeInfoError as exc:
+            return Response(
+                {"detail": str(exc)},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+
+        return Response(payload)
 
 
 class EmulationTradeViewSet(viewsets.ModelViewSet):

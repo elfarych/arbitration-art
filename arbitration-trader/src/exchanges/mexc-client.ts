@@ -1,5 +1,5 @@
 import * as ccxt from 'ccxt';
-import type { IExchangeClient } from './exchange-client.js';
+import type { ExchangeClientOptions, IExchangeClient } from './exchange-client.js';
 import type { OrderResult, SymbolMarketInfo } from '../types/index.js';
 import { logger } from '../utils/logger.js';
 import { config } from '../config.js';
@@ -17,13 +17,14 @@ export class MexcClient implements IExchangeClient {
     public readonly name = 'Mexc';
     private exchange: ccxt.mexc;
 
-    constructor() {
+    constructor(options: ExchangeClientOptions = {}) {
+        const useTestnet = options.useTestnet ?? config.useTestnet;
         // defaultType=swap targets MEXC futures/swap markets.
         this.exchange = new ccxt.mexc({
-            apiKey: config.mexc.apiKey,
-            secret: config.mexc.secret,
+            apiKey: options.apiKey ?? config.mexc.apiKey,
+            secret: options.secret ?? config.mexc.secret,
             enableRateLimit: true,
-            ...(config.useTestnet && {
+            ...(useTestnet && {
                 sandbox: true,
             }),
             options: {
@@ -160,6 +161,10 @@ export class MexcClient implements IExchangeClient {
     getUsdtSymbols(): string[] {
         // Keep only USDT-settled perpetual symbols.
         return Object.keys(this.exchange.markets).filter(sym => sym.endsWith(':USDT'));
+    }
+
+    async pingPrivate(): Promise<void> {
+        await this.exchange.fetchBalance();
     }
 
     private extractCommission(order: any): number {

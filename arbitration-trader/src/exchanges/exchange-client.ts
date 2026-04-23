@@ -1,5 +1,11 @@
 import type { OrderResult, SymbolMarketInfo } from '../types/index.js';
 
+export interface ExchangeClientOptions {
+    apiKey?: string;
+    secret?: string;
+    useTestnet?: boolean;
+}
+
 /**
  * Unified interface for exchange operations.
  * All REST exchange clients implement this contract so Trader can place orders,
@@ -34,4 +40,7 @@ export interface IExchangeClient {
 
     /** Get all available USDT perpetual symbols */
     getUsdtSymbols(): string[];
+
+    /** Verify that private API access works for the configured credentials */
+    pingPrivate(): Promise<void>;
 }

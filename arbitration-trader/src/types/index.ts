@@ -37,6 +37,41 @@ export interface RuntimeCommandPayload {
     keys: RuntimeKeysPayload;
 }
 
+export interface ExchangeHealthCheckResult {
+    exchange: string;
+    available: boolean;
+    error: string | null;
+}
+
+export interface RuntimeTradePnlSnapshot {
+    trade_id: number;
+    coin: string;
+    order_type: 'buy' | 'sell';
+    amount: number;
+    opened_at: string;
+    current_pnl_percent: number | null;
+    estimated_pnl_usdt: number | null;
+    estimated_pnl_percentage: number | null;
+    pricing_mode: 'strict' | 'emergency' | 'unavailable';
+}
+
+export interface RuntimeTradesDiagnostics {
+    requested_runtime_config_id: number | null;
+    active_runtime_config_id: number | null;
+    is_requested_runtime_active: boolean;
+    trade_count: number;
+    active_coins: string[];
+    trades: RuntimeTradePnlSnapshot[];
+}
+
+export interface SystemLoadSnapshot {
+    cpu_percent: number;
+    memory_total_bytes: number;
+    memory_used_bytes: number;
+    memory_free_bytes: number;
+    memory_used_percent: number;
+}
+
 // ──────────── Orderbook ────────────
 
 /**

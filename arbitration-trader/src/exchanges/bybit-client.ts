@@ -1,5 +1,5 @@
 import * as ccxt from 'ccxt';
-import type { IExchangeClient } from './exchange-client.js';
+import type { ExchangeClientOptions, IExchangeClient } from './exchange-client.js';
 import type { OrderResult, SymbolMarketInfo } from '../types/index.js';
 import { logger } from '../utils/logger.js';
 import { config } from '../config.js';
@@ -16,13 +16,14 @@ export class BybitClient implements IExchangeClient {
     public readonly name = 'Bybit';
     private exchange: ccxt.bybit;
 
-    constructor() {
+    constructor(options: ExchangeClientOptions = {}) {
+        const useTestnet = options.useTestnet ?? config.useTestnet;
         // defaultType=swap targets perpetual contracts instead of spot markets.
         this.exchange = new ccxt.bybit({
-            apiKey: config.bybit.apiKey,
-            secret: config.bybit.secret,
+            apiKey: options.apiKey ?? config.bybit.apiKey,
+            secret: options.secret ?? config.bybit.secret,
             enableRateLimit: true,
-            ...(config.useTestnet && {
+            ...(useTestnet && {
                 sandbox: true,
             }),
             options: {
@@ -145,6 +146,10 @@ export class BybitClient implements IExchangeClient {
     getUsdtSymbols(): string[] {
         // ccxt futures symbols are formatted like BTC/USDT:USDT.
         return Object.keys(this.exchange.markets).filter(sym => sym.endsWith(':USDT'));
+    }
+
+    async pingPrivate(): Promise<void> {
+        await this.exchange.fetchBalance();
     }
 
     private extractCommission(order: any): number {

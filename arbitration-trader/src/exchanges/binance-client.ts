@@ -1,6 +1,6 @@
 import axios, { AxiosInstance } from 'axios';
 import * as crypto from 'crypto';
-import type { IExchangeClient } from './exchange-client.js';
+import type { ExchangeClientOptions, IExchangeClient } from './exchange-client.js';
 import type { OrderResult, SymbolMarketInfo } from '../types/index.js';
 import { logger } from '../utils/logger.js';
 import { config } from '../config.js';
@@ -33,10 +33,16 @@ export class BinanceClient implements IExchangeClient {
     private httpClient: AxiosInstance;
     private baseUrl: string;
     private markets: Map<string, any> = new Map();
+    private apiKey: string;
+    private secret: string;
 
-    constructor() {
+    constructor(options: ExchangeClientOptions = {}) {
+        const useTestnet = options.useTestnet ?? config.useTestnet;
+        this.apiKey = options.apiKey ?? config.binance.apiKey;
+        this.secret = options.secret ?? config.binance.secret;
+
         // Toggle between Binance Futures testnet and production.
-        this.baseUrl = config.useTestnet 
+        this.baseUrl = useTestnet
             ? 'https://testnet.binancefuture.com'
             : 'https://fapi.binance.com';
 
@@ -124,7 +130,7 @@ export class BinanceClient implements IExchangeClient {
                 .map(k => `${k}=${encodeURIComponent(params[k])}`)
                 .join('&');
             
-            const signature = crypto.createHmac('sha256', config.binance.secret)
+            const signature = crypto.createHmac('sha256', this.secret)
                 .update(queryString)
                 .digest('hex');
                 
@@ -138,7 +144,7 @@ export class BinanceClient implements IExchangeClient {
         const headers: Record<string, string> = {};
         if (auth) {
             // Secret is used only for HMAC signing; API key goes in the header.
-            headers['X-MBX-APIKEY'] = config.binance.apiKey;
+            headers['X-MBX-APIKEY'] = this.apiKey;
         }
 
         let url = endpoint;
@@ -160,6 +166,10 @@ export class BinanceClient implements IExchangeClient {
         });
 
         return response.data;
+    }
+
+    async pingPrivate(): Promise<void> {
+        await this.request('GET', '/fapi/v2/account');
     }
 
     async loadMarkets(): Promise<void> {

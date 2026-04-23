@@ -8,7 +8,7 @@
 
 `arbitration-trader` - standalone TypeScript/Node.js процесс для реальной арбитражной торговли между двумя выбранными futures/derivatives биржами.
 
-Сервис поднимает HTTP control plane, принимает `POST /engine/trader/{start|sync|stop}` от Django, держит в одном процессе только один активный `TraderRuntimeConfig` и получает биржевые ключи/торговые параметры в payload.
+Сервис поднимает HTTP control plane, принимает lifecycle-команды `POST /engine/trader/{start|sync|stop}` от Django, отдает diagnostic routes для exchange health, active coins, live PnL и system load, держит в одном процессе только один активный `TraderRuntimeConfig` и получает биржевые ключи/торговые параметры в payload.
 
 Сервис:
 
@@ -1276,7 +1276,7 @@ Fix `DEPLOY_LINUX.md` secret variable names before production deployment.
 6. Add automated tests for math utilities.
 7. Add mocked exchange tests for open/rollback/close flows.
 8. Add structured logging and secret redaction policy.
-9. Add health metrics: active trades, WS errors, close retries, cleanup count.
+9. Add persistent counters for WS errors, close retries and cleanup events.
 10. Add lock/lease if more than one process can run.
 
 ## 24. Workflow summary
@@ -1317,6 +1317,10 @@ The HTTP server exposes:
 - `POST /engine/trader/start`
 - `POST /engine/trader/sync`
 - `POST /engine/trader/stop`
+- `POST /engine/trader/runtime/exchange-health`
+- `GET /engine/trader/runtime/active-coins`
+- `GET /engine/trader/runtime/open-trades-pnl`
+- `GET /engine/trader/runtime/system-load`
 
 All endpoints except `/health` require `X-Service-Token`.
 
@@ -1330,6 +1334,23 @@ Command behavior:
 3. `stop`
    - stop the active runtime;
    - if `runtime_config_id` is provided, it must match the active runtime.
+
+Diagnostic behavior:
+
+1. `POST /engine/trader/runtime/exchange-health`
+   - receives a full Django runtime payload with exchange keys;
+   - creates short-lived REST clients for primary/secondary exchanges without mutating the currently active runtime;
+   - runs authenticated private API checks and returns per-exchange availability/error.
+2. `GET /engine/trader/runtime/active-coins`
+   - reads in-memory trader state for the requested `runtime_config_id`;
+   - returns `active_coins`, `trade_count` and `is_requested_runtime_active`.
+3. `GET /engine/trader/runtime/open-trades-pnl`
+   - reads in-memory open trades;
+   - calculates live mark-to-market values from the current orderbook snapshot;
+   - returns both signal-style `current_pnl_percent` and estimated USDT / percentage PnL using recorded open commission.
+4. `GET /engine/trader/runtime/system-load`
+   - samples system-wide CPU utilization over a short interval;
+   - returns total/used/free RAM in bytes and percent usage for the host running the trader process.
 
 ### 24.4. Runtime bootstrap sequence
 

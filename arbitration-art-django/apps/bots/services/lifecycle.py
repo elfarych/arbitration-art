@@ -2,7 +2,6 @@ import time
 from typing import Any
 
 import requests
-from django.conf import settings
 from django.utils import timezone
 
 from apps.bots.models import (
@@ -12,44 +11,33 @@ from apps.bots.models import (
     SyncStatus,
     TraderRuntimeConfig,
 )
+from apps.bots.services.trader_runtime_shared import (
+    build_trader_runtime_payload,
+    exchange_keys_for_user,
+    join_control_url,
+    request_settings,
+    service_headers,
+)
 
 
 class LifecycleSyncError(RuntimeError):
     """Raised when Django cannot synchronize lifecycle state with a runtime."""
 
 
-def _join_control_url(service_url: str, path: str) -> str:
-    return f"{service_url.rstrip('/')}/{path.lstrip('/')}"
-
-
-def _service_headers() -> dict[str, str]:
-    token = getattr(settings, "SERVICE_SHARED_TOKEN", "")
-    if not token:
-        raise LifecycleSyncError("SERVICE_SHARED_TOKEN is not configured.")
-
-    return {
-        "Content-Type": "application/json",
-        "X-Service-Token": token,
-    }
-
-
-def _request_settings() -> tuple[int, float, float]:
-    retries = max(1, int(getattr(settings, "SERVICE_REQUEST_RETRIES", 3)))
-    timeout = float(getattr(settings, "SERVICE_REQUEST_TIMEOUT_SECONDS", 5))
-    retry_delay = float(getattr(settings, "SERVICE_REQUEST_RETRY_DELAY_SECONDS", 1))
-    return retries, timeout, retry_delay
-
-
 def _perform_post(url: str, payload: dict[str, Any]) -> None:
-    retries, timeout, retry_delay = _request_settings()
+    retries, timeout, retry_delay = request_settings()
     last_error = "Unknown service sync error."
+    try:
+        headers = service_headers()
+    except RuntimeError as exc:
+        raise LifecycleSyncError(str(exc)) from exc
 
     for attempt in range(1, retries + 1):
         try:
             response = requests.post(
                 url,
                 json=payload,
-                headers=_service_headers(),
+                headers=headers,
                 timeout=timeout,
             )
             response.raise_for_status()
@@ -64,23 +52,6 @@ def _perform_post(url: str, payload: dict[str, Any]) -> None:
                 time.sleep(retry_delay)
 
     raise LifecycleSyncError(last_error)
-
-
-def _exchange_keys_for_user(user) -> dict[str, str]:
-    keys = getattr(user, "exchange_keys", None)
-    if keys is None:
-        return {}
-
-    return {
-        "binance_api_key": keys.binance_api_key,
-        "binance_secret": keys.binance_secret,
-        "bybit_api_key": keys.bybit_api_key,
-        "bybit_secret": keys.bybit_secret,
-        "gate_api_key": keys.gate_api_key,
-        "gate_secret": keys.gate_secret,
-        "mexc_api_key": keys.mexc_api_key,
-        "mexc_secret": keys.mexc_secret,
-    }
 
 
 def _bot_runtime_payload(bot: BotConfig) -> dict[str, Any]:
@@ -106,33 +77,7 @@ def _bot_runtime_payload(bot: BotConfig) -> dict[str, Any]:
             "max_leg_drawdown_percent": bot.max_leg_drawdown_percent,
             "is_active": bot.is_active,
         },
-        "keys": _exchange_keys_for_user(bot.owner),
-    }
-
-
-def _trader_runtime_payload(runtime_config: TraderRuntimeConfig) -> dict[str, Any]:
-    return {
-        "runtime_config_id": runtime_config.id,
-        "owner_id": runtime_config.owner_id,
-        "config": {
-            "id": runtime_config.id,
-            "name": runtime_config.name,
-            "primary_exchange": runtime_config.primary_exchange,
-            "secondary_exchange": runtime_config.secondary_exchange,
-            "use_testnet": runtime_config.use_testnet,
-            "trade_amount_usdt": str(runtime_config.trade_amount_usdt),
-            "leverage": runtime_config.leverage,
-            "max_concurrent_trades": runtime_config.max_concurrent_trades,
-            "top_liquid_pairs_count": runtime_config.top_liquid_pairs_count,
-            "max_trade_duration_minutes": runtime_config.max_trade_duration_minutes,
-            "max_leg_drawdown_percent": str(runtime_config.max_leg_drawdown_percent),
-            "open_threshold": str(runtime_config.open_threshold),
-            "close_threshold": str(runtime_config.close_threshold),
-            "orderbook_limit": runtime_config.orderbook_limit,
-            "chunk_size": runtime_config.chunk_size,
-            "is_active": runtime_config.is_active,
-        },
-        "keys": _exchange_keys_for_user(runtime_config.owner),
+        "keys": exchange_keys_for_user(bot.owner),
     }
 
 
@@ -192,7 +137,7 @@ def sync_bot_lifecycle(bot_id: int, action: str) -> None:
     payload = {"bot_id": bot.id} if action in {LifecycleCommand.STOP, LifecycleCommand.FORCE_CLOSE} else _bot_runtime_payload(bot)
 
     try:
-        _perform_post(_join_control_url(bot.service_url, path), payload)
+        _perform_post(join_control_url(bot.service_url, path), payload)
     except LifecycleSyncError as exc:
         _update_sync_metadata(
             BotConfig.objects.filter(pk=bot_id),
@@ -216,7 +161,7 @@ def stop_deleted_bot(service_url: str, bot_id: int) -> None:
     """Send a best-effort stop command for a BotConfig being deleted."""
 
     _perform_post(
-        _join_control_url(service_url, "/engine/bot/stop"),
+        join_control_url(service_url, "/engine/bot/stop"),
         {"bot_id": bot_id},
     )
 
@@ -245,11 +190,11 @@ def sync_trader_runtime_lifecycle(runtime_config_id: int, action: str) -> None:
     payload = (
         {"runtime_config_id": runtime_config.id}
         if action == LifecycleCommand.STOP
-        else _trader_runtime_payload(runtime_config)
+        else build_trader_runtime_payload(runtime_config)
     )
 
     try:
-        _perform_post(_join_control_url(runtime_config.service_url, path), payload)
+        _perform_post(join_control_url(runtime_config.service_url, path), payload)
     except LifecycleSyncError as exc:
         _update_sync_metadata(
             TraderRuntimeConfig.objects.filter(pk=runtime_config_id),
