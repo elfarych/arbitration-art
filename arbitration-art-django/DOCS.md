@@ -336,6 +336,11 @@ Logout behavior:
 
 Файл моделей: `apps/bots/models.py`.
 
+Общие definitions exchange choices вынесены на модульный уровень:
+
+- `BOT_EXCHANGE_CHOICES` для `BotConfig`, `EmulationTrade` и `Trade`;
+- `TRADER_EXCHANGE_CHOICES` для `TraderRuntimeConfig`.
+
 ### 8.1. `BotConfig`
 
 Назначение: конфигурационная карточка арбитражного бота.
@@ -351,8 +356,8 @@ Choices:
 `Exchange`:
 
 - `binance_futures` - Binance Futures
-- `binance_spot` - Binance Spot
 - `bybit_futures` - Bybit Futures
+- `gate_futures` - Gate Futures
 - `mexc_futures` - Mexc Futures
 
 `OrderType`:
@@ -427,8 +432,8 @@ Choices:
 |---|---|---:|---|
 | `bot` | FK BotConfig | да | Бот или `null` для scanner trade. |
 | `coin` | `CharField(50)` | да | Дублирует монету для историчности/сканера. |
-| `primary_exchange` | choices BotConfig.Exchange | да | Primary exchange. |
-| `secondary_exchange` | choices BotConfig.Exchange | да | Secondary exchange. |
+| `primary_exchange` | choices `BOT_EXCHANGE_CHOICES` | да | Primary exchange. |
+| `secondary_exchange` | choices `BOT_EXCHANGE_CHOICES` | да | Secondary exchange. |
 | `order_type` | choices BotConfig.OrderType | да | buy/sell/auto. |
 | `status` | choices Status | нет | Default `open`. |
 | `amount` | `DecimalField(18, 8)` | нет | Размер сделки. |
@@ -473,8 +478,8 @@ Choices:
 | Поле | Тип | Nullable | Комментарий |
 |---|---|---:|---|
 | `coin` | `CharField(50)` | нет | Монета. |
-| `primary_exchange` | choices BotConfig.Exchange | нет | Primary exchange. |
-| `secondary_exchange` | choices BotConfig.Exchange | нет | Secondary exchange. |
+| `primary_exchange` | choices `BOT_EXCHANGE_CHOICES` | нет | Primary exchange. |
+| `secondary_exchange` | choices `BOT_EXCHANGE_CHOICES` | нет | Secondary exchange. |
 | `order_type` | choices BotConfig.OrderType | нет | buy/sell/auto. |
 | `status` | choices Status | нет | Default `open`. |
 | `close_reason` | choices CloseReason | да | Причина закрытия. |
@@ -609,7 +614,91 @@ Side effects:
 }
 ```
 
-### 9.2. `EmulationTradeViewSet`
+### 9.2. `TraderRuntimeConfigViewSet`
+
+Класс: `apps.bots.api.views.TraderRuntimeConfigViewSet`.
+
+Тип: `ModelViewSet`.
+
+Permissions:
+
+```python
+permission_classes = [IsAuthenticated]
+```
+
+Queryset:
+
+```python
+TraderRuntimeConfig.objects.filter(owner=request.user, is_deleted=False)
+```
+
+Если передан `?include_archived=true`, queryset включает архивные конфиги.
+
+Endpoints:
+
+| Method | Path | Назначение |
+|---|---|---|
+| `GET` | `/api/bots/runtime-configs/` | Список runtime-конфигов текущего пользователя. |
+| `POST` | `/api/bots/runtime-configs/` | Создать runtime-конфиг текущего пользователя. |
+| `GET` | `/api/bots/runtime-configs/{id}/` | Получить runtime-конфиг. |
+| `PUT` | `/api/bots/runtime-configs/{id}/` | Полностью обновить runtime-конфиг. |
+| `PATCH` | `/api/bots/runtime-configs/{id}/` | Частично обновить runtime-конфиг. |
+| `DELETE` | `/api/bots/runtime-configs/{id}/` | Архивировать runtime-конфиг и отправить `stop`, если runtime считался активным. |
+
+Serializer fields:
+
+```text
+id
+name
+service_url
+primary_exchange
+secondary_exchange
+use_testnet
+trade_amount_usdt
+leverage
+max_concurrent_trades
+top_liquid_pairs_count
+max_trade_duration_minutes
+max_leg_drawdown_percent
+open_threshold
+close_threshold
+orderbook_limit
+chunk_size
+is_active
+status
+sync_status
+last_command
+last_sync_error
+last_synced_at
+is_deleted
+archived_at
+created_at
+updated_at
+```
+
+Read-only:
+
+```text
+id
+status
+sync_status
+last_command
+last_sync_error
+last_synced_at
+is_deleted
+archived_at
+created_at
+updated_at
+```
+
+Поведение create/update:
+
+- `owner` всегда выставляется из `request.user`.
+- На `POST /api/bots/runtime-configs/` serializer принудительно сохраняет `is_active=false`, даже если клиент прислал `true`.
+- При создании с `is_active=false` post-save сигнал не отправляет lifecycle-команду в `arbitration-trader`.
+- Первый lifecycle-запрос появляется только после явного включения runtime-конфига через update.
+
+### 9.3. `EmulationTradeViewSet`
 
 Класс: `apps.bots.api.views.EmulationTradeViewSet`.
 
@@ -676,7 +765,7 @@ opened_at
 
 Риск: так как permission `AllowAny` и это `ModelViewSet`, а не read-only API, анонимный клиент может создавать/обновлять/удалять scanner trades, если не закрыто внешним reverse proxy или другим слоем. Это может быть намеренно для engine/scanner, но должно быть явно защищено на уровне сети или отдельным service token.
 
-### 9.3. `TradeViewSet`
+### 9.4. `TradeViewSet`
 
 Класс: `apps.bots.api.views.TradeViewSet`.
 

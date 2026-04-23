@@ -50,6 +50,10 @@ class BotConfigSerializer(serializers.ModelSerializer):
 class TraderRuntimeConfigSerializer(serializers.ModelSerializer):
     """Serializer for standalone trader runtime configuration CRUD."""
 
+    def create(self, validated_data):
+        validated_data["is_active"] = False
+        return super().create(validated_data)
+
     class Meta:
         model = TraderRuntimeConfig
         fields = (

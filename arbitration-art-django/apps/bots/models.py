@@ -39,15 +39,24 @@ class LifecycleCommand(models.TextChoices):
     FORCE_CLOSE = "force-close", "Force close"
 
 
+BOT_EXCHANGE_CHOICES = (
+    ("binance_futures", "Binance Futures"),
+    ("bybit_futures", "Bybit Futures"),
+    ("gate_futures", "Gate Futures"),
+    ("mexc_futures", "Mexc Futures"),
+)
+
+
+TRADER_EXCHANGE_CHOICES = (
+    ("binance", "Binance"),
+    ("bybit", "Bybit"),
+    ("gate", "Gate"),
+    ("mexc", "MEXC"),
+)
+
+
 class BotConfig(models.Model):
     """Arbitrage bot configuration card."""
-
-    class Exchange(models.TextChoices):
-        BINANCE_FUTURES = "binance_futures", "Binance Futures"
-        BINANCE_SPOT = "binance_spot", "Binance Spot"
-        BYBIT_FUTURES = "bybit_futures", "Bybit Futures"
-        GATE_FUTURES = "gate_futures", "Gate Futures"
-        MEXC_FUTURES = "mexc_futures", "Mexc Futures"
 
     class OrderType(models.TextChoices):
         BUY = "buy", "Покупка"
@@ -72,12 +81,12 @@ class BotConfig(models.Model):
     primary_exchange = models.CharField(
         "primary exchange",
         max_length=50,
-        choices=Exchange.choices,
+        choices=BOT_EXCHANGE_CHOICES,
     )
     secondary_exchange = models.CharField(
         "secondary exchange",
         max_length=50,
-        choices=Exchange.choices,
+        choices=BOT_EXCHANGE_CHOICES,
     )
     entry_spread = models.DecimalField(
         "entry spread",
@@ -150,12 +159,6 @@ class BotConfig(models.Model):
 class TraderRuntimeConfig(models.Model):
     """Managed runtime configuration for the standalone trader service."""
 
-    class Exchange(models.TextChoices):
-        BINANCE = "binance", "Binance"
-        BYBIT = "bybit", "Bybit"
-        GATE = "gate", "Gate"
-        MEXC = "mexc", "MEXC"
-
     owner = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.CASCADE,
@@ -167,12 +170,12 @@ class TraderRuntimeConfig(models.Model):
     primary_exchange = models.CharField(
         "primary exchange",
         max_length=20,
-        choices=Exchange.choices,
+        choices=TRADER_EXCHANGE_CHOICES,
     )
     secondary_exchange = models.CharField(
         "secondary exchange",
         max_length=20,
-        choices=Exchange.choices,
+        choices=TRADER_EXCHANGE_CHOICES,
     )
     use_testnet = models.BooleanField("use testnet", default=False)
     trade_amount_usdt = models.DecimalField(
@@ -194,7 +197,7 @@ class TraderRuntimeConfig(models.Model):
     close_threshold = models.DecimalField("close threshold", max_digits=10, decimal_places=4)
     orderbook_limit = models.PositiveIntegerField("orderbook limit", default=50)
     chunk_size = models.PositiveIntegerField("chunk size", default=10)
-    is_active = models.BooleanField("active", default=True)
+    is_active = models.BooleanField("active", default=False)
     status = models.CharField(
         "runtime status",
         max_length=20,
@@ -294,14 +297,14 @@ class EmulationTrade(models.Model):
     primary_exchange = models.CharField(
         "primary exchange",
         max_length=50,
-        choices=BotConfig.Exchange.choices,
+        choices=BOT_EXCHANGE_CHOICES,
         null=True,
         blank=True,
     )
     secondary_exchange = models.CharField(
         "secondary exchange",
         max_length=50,
-        choices=BotConfig.Exchange.choices,
+        choices=BOT_EXCHANGE_CHOICES,
         null=True,
         blank=True,
     )
@@ -327,8 +330,10 @@ class EmulationTrade(models.Model):
     opened_at = models.DateTimeField("opened at", auto_now_add=True)
 
     # Close details
-    primary_close_price = models.DecimalField("primary close price", max_digits=20, decimal_places=8, null=True, blank=True)
-    secondary_close_price = models.DecimalField("secondary close price", max_digits=20, decimal_places=8, null=True, blank=True)
+    primary_close_price = models.DecimalField("primary close price", max_digits=20, decimal_places=8, null=True,
+                                              blank=True)
+    secondary_close_price = models.DecimalField("secondary close price", max_digits=20, decimal_places=8, null=True,
+                                                blank=True)
     close_spread = models.DecimalField("close spread", max_digits=10, decimal_places=4, null=True, blank=True)
     profit_percentage = models.DecimalField("profit percentage", max_digits=10, decimal_places=4, null=True, blank=True)
     closed_at = models.DateTimeField("closed at", null=True, blank=True)
@@ -386,12 +391,12 @@ class Trade(models.Model):
     primary_exchange = models.CharField(
         "primary exchange",
         max_length=50,
-        choices=BotConfig.Exchange.choices,
+        choices=BOT_EXCHANGE_CHOICES,
     )
     secondary_exchange = models.CharField(
         "secondary exchange",
         max_length=50,
-        choices=BotConfig.Exchange.choices,
+        choices=BOT_EXCHANGE_CHOICES,
     )
     order_type = models.CharField(
         "order type",
