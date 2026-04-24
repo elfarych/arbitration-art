@@ -1,4 +1,9 @@
-import type { OrderResult, SymbolMarketInfo } from '../types/index.js';
+import type {
+    ExchangePosition,
+    ExchangeTicker,
+    OrderResult,
+    SymbolMarketInfo,
+} from '../types/index.js';
 
 export interface ExchangeClientOptions {
     apiKey?: string;
@@ -15,8 +20,14 @@ export interface ExchangeClientOptions {
 export interface IExchangeClient {
     readonly name: string;
 
-    /** Expose underlying ccxt instance */
-    readonly ccxtInstance: any;
+    /** Fetch exchange server time in milliseconds */
+    fetchTime(): Promise<number>;
+
+    /** Fetch normalized 24h ticker data keyed by internal symbol */
+    fetchTickers(symbols?: string[]): Promise<Record<string, ExchangeTicker>>;
+
+    /** Fetch normalized open positions for internal symbols */
+    fetchPositions(symbols: string[]): Promise<ExchangePosition[]>;
 
     /** Load all market data (call once at bootstrap) */
     loadMarkets(): Promise<void>;
@@ -32,7 +43,7 @@ export interface IExchangeClient {
         symbol: string,
         side: 'buy' | 'sell',
         amount: number,
-        params?: any,
+        params?: { reduceOnly?: boolean; clientOrderId?: string },
     ): Promise<OrderResult>;
 
     /** Get market info (lot sizes, precision, etc.) for a symbol */
@@ -43,4 +54,7 @@ export interface IExchangeClient {
 
     /** Verify that private API access works for the configured credentials */
     pingPrivate(): Promise<void>;
+
+    /** Verify account position mode is compatible with one-way reduce-only flow */
+    validateAccountMode(): Promise<void>;
 }

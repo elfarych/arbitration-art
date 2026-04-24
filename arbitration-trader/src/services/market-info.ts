@@ -1,5 +1,5 @@
 import type { IExchangeClient } from '../exchanges/exchange-client.js';
-import type { UnifiedMarketInfo } from '../types/index.js';
+import type { ExchangeTicker, UnifiedMarketInfo } from '../types/index.js';
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
 
@@ -32,14 +32,17 @@ export class MarketInfoService {
         // same symbol.
         let currentPrices: Record<string, number> = {};
         let secondaryPrices: Record<string, number> = {};
+        let primaryTickers: Record<string, ExchangeTicker> = {};
+        let secondaryTickers: Record<string, ExchangeTicker> = {};
         try {
             logger.info(TAG, `Fetching current prices for amount calculation and collision protection...`);
             const [pTickers, sTickers] = await Promise.all([
-                primaryClient.ccxtInstance.fetchTickers(),
-                secondaryClient.ccxtInstance.fetchTickers()
+                primaryClient.fetchTickers(),
+                secondaryClient.fetchTickers()
             ]);
+            primaryTickers = pTickers;
+            secondaryTickers = sTickers;
             for (const sym of commonSymbols) {
-                // Keep ccxt symbols as keys throughout the service.
                 if (pTickers[sym]?.last) currentPrices[sym] = pTickers[sym].last;
                 if (sTickers[sym]?.last) secondaryPrices[sym] = sTickers[sym].last;
             }
@@ -105,6 +108,10 @@ export class MarketInfoService {
                 minQty,
                 minNotional,
                 tradeAmount,
+                primaryFundingRate: primaryTickers[symbol]?.fundingRate ?? null,
+                secondaryFundingRate: secondaryTickers[symbol]?.fundingRate ?? null,
+                primaryNextFundingTime: primaryTickers[symbol]?.nextFundingTime ?? null,
+                secondaryNextFundingTime: secondaryTickers[symbol]?.nextFundingTime ?? null,
                 tradeable: true,
             };
 

@@ -28,6 +28,12 @@ export interface RuntimeConfigPayload {
     orderbook_limit: number;
     chunk_size: number;
     is_active: boolean;
+    min_open_net_edge_percent?: number | string;
+    entry_fee_buffer_percent?: number | string;
+    entry_slippage_buffer_percent?: number | string;
+    funding_buffer_percent?: number | string;
+    latency_buffer_percent?: number | string;
+    shadow_mode?: boolean;
 }
 
 export interface RuntimeCommandPayload {
@@ -72,7 +78,47 @@ export interface SystemLoadSnapshot {
     memory_used_percent: number;
 }
 
+// ──────────── Exchange Data ────────────
+
+export interface ExchangeTicker {
+    symbol: string;
+    last: number;
+    quoteVolume: number;
+    fundingRate: number | null;
+    nextFundingTime: number | null;
+    raw: unknown;
+}
+
+export interface ExchangePosition {
+    symbol: string;
+    side: 'long' | 'short';
+    amount: number;
+    contracts: number;
+    entryPrice: number;
+    raw: unknown;
+}
+
 // ──────────── Orderbook ────────────
+
+export interface OrderBookSnapshot {
+    symbol: string;
+    bids: [number, number][];
+    asks: [number, number][];
+    exchangeTimestamp: number | null;
+    localTimestamp: number;
+    sequence: string | number | null;
+    isSynced: boolean;
+}
+
+export interface OrderBookProvider {
+    readonly exchange: string;
+    connect(): Promise<void>;
+    subscribe(symbols: string[]): Promise<void>;
+    unsubscribe(symbols: string[]): Promise<void>;
+    getOrderBook(symbol: string): OrderBookSnapshot | null;
+    onUpdate(listener: (symbol: string) => void): () => void;
+    close(): Promise<void>;
+}
 
 /**
  * Normalized VWAP/top-of-book prices for one symbol across the configured
@@ -118,6 +164,14 @@ export interface UnifiedMarketInfo {
     minNotional: number;
     /** Pre-calculated amount of coins for the configured USDT volume */
     tradeAmount: number;
+    /** Latest funding rate from the primary exchange, as decimal fraction */
+    primaryFundingRate: number | null;
+    /** Latest funding rate from the secondary exchange, as decimal fraction */
+    secondaryFundingRate: number | null;
+    /** Next funding timestamp from the primary exchange, milliseconds */
+    primaryNextFundingTime: number | null;
+    /** Next funding timestamp from the secondary exchange, milliseconds */
+    secondaryNextFundingTime: number | null;
     /** Whether this pair is tradeable on both exchanges */
     tradeable: boolean;
 }

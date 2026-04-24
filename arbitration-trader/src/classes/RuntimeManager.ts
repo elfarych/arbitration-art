@@ -1,16 +1,19 @@
-import { pro } from 'ccxt';
+import * as crypto from 'node:crypto';
 import { clearActiveRuntime, config, setActiveRuntime } from '../config.js';
-import { Trader, TradeCounter } from './Trader.js';
+import { Trader } from './Trader.js';
+import { TradeCounter } from './TradeCounter.js';
 import { BinanceClient } from '../exchanges/binance-client.js';
 import { BybitClient } from '../exchanges/bybit-client.js';
 import { GateClient } from '../exchanges/gate-client.js';
 import { MexcClient } from '../exchanges/mexc-client.js';
 import type { ExchangeClientOptions, IExchangeClient } from '../exchanges/exchange-client.js';
+import { createOrderBookProvider } from '../exchanges/ws/orderbook-provider-factory.js';
 import { api } from '../services/api.js';
 import { getSystemLoadSnapshot } from '../services/diagnostics.js';
 import { MarketInfoService } from '../services/market-info.js';
 import type {
     ExchangeHealthCheckResult,
+    OrderBookProvider,
     RuntimeCommandPayload,
     RuntimeTradesDiagnostics,
     SystemLoadSnapshot,
@@ -24,8 +27,8 @@ interface ActiveRuntimeHandle {
     traders: Trader[];
     primaryClient: IExchangeClient;
     secondaryClient: IExchangeClient;
-    wsPrimary: any;
-    wsSecondary: any;
+    primaryBooks: OrderBookProvider;
+    secondaryBooks: OrderBookProvider;
     runPromise: Promise<void>;
 }
 
@@ -34,6 +37,7 @@ const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 export class RuntimeManager {
     private activeRuntime: ActiveRuntimeHandle | null = null;
     private operationChain: Promise<void> = Promise.resolve();
+    private confirmedSetupKeys = new Set<string>();
 
     private withLock<T>(operation: () => Promise<T>): Promise<T> {
         const nextOperation = this.operationChain.then(operation, operation);
@@ -209,8 +213,8 @@ export class RuntimeManager {
 
         setActiveRuntime(payload);
 
-        let wsPrimary: any = null;
-        let wsSecondary: any = null;
+        let primaryBooks: OrderBookProvider | null = null;
+        let secondaryBooks: OrderBookProvider | null = null;
 
         try {
             logger.info(TAG, '═══════════════════════════════════════════');
@@ -229,21 +233,27 @@ export class RuntimeManager {
                 throw new Error('Primary and secondary exchanges MUST be different.');
             }
 
+            logger.info(TAG, 'Checking required account modes...');
+            await Promise.all([
+                primaryClient.validateAccountMode(),
+                secondaryClient.validateAccountMode(),
+            ]);
+
             try {
                 logger.info(TAG, 'Measuring latency to exchange matching engines...');
                 await Promise.all([
-                    primaryClient.ccxtInstance.fetchTime().catch(() => {}),
-                    secondaryClient.ccxtInstance.fetchTime().catch(() => {}),
+                    primaryClient.fetchTime().catch(() => {}),
+                    secondaryClient.fetchTime().catch(() => {}),
                 ]);
 
                 const [primaryStart, secondaryStart] = [Date.now(), Date.now()];
                 await Promise.all([
-                    primaryClient.ccxtInstance.fetchTime()
+                    primaryClient.fetchTime()
                         .then(() => {
                             logger.info(TAG, `📡 ${primaryClient.name} Latency: ${Date.now() - primaryStart} ms`);
                         })
                         .catch(() => logger.warn(TAG, `Failed to measure latency for ${primaryClient.name}`)),
-                    secondaryClient.ccxtInstance.fetchTime()
+                    secondaryClient.fetchTime()
                         .then(() => {
                             logger.info(TAG, `📡 ${secondaryClient.name} Latency: ${Date.now() - secondaryStart} ms`);
                         })
@@ -265,26 +275,74 @@ export class RuntimeManager {
 
             logger.info(TAG, `Found ${commonSymbols.length} intersecting USDT futures pairs.`);
 
-            logger.info(TAG, `Fetching 24h volume to determine top ${config.topLiquidPairsCount} liquid pairs...`);
-            try {
-                const tickers = await primaryClient.ccxtInstance.fetchTickers();
-                commonSymbols = commonSymbols.filter(symbol => (tickers[symbol]?.quoteVolume || 0) >= 2_000_000);
-                commonSymbols.sort((left, right) => (tickers[right]?.quoteVolume || 0) - (tickers[left]?.quoteVolume || 0));
-                commonSymbols = commonSymbols.slice(0, config.topLiquidPairsCount);
-                logger.info(TAG, `Filtered down to top ${commonSymbols.length} most liquid pairs based on ${primaryClient.name} 24h USDT volume.`);
-            } catch (error: any) {
-                logger.warn(TAG, `Failed to fetch volume data, proceeding with all ${commonSymbols.length} pairs. Error: ${error.message}`);
+            logger.info(TAG, 'Checking for open trades from previous session...');
+            const openTrades = await api.getOpenTrades(config.runtimeConfigId);
+            logger.info(TAG, `Found ${openTrades.length} open trades to restore.`);
+            const recoverySymbols = [...new Set(openTrades.map(trade => trade.coin))];
+
+            const missingRecoverySymbols = recoverySymbols.filter(symbol => !primarySymbols.has(symbol) || !secondarySymbols.includes(symbol));
+            if (missingRecoverySymbols.length > 0) {
+                throw new Error(
+                    `Open trades exist for symbols that are not available on both exchanges: ${missingRecoverySymbols.join(', ')}.`,
+                );
             }
 
-            if (commonSymbols.length === 0) {
-                throw new Error('No common symbols found.');
+            logger.info(TAG, `Fetching 24h volume from both exchanges to determine top ${config.topLiquidPairsCount} liquid pairs...`);
+            let scannableSymbols: string[] = [];
+            try {
+                const [primaryTickers, secondaryTickers] = await Promise.all([
+                    primaryClient.fetchTickers(),
+                    secondaryClient.fetchTickers(),
+                ]);
+
+                scannableSymbols = commonSymbols
+                    .filter(symbol => {
+                        const primaryVolume = primaryTickers[symbol]?.quoteVolume || 0;
+                        const secondaryVolume = secondaryTickers[symbol]?.quoteVolume || 0;
+                        return Math.min(primaryVolume, secondaryVolume) >= 2_000_000;
+                    })
+                    .sort((left, right) => {
+                        const leftVolume = Math.min(
+                            primaryTickers[left]?.quoteVolume || 0,
+                            secondaryTickers[left]?.quoteVolume || 0,
+                        );
+                        const rightVolume = Math.min(
+                            primaryTickers[right]?.quoteVolume || 0,
+                            secondaryTickers[right]?.quoteVolume || 0,
+                        );
+                        return rightVolume - leftVolume;
+                    })
+                    .slice(0, config.topLiquidPairsCount);
+
+                logger.info(TAG, `Filtered down to top ${scannableSymbols.length} most liquid pairs based on min cross-exchange 24h USDT volume.`);
+            } catch (error: any) {
+                if (openTrades.length === 0) {
+                    throw new Error(`Failed to fetch volume data and no recovery trades are available: ${error.message}`);
+                }
+
+                logger.error(TAG, `Failed to fetch volume data. Runtime will manage recovery trades only and block new entries. Error: ${error.message}`);
+                scannableSymbols = [];
+            }
+
+            const runtimeSymbols = unique([...scannableSymbols, ...recoverySymbols]);
+            const entryDisabledSymbols = new Set(runtimeSymbols.filter(symbol => !scannableSymbols.includes(symbol)));
+
+            if (runtimeSymbols.length === 0) {
+                throw new Error('No symbols left after liquidity filtering and recovery selection.');
             }
 
             const marketInfo = new MarketInfoService();
-            const tradeableSymbols = await marketInfo.initialize(primaryClient, secondaryClient, commonSymbols);
+            const tradeableSymbols = await marketInfo.initialize(primaryClient, secondaryClient, runtimeSymbols);
 
             if (tradeableSymbols.length === 0) {
                 throw new Error('No tradeable symbols after market info validation.');
+            }
+
+            const missingTradeableRecovery = recoverySymbols.filter(symbol => !tradeableSymbols.includes(symbol));
+            if (missingTradeableRecovery.length > 0) {
+                throw new Error(
+                    `Open trades cannot be restored because market info is unavailable for: ${missingTradeableRecovery.join(', ')}.`,
+                );
             }
 
             logger.info(TAG, `Setting leverage ${config.leverage}x and isolated margin on ${tradeableSymbols.length} pairs...`);
@@ -294,10 +352,17 @@ export class RuntimeManager {
             const finalTradeableSymbols: string[] = [];
 
             const setupSymbol = async (symbol: string) => {
+                const setupKey = this.buildSetupCacheKey(payload, symbol);
+                if (this.confirmedSetupKeys.has(setupKey)) {
+                    logger.debug(TAG, `Skipping cached leverage/margin setup for ${symbol}`);
+                    return;
+                }
+
                 await Promise.all([
                     primaryClient.setIsolatedMargin(symbol).then(() => primaryClient.setLeverage(symbol, config.leverage)),
                     secondaryClient.setIsolatedMargin(symbol).then(() => secondaryClient.setLeverage(symbol, config.leverage)),
                 ]);
+                this.confirmedSetupKeys.add(setupKey);
             };
 
             for (let index = 0; index < tradeableSymbols.length; index += batchSize) {
@@ -322,17 +387,29 @@ export class RuntimeManager {
                 throw new Error('No tradeable symbols left after setup constraint checks.');
             }
 
-            logger.info(TAG, `Leverage/margin setup complete. Successful pairs: ${finalTradeableSymbols.length}. Excluded pairs: ${leverageErrors}.`);
-            logger.info(TAG, 'Creating WebSocket instances...');
+            const missingSetupRecovery = recoverySymbols.filter(symbol => !finalTradeableSymbols.includes(symbol));
+            if (missingSetupRecovery.length > 0) {
+                throw new Error(
+                    `Open trades cannot be restored because leverage/margin setup failed for: ${missingSetupRecovery.join(', ')}.`,
+                );
+            }
 
-            wsPrimary = this.createWsClient(config.primaryExchange);
-            wsSecondary = this.createWsClient(config.secondaryExchange);
+            logger.info(TAG, `Leverage/margin setup complete. Successful pairs: ${finalTradeableSymbols.length}. Excluded pairs: ${leverageErrors}.`);
+            logger.info(TAG, 'Creating orderbook providers...');
+
+            primaryBooks = createOrderBookProvider(config.primaryExchange);
+            secondaryBooks = createOrderBookProvider(config.secondaryExchange);
 
             await Promise.all([
-                wsPrimary.loadMarkets(),
-                wsSecondary.loadMarkets(),
+                primaryBooks.connect(),
+                secondaryBooks.connect(),
             ]);
-            logger.info(TAG, 'WebSocket markets loaded. Ready to stream.');
+
+            await Promise.all([
+                primaryBooks.subscribe(finalTradeableSymbols),
+                secondaryBooks.subscribe(finalTradeableSymbols),
+            ]);
+            logger.info(TAG, 'Orderbook providers are connected and subscribed.');
 
             const tradeCounter = new TradeCounter();
             const chunks: string[][] = [];
@@ -341,21 +418,18 @@ export class RuntimeManager {
             }
 
             logger.info(TAG, `Split into ${chunks.length} chunks of ${config.chunkSize}.`);
-            logger.info(TAG, 'Checking for open trades from previous session...');
-
-            const openTrades = await api.getOpenTrades(config.runtimeConfigId);
-            logger.info(TAG, `Found ${openTrades.length} open trades to restore.`);
 
             const traders: Trader[] = chunks.map((chunk, index) => (
                 new Trader(
                     index + 1,
                     chunk,
-                    wsPrimary,
-                    wsSecondary,
+                    primaryBooks!,
+                    secondaryBooks!,
                     primaryClient,
                     secondaryClient,
                     marketInfo,
                     tradeCounter,
+                    entryDisabledSymbols,
                 )
             ));
 
@@ -364,7 +438,7 @@ export class RuntimeManager {
                 if (trader) {
                     trader.restoreOpenTrades([trade]);
                 } else {
-                    logger.warn(TAG, `Open trade for ${trade.coin} (ID: ${trade.id}) has no matching trader chunk. Ignoring.`);
+                    throw new Error(`Open trade for ${trade.coin} (ID: ${trade.id}) has no matching trader chunk.`);
                 }
             }
 
@@ -378,25 +452,25 @@ export class RuntimeManager {
                 traders,
                 primaryClient,
                 secondaryClient,
-                wsPrimary,
-                wsSecondary,
+                primaryBooks,
+                secondaryBooks,
                 runPromise,
             };
             this.monitorRuntimeTermination(payload.runtime_config_id, runPromise);
 
             logger.info(TAG, `Runtime ${payload.runtime_config_id} started successfully.`);
         } catch (error) {
-            if (wsPrimary) {
+            if (primaryBooks) {
                 try {
-                    await wsPrimary.close();
+                    await primaryBooks.close();
                 } catch {
                     // Ignore cleanup errors on failed startup.
                 }
             }
 
-            if (wsSecondary) {
+            if (secondaryBooks) {
                 try {
-                    await wsSecondary.close();
+                    await secondaryBooks.close();
                 } catch {
                     // Ignore cleanup errors on failed startup.
                 }
@@ -421,13 +495,13 @@ export class RuntimeManager {
         await Promise.allSettled(current.traders.map(trader => trader.stop(true)));
 
         try {
-            await current.wsPrimary.close();
+            await current.primaryBooks.close();
         } catch {
             // Ignore websocket close errors during shutdown.
         }
 
         try {
-            await current.wsSecondary.close();
+            await current.secondaryBooks.close();
         } catch {
             // Ignore websocket close errors during shutdown.
         }
@@ -489,19 +563,43 @@ export class RuntimeManager {
         }
     }
 
-    private createWsClient(name: string): any {
-        const isTestnet = config.useTestnet;
-        switch (name.toLowerCase()) {
+    private buildSetupCacheKey(payload: RuntimeCommandPayload, symbol: string): string {
+        const selectedKeys = [
+            this.exchangeApiKey(payload.config.primary_exchange, payload),
+            this.exchangeApiKey(payload.config.secondary_exchange, payload),
+        ].join('|');
+        const accountFingerprint = crypto
+            .createHash('sha256')
+            .update(selectedKeys)
+            .digest('hex')
+            .slice(0, 16);
+
+        return [
+            accountFingerprint,
+            payload.config.primary_exchange,
+            payload.config.secondary_exchange,
+            symbol,
+            payload.config.leverage,
+        ].join(':');
+    }
+
+    private exchangeApiKey(exchange: string, payload: RuntimeCommandPayload): string {
+        switch (exchange.toLowerCase()) {
             case 'binance':
-                return new pro.binanceusdm({ ...(isTestnet && { sandbox: true }) });
+                return payload.keys.binance_api_key || '';
             case 'bybit':
-                return new pro.bybit({ ...(isTestnet && { sandbox: true }), options: { defaultType: 'swap' } });
+                return payload.keys.bybit_api_key || '';
             case 'mexc':
-                return new pro.mexc({ ...(isTestnet && { sandbox: true }), options: { defaultType: 'swap' } });
+                return payload.keys.mexc_api_key || '';
             case 'gate':
-                return new pro.gate({ ...(isTestnet && { sandbox: true }), options: { defaultType: 'swap' } });
+                return payload.keys.gate_api_key || '';
             default:
-                throw new Error(`WS client not implemented for ${name}`);
+                return '';
         }
     }
+
+}
+
+function unique(values: string[]): string[] {
+    return [...new Set(values)];
 }

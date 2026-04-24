@@ -1,79 +1,22 @@
-import { type Exchange } from 'ccxt';
 import { calculateOpenSpread, calculateTruePnL, calculateRealPnL, d, checkLegDrawdown, calculateVWAP } from '../utils/math.js';
 import { api } from '../services/api.js';
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
+import { CloseSyncService } from '../services/close-sync-service.js';
+import { fetchConfirmedPosition } from '../services/position-recovery.js';
+import { shadowRecorder } from '../services/shadow-recorder.js';
+import { SignalEngine } from '../services/signal-engine.js';
 import type { IExchangeClient } from '../exchanges/exchange-client.js';
 import type { MarketInfoService } from '../services/market-info.js';
-import type { OrderbookPrices, RuntimeTradePnlSnapshot, TradeClosePayload, TradeRecord } from '../types/index.js';
-
-type CloseTriggerReason = 'profit' | 'timeout' | 'shutdown' | 'error' | 'liquidation';
-
-interface PendingCloseSync {
-    payload: TradeClosePayload;
-    reason: CloseTriggerReason;
-    nextBaselineBuy: number | null;
-    nextBaselineSell: number | null;
-}
-
-/**
- * Per-symbol mutable runtime state.
- *
- * This state lives only inside the Node process. Django is the durable source
- * for trade records, while this map controls current signal calculation,
- * cooldowns and re-entrancy protection.
- */
-interface PairState {
-    baselineBuy: number | null;
-    baselineSell: number | null;
-    activeTrade: TradeRecord | null;
-    /** Timestamp when the trade was opened (for timeout monitoring) */
-    openedAtMs: number | null;
-    /** Mutex: prevents concurrent open/close race conditions */
-    busy: boolean;
-    /** Cooldown timestamp: prevents rapid re-entry after failed orders */
-    cooldownUntil: number;
-    /** Persisted exchange close data waiting to be synced into Django */
-    pendingCloseSync: PendingCloseSync | null;
-}
-
-/**
- * Shared counter for concurrent trades across all Trader instances.
- * Implements optimistic locking (reserve/release) to prevent async race conditions.
- */
-export class TradeCounter {
-    private count = 0;
-
-    get current(): number {
-        return this.count;
-    }
-
-    canOpen(): boolean {
-        return this.count < config.maxConcurrentTrades;
-    }
-
-    /** Atomically reserve a slot if available */
-    reserve(): boolean {
-        if (this.count < config.maxConcurrentTrades) {
-            this.count++;
-            logger.info('TradeCounter', `Reserved trade slot: ${this.count}/${config.maxConcurrentTrades}`);
-            return true;
-        }
-        return false;
-    }
-
-    /** Release a reserved slot */
-    release(): void {
-        this.count = Math.max(0, this.count - 1);
-        logger.info('TradeCounter', `Released trade slot: ${this.count}/${config.maxConcurrentTrades}`);
-    }
-
-    /** Force increment for restoring existing state */
-    forceReserve(): void {
-        this.count++;
-        logger.info('TradeCounter', `Force reserved (restore): ${this.count}/${config.maxConcurrentTrades}`);
-    }
-}
+import type { TradeCounter } from './TradeCounter.js';
+import { createPairState, type CloseTriggerReason, type PairState } from './trade-state.js';
+import type {
+    OrderBookProvider,
+    OrderbookPrices,
+    RuntimeTradePnlSnapshot,
+    TradeClosePayload,
+    TradeRecord,
+} from '../types/index.js';
 
 const COOLDOWN_MS = 30_000; // 30s cooldown after failed order
 const TIMEOUT_CHECK_INTERVAL_MS = 10_000; // Check timeouts every 10s
@@ -90,30 +33,30 @@ export class Trader {
     private isRunning = true;
     private states: Map<string, PairState> = new Map();
     private timeoutTimer: ReturnType<typeof setInterval> | null = null;
+    private unsubscribeCallbacks: Array<() => void> = [];
+    private scheduledChecks = new Set<string>();
+    private runningChecks = new Set<string>();
+    private stopResolve: (() => void) | null = null;
+    private readonly signalEngine = new SignalEngine();
+    private readonly closeSync: CloseSyncService;
 
     constructor(
         public id: number,
         public symbols: string[],
-        private primaryWs: Exchange,
-        private secondaryWs: Exchange,
+        private primaryBooks: OrderBookProvider,
+        private secondaryBooks: OrderBookProvider,
         private primaryClient: IExchangeClient,
         private secondaryClient: IExchangeClient,
         private marketInfo: MarketInfoService,
         private tradeCounter: TradeCounter,
+        private entryDisabledSymbols: Set<string> = new Set(),
     ) {
         this.tag = `Trader-${id}`;
+        this.closeSync = new CloseSyncService(this.tag);
         // Pre-create state for every symbol so runtime checks can use direct
         // Map lookups without creating state while websocket callbacks are active.
         for (const sym of symbols) {
-            this.states.set(sym, {
-                baselineBuy: null,
-                baselineSell: null,
-                activeTrade: null,
-                openedAtMs: null,
-                busy: false,
-                cooldownUntil: 0,
-                pendingCloseSync: null,
-            });
+            this.states.set(sym, createPairState(!this.entryDisabledSymbols.has(sym)));
         }
     }
 
@@ -196,25 +139,34 @@ export class Trader {
     }
 
     /**
-     * Start watching orderbooks. Returns a Promise that never resolves
+     * Start processing provider updates. Returns a Promise that never resolves
      * (keeps running until `stop()` is called).
      */
     public async start(): Promise<void> {
         logger.info(this.tag, `Starting loops for ${this.symbols.length} pairs...`);
+        this.isRunning = true;
 
         // Start the timeout watchdog separately from websocket ticks so positions
         // can be closed even when a symbol stops receiving frequent book updates.
         this.timeoutTimer = setInterval(() => this.checkTimeouts(), TIMEOUT_CHECK_INTERVAL_MS);
 
-        const loops: Promise<void>[] = [];
+        const handleUpdate = (symbol: string) => {
+            if (this.states.has(symbol)) {
+                this.scheduleCheck(symbol);
+            }
+        };
+        this.unsubscribeCallbacks = [
+            this.primaryBooks.onUpdate(handleUpdate),
+            this.secondaryBooks.onUpdate(handleUpdate),
+        ];
+
         for (const symbol of this.symbols) {
-            // Every symbol is watched on both exchanges. watchLoop reads the
-            // latest orderbook from ccxt.pro's internal cache after each update.
-            loops.push(this.watchLoop(this.primaryWs, symbol, this.primaryClient.name));
-            loops.push(this.watchLoop(this.secondaryWs, symbol, this.secondaryClient.name));
+            this.scheduleCheck(symbol);
         }
 
-        await Promise.all(loops);
+        await new Promise<void>(resolve => {
+            this.stopResolve = resolve;
+        });
     }
 
     /**
@@ -228,41 +180,52 @@ export class Trader {
             this.timeoutTimer = null;
         }
 
+        for (const unsubscribe of this.unsubscribeCallbacks) {
+            unsubscribe();
+        }
+        this.unsubscribeCallbacks = [];
+
         if (closePositions) {
             // Used during graceful shutdown to flatten all active positions before
             // the process exits.
             await this.closeAllPositions('shutdown');
         }
 
+        this.stopResolve?.();
+        this.stopResolve = null;
         logger.info(this.tag, 'Stopped.');
     }
 
-    // ───────────── Private: Watch Loop ─────────────
-
-    private async watchLoop(exchange: Exchange, symbol: string, exName: string) {
-        let consecutiveErrors = 0;
-
-        while (this.isRunning) {
-            try {
-                await exchange.watchOrderBook(symbol, config.orderbookLimit);
-                consecutiveErrors = 0;
-                await this.checkSpreads(symbol);
-            } catch (e: any) {
-                consecutiveErrors++;
-                // Backoff prevents a bad websocket subscription from spinning
-                // hot and flooding logs.
-                const delay = Math.min(2000 * consecutiveErrors, 30000);
-                logger.error(this.tag, `WS error ${exName} ${symbol} (attempt ${consecutiveErrors}): ${e.message}`);
-                await new Promise(r => setTimeout(r, delay));
-            }
+    private scheduleCheck(symbol: string): void {
+        if (
+            !this.isRunning ||
+            this.scheduledChecks.has(symbol) ||
+            this.runningChecks.has(symbol)
+        ) {
+            return;
         }
+
+        this.scheduledChecks.add(symbol);
+        queueMicrotask(() => {
+            this.scheduledChecks.delete(symbol);
+            if (!this.isRunning || this.runningChecks.has(symbol)) {
+                return;
+            }
+
+            this.runningChecks.add(symbol);
+            void this.checkSpreads(symbol)
+                .catch((error: any) => {
+                    logger.error(this.tag, `Spread check failed for ${symbol}: ${error.message}`);
+                })
+                .finally(() => {
+                    this.runningChecks.delete(symbol);
+                });
+        });
     }
 
     private getPrices(symbol: string, targetCoinsFallback?: number, isEmergency: boolean = false): OrderbookPrices | null {
-        // ccxt.pro keeps orderbooks in memory on the exchange instance. Both
-        // primary and secondary books must have at least one bid and ask.
-        const bOb = (this.primaryWs as any).orderbooks?.[symbol];
-        const yOb = (this.secondaryWs as any).orderbooks?.[symbol];
+        const bOb = this.primaryBooks.getOrderBook(symbol);
+        const yOb = this.secondaryBooks.getOrderBook(symbol);
 
         if (
             !bOb?.bids?.length || !bOb?.asks?.length ||
@@ -322,7 +285,7 @@ export class Trader {
         } else {
             // Dynamic lot sizing based on current primary best bid and configured
             // USDT budget.
-            const bOb = (this.primaryWs as any).orderbooks?.[symbol];
+            const bOb = this.primaryBooks.getOrderBook(symbol);
             const currentPrice = bOb?.bids?.[0]?.[0];
             if (!currentPrice) return;
 
@@ -348,28 +311,22 @@ export class Trader {
             return;
         }
 
+        if (!state.canOpenNewTrades) {
+            return;
+        }
+
         // Idle state: look for entry.
         const prices = this.getPrices(symbol, targetCoins, false);
         if (!prices) return;
 
-        const currentBuySpread = calculateOpenSpread(prices, 'buy');
-        const currentSellSpread = calculateOpenSpread(prices, 'sell');
-
-        // Baseline EMA tracks normal spread level per direction. Entries require
-        // spread expansion above baseline plus OPEN_THRESHOLD.
-        const EMA_ALPHA = 0.002;
-
-        if (state.baselineBuy === null) {
-            state.baselineBuy = currentBuySpread;
-        } else {
-            state.baselineBuy = state.baselineBuy * (1 - EMA_ALPHA) + currentBuySpread * EMA_ALPHA;
-        }
-
-        if (state.baselineSell === null) {
-            state.baselineSell = currentSellSpread;
-        } else {
-            state.baselineSell = state.baselineSell * (1 - EMA_ALPHA) + currentSellSpread * EMA_ALPHA;
-        }
+        const evaluation = this.signalEngine.evaluateEntry(
+            prices,
+            info,
+            state.baselineBuy,
+            state.baselineSell,
+        );
+        state.baselineBuy = evaluation.nextBaselineBuy;
+        state.baselineSell = evaluation.nextBaselineSell;
 
         // Check global concurrent limit first as a cheap read-only guard.
         if (!this.tradeCounter.canOpen()) return;
@@ -377,12 +334,17 @@ export class Trader {
         // Cooldown prevents immediate re-entry after failed orders/cleanup.
         if (Date.now() < state.cooldownUntil) return;
 
-        if (currentBuySpread >= state.baselineBuy + config.openThreshold) {
-            await this.executeOpen(symbol, state, 'buy', prices, currentBuySpread, targetCoins);
-            return;
-        }
-        if (currentSellSpread >= state.baselineSell + config.openThreshold) {
-            await this.executeOpen(symbol, state, 'sell', prices, currentSellSpread, targetCoins);
+        if (evaluation.decision) {
+            await this.executeOpen(
+                symbol,
+                state,
+                evaluation.decision.orderType,
+                prices,
+                evaluation.decision.spread,
+                targetCoins,
+                evaluation.decision.expectedNetEdge,
+                evaluation.decision.fundingCostPercent,
+            );
             return;
         }
     }
@@ -395,21 +357,39 @@ export class Trader {
         orderType: 'buy' | 'sell',
         prices: OrderbookPrices,
         spread: number,
-        targetCoins: number
+        targetCoins: number,
+        expectedNetEdge: number,
+        fundingCostPercent: number,
     ) {
         state.busy = true;
+        let slotReserved = false;
 
         try {
+            if (config.shadowMode) {
+                await shadowRecorder.recordEntrySignal({
+                    symbol,
+                    order_type: orderType,
+                    amount: targetCoins,
+                    spread: d(spread, 4),
+                    expected_net_edge: d(expectedNetEdge, 4),
+                    funding_cost_percent: d(fundingCostPercent, 4),
+                    prices,
+                });
+                state.cooldownUntil = Date.now() + COOLDOWN_MS;
+                return;
+            }
+
             // Reserve a global slot atomically. This closes a race where multiple
             // symbols pass canOpen() before any one of them opens.
             if (!this.tradeCounter.reserve()) {
                 logger.debug(this.tag, `Skipping ${symbol}: concurrent trade limit reached just now`);
                 return;
             }
+            slotReserved = true;
 
             const amount = targetCoins;
 
-            logger.info(this.tag, `🔴 OPENING ${symbol} (${orderType}), amount: ${amount}, spread: ${spread.toFixed(3)}%`);
+            logger.info(this.tag, `🔴 OPENING ${symbol} (${orderType}), amount: ${amount}, spread: ${spread.toFixed(3)}%, expected net edge: ${expectedNetEdge.toFixed(3)}%`);
 
             // Determine order sides for each exchange.
             const primarySide = orderType === 'buy' ? 'buy' : 'sell';
@@ -430,19 +410,24 @@ export class Trader {
                     const revSide = primarySide === 'buy' ? 'sell' : 'buy';
                     // reduceOnly is critical to avoid opening a new opposite
                     // margin position during rollback.
-                    await this.primaryClient.createMarketOrder(symbol, revSide, pSettled.value.filledQty, { reduceOnly: true }).catch(console.error);
+                    await this.primaryClient.createMarketOrder(symbol, revSide, pSettled.value.filledQty, { reduceOnly: true })
+                        .catch((error: any) => logger.error(this.tag, `Primary rollback failed for ${symbol}: ${error.message}`));
                 }
                 if (sSettled.status === 'fulfilled') {
                     const revSide = secondarySide === 'buy' ? 'sell' : 'buy';
-                    await this.secondaryClient.createMarketOrder(symbol, revSide, sSettled.value.filledQty, { reduceOnly: true }).catch(console.error);
+                    await this.secondaryClient.createMarketOrder(symbol, revSide, sSettled.value.filledQty, { reduceOnly: true })
+                        .catch((error: any) => logger.error(this.tag, `Secondary rollback failed for ${symbol}: ${error.message}`));
                 }
 
                 // Insurance against network timeout: an order may have filled
                 // even if the API call rejected before returning its response.
                 await new Promise(r => setTimeout(r, 1000)); 
-                await this.handleOpenCleanup(symbol, orderType);
+                await this.safeHandleOpenCleanup(symbol, orderType);
 
-                this.tradeCounter.release();
+                if (slotReserved) {
+                    this.tradeCounter.release();
+                    slotReserved = false;
+                }
                 state.cooldownUntil = Date.now() + COOLDOWN_MS;
                 return;
             }
@@ -487,6 +472,7 @@ export class Trader {
 
             state.activeTrade = tradeRecord;
             state.openedAtMs = Date.now();
+            slotReserved = false;
 
             logger.info(this.tag, `✅ Opened ${symbol} (${orderType}). DB ID: ${tradeRecord.id}, ${this.primaryClient.name}: ${pPriceSafe}, ${this.secondaryClient.name}: ${sPriceSafe}`);
 
@@ -496,9 +482,12 @@ export class Trader {
             // Atomic safety: if an order failed, or if Django API failed after
             // orders were placed, close any opened positions to avoid naked
             // exposure.
-            await this.handleOpenCleanup(symbol, orderType);
+            await this.safeHandleOpenCleanup(symbol, orderType);
 
-            this.tradeCounter.release();
+            if (slotReserved) {
+                this.tradeCounter.release();
+                slotReserved = false;
+            }
             state.baselineBuy = null;
             state.baselineSell = null;
             state.cooldownUntil = Date.now() + COOLDOWN_MS;
@@ -518,14 +507,15 @@ export class Trader {
         // covers the case where an API request times out after the exchange filled.
         const info = this.marketInfo.getInfo(symbol);
         const minQty = info?.minQty || 0;
+        const cleanupErrors: string[] = [];
         try {
             // Try closing any position that might have been opened on primary.
             try {
-                const primaryPositions = await (this.primaryClient as any).ccxtInstance.fetchPositions([symbol]);
+                const primaryPositions = await this.primaryClient.fetchPositions([symbol]);
                 for (const pos of primaryPositions) {
                     if (pos.symbol !== symbol) continue;
 
-                    const size = Math.abs(Number(pos.contracts ?? pos.amount ?? 0));
+                    const size = Math.abs(Number(pos.amount ?? pos.contracts ?? 0));
                     if (size > 0 && size >= minQty) {
                         const side = pos.side === 'long' ? 'sell' : 'buy';
                         await this.primaryClient.createMarketOrder(symbol, side, size, { reduceOnly: true });
@@ -534,15 +524,16 @@ export class Trader {
                 }
             } catch (err: any) {
                 logger.error(this.tag, `Failed to clean up ${this.primaryClient.name} position for ${symbol}: ${err.message}`);
+                cleanupErrors.push(`${this.primaryClient.name}: ${err.message}`);
             }
 
             // Try closing any position that might have been opened on secondary.
             try {
-                const secondaryPositions = await (this.secondaryClient as any).ccxtInstance.fetchPositions([symbol]);
+                const secondaryPositions = await this.secondaryClient.fetchPositions([symbol]);
                 for (const pos of secondaryPositions) {
                     if (pos.symbol !== symbol) continue;
 
-                    const size = Math.abs(Number(pos.contracts ?? pos.amount ?? 0));
+                    const size = Math.abs(Number(pos.amount ?? pos.contracts ?? 0));
                     if (size > 0 && size >= minQty) {
                         const side = pos.side === 'long' ? 'sell' : 'buy';
                         await this.secondaryClient.createMarketOrder(symbol, side, size, { reduceOnly: true });
@@ -551,10 +542,24 @@ export class Trader {
                 }
             } catch (err: any) {
                 logger.error(this.tag, `Failed to clean up ${this.secondaryClient.name} position for ${symbol}: ${err.message}`);
+                cleanupErrors.push(`${this.secondaryClient.name}: ${err.message}`);
+            }
+
+            if (cleanupErrors.length > 0) {
+                throw new Error(cleanupErrors.join('; '));
             }
 
         } catch (cleanupErr: any) {
             logger.error(this.tag, `❌ CRITICAL: Cleanup error for ${symbol}: ${cleanupErr.message}`);
+            throw cleanupErr;
+        }
+    }
+
+    private async safeHandleOpenCleanup(symbol: string, orderType: 'buy' | 'sell'): Promise<void> {
+        try {
+            await this.handleOpenCleanup(symbol, orderType);
+        } catch (error: any) {
+            logger.error(this.tag, `❌ CRITICAL: Cleanup failed for ${symbol}, internal counters were still released: ${error.message}`);
         }
     }
 
@@ -617,23 +622,25 @@ export class Trader {
         try {
             const primaryCloseSide = orderType === 'buy' ? 'sell' : 'buy';
             const secondaryCloseSide = orderType === 'buy' ? 'buy' : 'sell';
+            const primaryExpectedSide = orderType === 'buy' ? 'long' : 'short';
+            const secondaryExpectedSide = orderType === 'buy' ? 'short' : 'long';
 
             let pPrice = 0, sPrice = 0, pOrder = 'already_closed', sOrder = 'already_closed';
             let closeCommission = 0;
 
-            // 1. Check current positions to make closing idempotent. If one leg is
-            // already flat, only close the remaining leg and record fallback price.
-            const pPositions = await (this.primaryClient as any).ccxtInstance.fetchPositions([symbol]);
-            const sPositions = await (this.secondaryClient as any).ccxtInstance.fetchPositions([symbol]);
-
-            const pPos = pPositions.find((p: any) => p.symbol === symbol && Math.abs(Number(p.contracts ?? p.amount ?? 0)) > 0);
-            const sPos = sPositions.find((p: any) => p.symbol === symbol && Math.abs(Number(p.contracts ?? p.amount ?? 0)) > 0);
-
-            const pSize = pPos ? Math.abs(Number(pPos.contracts ?? pPos.amount ?? 0)) : 0;
-            const sSize = sPos ? Math.abs(Number(sPos.contracts ?? sPos.amount ?? 0)) : 0;
-
             const info = this.marketInfo.getInfo(symbol);
             const minQty = info?.minQty || 0;
+
+            // 1. Check current positions to make closing idempotent. A missing
+            // position is accepted only after a second confirmation to reduce
+            // exchange lag / eventual consistency false negatives.
+            const [pPos, sPos] = await Promise.all([
+                fetchConfirmedPosition(this.primaryClient, symbol, primaryExpectedSide, minQty, this.tag),
+                fetchConfirmedPosition(this.secondaryClient, symbol, secondaryExpectedSide, minQty, this.tag),
+            ]);
+
+            const pSize = pPos?.size ?? 0;
+            const sSize = sPos?.size ?? 0;
 
             // 2. Execute missing closures only. This avoids flipping positions if
             // a previous close attempt partially succeeded.
@@ -705,7 +712,7 @@ export class Trader {
                 closed_at: new Date().toISOString(),
             };
 
-            const isDbSaved = await this.persistCloseTrade(trade.id, closePayload);
+            const isDbSaved = await this.closeSync.persistCloseTrade(trade.id, closePayload);
             if (!isDbSaved) {
                 state.pendingCloseSync = {
                     payload: closePayload,
@@ -793,28 +800,6 @@ export class Trader {
         }
     }
 
-    private async persistCloseTrade(tradeId: number, payload: TradeClosePayload): Promise<boolean> {
-        let retries = 0;
-
-        while (retries < 10) {
-            try {
-                // Persist close details with retries. At this point positions may
-                // already be flat, so losing the DB update would make recovery
-                // ambiguous after restart.
-                await api.closeTrade(tradeId, payload);
-                return true;
-            } catch (dbErr: any) {
-                retries++;
-                logger.error(this.tag, `❌ CRITICAL: Django update failed (ID: ${tradeId}): ${dbErr.message}. Attempt ${retries}/10. Retrying in 5s...`);
-                if (retries < 10) {
-                    await new Promise(r => setTimeout(r, 5000));
-                }
-            }
-        }
-
-        return false;
-    }
-
     private finalizeClosedTrade(
         state: PairState,
         nextBaselineBuy: number | null,
@@ -845,7 +830,7 @@ export class Trader {
         state.busy = true;
 
         try {
-            const isDbSaved = await this.persistCloseTrade(state.activeTrade.id, state.pendingCloseSync.payload);
+            const isDbSaved = await this.closeSync.persistCloseTrade(state.activeTrade.id, state.pendingCloseSync.payload);
             if (!isDbSaved) {
                 logger.error(this.tag, `❌ Django close sync is still pending for ${symbol}. Exchange positions stay flat, local state remains locked.`);
                 return;

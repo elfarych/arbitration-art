@@ -1,21 +1,63 @@
 import axios, { AxiosInstance } from 'axios';
 import * as crypto from 'crypto';
 import type { ExchangeClientOptions, IExchangeClient } from './exchange-client.js';
-import type { OrderResult, SymbolMarketInfo } from '../types/index.js';
+import type { ExchangePosition, ExchangeTicker, OrderResult, SymbolMarketInfo } from '../types/index.js';
+import { gateToUnified, unifiedToGate } from './symbols.js';
 import { logger } from '../utils/logger.js';
 import { config } from '../config.js';
 
 const TAG = 'GateClient';
+const SETTLE = 'usdt';
+const ORDER_POLL_ATTEMPTS = 6;
+const ORDER_POLL_DELAY_MS = 700;
+const TRADE_POLL_ATTEMPTS = 3;
+const TRADE_POLL_DELAY_MS = 500;
 
-function ccxtToGate(symbol: string): string {
-    // Convert ccxt futures symbol format (BTC/USDT:USDT) to Gate contract format
-    // (BTC_USDT).
-    return symbol.replace(':USDT', '').replace('/', '_');
+type HttpMethod = 'GET' | 'POST' | 'DELETE';
+
+interface GateContract {
+    name: string;
+    type?: string;
+    quanto_multiplier?: string | number;
+    order_price_round?: string | number;
+    order_size_round?: string | number;
+    order_size_min?: string | number;
 }
 
-function gateToCcxt(gateSymbol: string): string {
-    // Convert Gate contract names back to ccxt futures format.
-    return gateSymbol.replace('_', '/') + ':USDT';
+interface GateTicker {
+    contract: string;
+    last?: string;
+    mark_price?: string;
+    volume_24h_quote?: string;
+    funding_rate?: string;
+    funding_rate_indicative?: string;
+    funding_next_apply?: string | number;
+}
+
+interface GatePosition {
+    contract?: string;
+    size?: string | number;
+    leverage?: string | number;
+    lever?: string | number;
+    pos_margin_mode?: string;
+    entry_price?: string;
+}
+
+interface GateOrder {
+    id?: string | number;
+    contract?: string;
+    size?: string | number;
+    left?: string | number;
+    fill_price?: string | number;
+    status?: string;
+    finish_as?: string;
+    text?: string;
+}
+
+interface GateTrade {
+    size?: string | number;
+    price?: string | number;
+    fee?: string | number;
 }
 
 /**
@@ -26,295 +68,219 @@ function gateToCcxt(gateSymbol: string): string {
  */
 export class GateClient implements IExchangeClient {
     public readonly name = 'Gate';
-    private httpClient: AxiosInstance;
-    private baseUrl: string;
-    private markets: Map<string, any> = new Map();
-    private apiKey: string;
-    private secret: string;
+
+    private readonly httpClient: AxiosInstance;
+    private readonly baseUrl: string;
+    private readonly apiKey: string;
+    private readonly secret: string;
+    private readonly markets: Map<string, GateContract> = new Map();
 
     constructor(options: ExchangeClientOptions = {}) {
         const useTestnet = options.useTestnet ?? config.useTestnet;
         this.apiKey = options.apiKey ?? config.gate.apiKey;
         this.secret = options.secret ?? config.gate.secret;
 
-        // Gate exposes separate base URLs for futures testnet and production.
         this.baseUrl = useTestnet
             ? 'https://fx-api-testnet.gateio.ws/api/v4'
-            : 'https://api.gateio.ws/api/v4';
+            : 'https://fx-api.gateio.ws/api/v4';
 
         this.httpClient = axios.create({
             baseURL: this.baseUrl,
             timeout: 10000,
         });
-
-        // Normalize Gate API error payloads into Error.message.
-        this.httpClient.interceptors.response.use(
-            response => response,
-            error => {
-                if (error.response?.data) {
-                    throw new Error(`Gate API Error: ${JSON.stringify(error.response.data)}`);
-                }
-                throw error;
-            }
-        );
     }
 
-    // Trader expects a small ccxt-like surface for tickers and position fetches.
-    get ccxtInstance(): any {
-        return {
-            fetchTime: async () => Date.now(),
-            fetchTickers: async () => {
-                // Convert Gate ticker contract names into ccxt symbols.
-                const data = await this.request('GET', '/futures/usdt/tickers');
-                const tickers: any = {};
-                for (const t of data) {
-                    tickers[gateToCcxt(t.contract)] = {
-                        last: Number(t.last),
-                        quoteVolume: Number(t.volume_24h_quote || 0)
-                    };
-                }
-                return tickers;
-            },
-            fetchPositions: async (symbols: string[]) => {
-                const results: any[] = [];
-                for (const symbol of symbols) {
-                    try {
-                        const gateSymbol = ccxtToGate(symbol);
-                        const data = await this.request('GET', `/futures/usdt/positions/${gateSymbol}`);
-                        if (data && data.size !== undefined && Number(data.size) !== 0) {
-                            const market = this.markets.get(gateSymbol);
-                            // Gate reports futures position size in contracts.
-                            // Convert it back to base coin amount for Trader.
-                            const multiplier = Number(market?.quanto_multiplier || 1);
-                            const baseAmount = Math.abs(Number(data.size)) * multiplier;
-
-                            results.push({
-                                symbol: symbol,
-                                contracts: baseAmount,
-                                amount: baseAmount,
-                                side: Number(data.size) > 0 ? 'long' : 'short',
-                                entryPrice: parseFloat(data.entry_price || '0'),
-                            });
-                        }
-                    } catch (e: any) {
-                        logger.error(TAG, `Failed to fetch positions for ${symbol}: ${e.message}`);
-                    }
-                }
-                return results;
-            }
-        };
+    async fetchTime(): Promise<number> {
+        return Date.now();
     }
 
-    private sign(method: string, endpoint: string, query: string, payload: string) {
-        // Gate v4 signs method, full API path, query string, SHA512 payload hash
-        // and timestamp separated by newlines.
-        const t = Math.floor(Date.now() / 1000).toString();
-        const hashedPayload = crypto.createHash('sha512').update(payload).digest('hex');
-        const signatureString = [method, endpoint, query, hashedPayload, t].join('\n');
-        
-        const sign = crypto.createHmac('sha512', this.secret).update(signatureString).digest('hex');
-        return {
-            'KEY': this.apiKey,
-            'Timestamp': t,
-            'SIGN': sign,
-        };
+    async fetchTickers(symbols?: string[]): Promise<Record<string, ExchangeTicker>> {
+        const requested = symbols ? new Set(symbols) : null;
+        const data = await this.request<GateTicker[]>('GET', `/futures/${SETTLE}/tickers`, {}, null, false);
+        const tickers: Record<string, ExchangeTicker> = {};
+
+        for (const ticker of data) {
+            const symbol = gateToUnified(ticker.contract);
+            if (requested && !requested.has(symbol)) {
+                continue;
+            }
+
+            tickers[symbol] = {
+                symbol,
+                last: Number(ticker.last || ticker.mark_price || 0),
+                quoteVolume: Number(ticker.volume_24h_quote || 0),
+                fundingRate: parseNullableNumber(ticker.funding_rate || ticker.funding_rate_indicative),
+                nextFundingTime: parseNullableTimestamp(ticker.funding_next_apply),
+                raw: ticker,
+            };
+        }
+
+        return tickers;
+    }
+
+    async fetchPositions(symbols: string[]): Promise<ExchangePosition[]> {
+        const results: ExchangePosition[] = [];
+
+        for (const symbol of symbols) {
+            try {
+                const gateSymbol = unifiedToGate(symbol);
+                const data = await this.request<GatePosition>('GET', `/futures/${SETTLE}/positions/${gateSymbol}`);
+                const nativeSize = Number(data.size || 0);
+                if (!Number.isFinite(nativeSize) || nativeSize === 0) {
+                    continue;
+                }
+
+                const multiplier = this.getMultiplierOrThrow(gateSymbol, symbol);
+                const baseAmount = Math.abs(nativeSize) * multiplier;
+
+                results.push({
+                    symbol,
+                    // Trader currently closes positions with `contracts ?? amount`,
+                    // so both fields intentionally carry base amount for Gate.
+                    contracts: baseAmount,
+                    amount: baseAmount,
+                    side: nativeSize > 0 ? 'long' : 'short',
+                    entryPrice: Number(data.entry_price || 0),
+                    raw: data,
+                });
+            } catch (error: any) {
+                const message = this.formatError(error);
+                logger.error(TAG, `Failed to fetch positions for ${symbol}: ${message}`);
+                throw new Error(`Failed to fetch Gate position for ${symbol}: ${message}`);
+            }
+        }
+
+        return results;
     }
 
     async pingPrivate(): Promise<void> {
-        await this.request('GET', '/futures/usdt/accounts');
+        await this.request('GET', `/futures/${SETTLE}/accounts`);
     }
 
-    private async request(method: 'GET' | 'POST' | 'DELETE', endpoint: string, query: Record<string, any> = {}, data: any = null) {
-        const queryString = Object.keys(query)
-            .sort() // Gate usually requires sorted params or matched url formatting
-            .map(k => `${encodeURIComponent(k)}=${encodeURIComponent(query[k])}`)
-            .join('&');
-            
-        const payloadStr = data ? JSON.stringify(data) : '';
-        const pathStr = '/api/v4' + endpoint;
-
-        const headers = {
-            'Accept': 'application/json',
-            'Content-Type': 'application/json',
-            ...this.sign(method, pathStr, queryString, payloadStr)
-        };
-
-        const url = queryString ? `${endpoint}?${queryString}` : endpoint;
-
-        const response = await this.httpClient.request({
-            method,
-            url,
-            data: payloadStr || undefined,
-            headers
-        });
-        return response.data;
+    async validateAccountMode(): Promise<void> {
+        await this.pingPrivate();
     }
 
     async loadMarkets(): Promise<void> {
-        // Cache futures contract metadata for conversion and sizing.
-        const contracts = await this.request('GET', '/futures/usdt/contracts');
+        const contracts = await this.request<GateContract[]>('GET', `/futures/${SETTLE}/contracts`, {}, null, false);
         this.markets.clear();
+
         for (const contract of contracts) {
-            this.markets.set(contract.name, contract);
+            if (this.isTradeableUsdtContract(contract)) {
+                this.markets.set(contract.name, contract);
+            }
         }
+
+        if (this.markets.size === 0) {
+            throw new Error('Failed to load Gate USDT futures markets');
+        }
+
         logger.info(TAG, `Markets loaded: ${this.markets.size} symbols`);
     }
 
     async setLeverage(symbol: string, leverage: number): Promise<void> {
-        const gateSymbol = ccxtToGate(symbol);
+        const gateSymbol = unifiedToGate(symbol);
         try {
-            await this.request('POST', `/futures/usdt/positions/${gateSymbol}/leverage`, {
-                leverage: leverage.toString(),
-                cross_leverage_limit: leverage.toString()
-            });
-            logger.debug(TAG, `Leverage set to ${leverage}x for ${symbol}`);
-        } catch (e: any) {
-            throw new Error(`Failed to set leverage to ${leverage}x on Gate for ${symbol}: ${e.message}`);
+            const response = await this.request<GatePosition>(
+                'POST',
+                `/futures/${SETTLE}/positions/${gateSymbol}/leverage`,
+                { leverage: this.formatDecimal(leverage) },
+            );
+
+            this.assertIsolatedLeverage(symbol, leverage, response);
+            logger.debug(TAG, `Isolated leverage set to ${leverage}x for ${symbol}`);
+        } catch (error: any) {
+            throw new Error(`Failed to set isolated leverage to ${leverage}x on Gate for ${symbol}: ${this.formatError(error)}`);
         }
     }
 
     async setIsolatedMargin(symbol: string): Promise<void> {
-        const gateSymbol = ccxtToGate(symbol);
-        try {
-            // Gate typically configures isolated mode dynamically when margin is
-            // set. This call is best-effort and skipped if unsupported.
-            await this.request('POST', `/futures/usdt/positions/${gateSymbol}/margin`, {
-                size: "0" 
-            });
-            logger.debug(TAG, `Isolated margin logic confirmed for ${symbol}`);
-        } catch (e: any) {
-            if (e.message.includes('already in isolated')) {
-                logger.debug(TAG, `Margin already isolated for ${symbol}`);
-            } else {
-                throw new Error(`Failed to confirm isolated margin on Gate for ${symbol}: ${e.message}`);
-            }
+        if (!Number.isFinite(config.leverage) || config.leverage <= 0) {
+            throw new Error(`Gate isolated margin requires a positive leverage for ${symbol}`);
         }
+
+        // Gate uses positive leverage as isolated margin mode. Runtime calls
+        // setLeverage immediately after this method, where the API response is
+        // validated before the symbol is allowed into scanning.
+        logger.debug(TAG, `Gate isolated margin for ${symbol} is controlled by positive leverage.`);
     }
 
     async createMarketOrder(
         symbol: string,
         side: 'buy' | 'sell',
-        amount: number, // Base currency amount.
-        params: any = {},
+        amount: number,
+        params: { reduceOnly?: boolean; clientOrderId?: string } = {},
     ): Promise<OrderResult> {
-        const gateSymbol = ccxtToGate(symbol);
-        const market = this.markets.get(gateSymbol);
-        
-        if (!market) {
-            throw new Error(`Market not loaded for ${symbol}`);
-        }
+        const gateSymbol = unifiedToGate(symbol);
+        const multiplier = this.getMultiplierOrThrow(gateSymbol, symbol);
+        const sizeInContracts = this.baseAmountToContracts(gateSymbol, amount, multiplier);
+        const signedSize = side === 'sell' ? -sizeInContracts : sizeInContracts;
+        const clientText = this.createOrderText(params.clientOrderId);
 
-        // Convert base currency amount to Gate contract count.
-        const quantoMultiplier = Number(market.quanto_multiplier);
-        let sizeInContracts = Math.round(amount / quantoMultiplier);
-        
-        // Gate uses positive size for buy/long and negative size for sell/short.
-        if (side === 'sell') {
-            sizeInContracts = -sizeInContracts;
-        }
+        logger.info(TAG, `Creating ${side} order for ${symbol}, amount (base): ${amount}, size (contracts): ${signedSize}`);
 
-        logger.info(TAG, `Creating ${side} order for ${symbol}, amount (base): ${amount}, size (contracts): ${sizeInContracts}`);
-
-        const payload: any = {
+        const payload: Record<string, unknown> = {
             contract: gateSymbol,
-            size: sizeInContracts,
-            price: "0", 
-            tif: "ioc" 
+            size: Number(this.formatDecimal(signedSize, 16)),
+            price: '0',
+            tif: 'ioc',
+            text: clientText,
         };
 
         if (params.reduceOnly) {
             payload.reduce_only = true;
         }
 
-        let orderData;
+        let orderData: GateOrder;
         try {
-            orderData = await this.request('POST', '/futures/usdt/orders', {}, payload);
-        } catch (e: any) {
-            throw new Error(`Gate order failed: ${e.message}`);
-        }
-
-        let filled = orderData;
-        const orderId = orderData.id;
-
-        // Gate can return fill_price=0 or status=open immediately after submit,
-        // so poll for final execution details.
-        let retries = 0;
-        let avgPrice = parseFloat(filled.fill_price || '0');
-        
-        while ((avgPrice === 0 || filled.status === 'open') && retries < 5) {
-            await new Promise(r => setTimeout(r, 1000));
-            retries++;
-            try {
-                const checked = await this.request('GET', `/futures/usdt/orders/${orderId}`);
-                if (checked) {
-                    filled = checked;
-                    avgPrice = parseFloat(filled.fill_price || '0');
-                }
-                if (avgPrice > 0 && filled.status !== 'open') break;
-            } catch (e) {
-                // Ignore fetch errors during polling
+            orderData = await this.request<GateOrder>('POST', `/futures/${SETTLE}/orders`, {}, payload);
+        } catch (error: any) {
+            const reconciled = await this.reconcileSubmittedOrder(gateSymbol, clientText, amount, multiplier);
+            if (reconciled) {
+                this.assertFilledMarketOrder(reconciled, clientText, amount);
+                logger.info(TAG, `Order filled after reconciliation: ${symbol} ${side} @ ${reconciled.avgPrice}, qty: ${reconciled.filledQty}, commission: ${reconciled.commission} USDT`);
+                return reconciled;
             }
+
+            throw new Error(`Gate order failed: ${this.formatError(error)}`);
         }
 
-        // Commission is extracted from Gate trade records; paid fees are negative
-        // in native responses, so use absolute value.
-        let commission = 0;
-        try {
-            // Wait 500ms to ensure trades are flushed to db
-            await new Promise(r => setTimeout(r, 500));
-            const trades = await this.request('GET', '/futures/usdt/my_trades', { contract: gateSymbol, order: orderId });
-            if (Array.isArray(trades)) {
-                for (const t of trades) {
-                    commission += Math.abs(parseFloat(t.fee || '0'));
-                }
-            }
-        } catch (e: any) {
-            logger.warn(TAG, `Failed to extract trades for order ${orderId}, fee left 0: ${e.message}`);
-        }
+        const orderId = orderData.id ? String(orderData.id) : undefined;
+        const result = await this.waitForOrderResult(gateSymbol, orderId, clientText, amount, multiplier, orderData);
 
-        // Compute actual filled base currency quantity.
-        const filledContracts = Math.abs(Number(filled.size) - Number(filled.left || 0));
-        const filledQty = filledContracts * quantoMultiplier;
-
-        const result: OrderResult = {
-            orderId: String(filled.id),
-            avgPrice: avgPrice,
-            filledQty: filledQty,
-            commission,
-            commissionAsset: 'USDT',
-            status: filled.status === 'finished' ? 'closed' : filled.status, 
-            raw: filled,
-        };
-
-        logger.info(TAG, `Order filled: ${symbol} ${side} @ ${result.avgPrice}, qty: ${result.filledQty}, commission: ${result.commission}`);
+        this.assertFilledMarketOrder(result, orderId || clientText, amount);
+        logger.info(TAG, `Order filled: ${symbol} ${side} @ ${result.avgPrice}, qty: ${result.filledQty}, commission: ${result.commission} USDT`);
         return result;
     }
 
     getMarketInfo(symbol: string): SymbolMarketInfo | null {
-        // Convert Gate contract constraints into base-coin constraints.
-        const gateSymbol = ccxtToGate(symbol);
+        const gateSymbol = unifiedToGate(symbol);
         const market = this.markets.get(gateSymbol);
-        
-        if (!market) return null;
+        if (!market) {
+            return null;
+        }
 
         const quantoMultiplier = Number(market.quanto_multiplier);
-        
-        // Gate precision in API response: order_price_round (e.g. "0.1")
-        const priceStep = Number(market.order_price_round);
-        
-        // Gate order size step is in contracts. Convert it back to base currency.
-        const sizeStepContracts = Number(market.order_size_round || '1');
-        const stepSizeBase = sizeStepContracts * quantoMultiplier;
+        if (!Number.isFinite(quantoMultiplier) || quantoMultiplier <= 0) {
+            return null;
+        }
 
-        const minQtyContracts = Number(market.order_size_min || '1');
+        const priceStep = Number(market.order_price_round || 0);
+        const sizeStepContracts = Number(market.order_size_round || 1);
+        const stepSizeBase = sizeStepContracts * quantoMultiplier;
+        const minQtyContracts = Number(market.order_size_min || 1);
         const minQtyBase = minQtyContracts * quantoMultiplier;
+
+        if (!Number.isFinite(stepSizeBase) || stepSizeBase <= 0 || !Number.isFinite(minQtyBase) || minQtyBase <= 0) {
+            return null;
+        }
 
         return {
             symbol,
             minQty: minQtyBase,
             stepSize: stepSizeBase,
-            minNotional: 0, // Gate calculates notional requirements mostly on size_min anyway
-            pricePrecision: Math.max(0, Math.round(-Math.log10(priceStep))),
+            minNotional: 0,
+            pricePrecision: priceStep > 0 ? Math.max(0, Math.round(-Math.log10(priceStep))) : 8,
             quantityPrecision: Math.max(0, Math.round(-Math.log10(stepSizeBase))),
         };
     }
@@ -322,10 +288,370 @@ export class GateClient implements IExchangeClient {
     getUsdtSymbols(): string[] {
         const symbols: string[] = [];
         for (const contract of this.markets.values()) {
-            if (contract.type === 'direct' && contract.name.endsWith('_USDT')) {
-                symbols.push(gateToCcxt(contract.name));
-            }
+            symbols.push(gateToUnified(contract.name));
         }
         return symbols;
     }
+
+    private sign(method: string, endpoint: string, query: string, payload: string): Record<string, string> {
+        const timestamp = Math.floor(Date.now() / 1000).toString();
+        const hashedPayload = crypto.createHash('sha512').update(payload).digest('hex');
+        const signatureString = [method, endpoint, query, hashedPayload, timestamp].join('\n');
+        const signature = crypto.createHmac('sha512', this.secret).update(signatureString).digest('hex');
+
+        return {
+            KEY: this.apiKey,
+            Timestamp: timestamp,
+            SIGN: signature,
+        };
+    }
+
+    private async request<T = unknown>(
+        method: HttpMethod,
+        endpoint: string,
+        query: Record<string, unknown> = {},
+        data: unknown = null,
+        signed = true,
+    ): Promise<T> {
+        const queryString = this.buildQueryString(query);
+        const payload = data === null || data === undefined ? '' : JSON.stringify(data);
+        const headers: Record<string, string> = {
+            Accept: 'application/json',
+            'Content-Type': 'application/json',
+        };
+
+        if (signed) {
+            if (!this.apiKey || !this.secret) {
+                throw new Error('Gate API credentials are required for private futures requests');
+            }
+            Object.assign(headers, this.sign(method, `/api/v4${endpoint}`, queryString, payload));
+        }
+
+        const url = queryString ? `${endpoint}?${queryString}` : endpoint;
+
+        try {
+            const response = await this.httpClient.request({
+                method,
+                url,
+                data: payload || undefined,
+                headers,
+            });
+            return response.data as T;
+        } catch (error: any) {
+            throw this.normalizeRequestError(error);
+        }
+    }
+
+    private async waitForOrderResult(
+        gateSymbol: string,
+        orderId: string | undefined,
+        clientText: string,
+        requestedAmount: number,
+        multiplier: number,
+        initialOrder?: GateOrder,
+    ): Promise<OrderResult> {
+        let lastOrder: GateOrder | null = initialOrder ?? null;
+        let lastError: unknown = null;
+
+        for (let attempt = 0; attempt < ORDER_POLL_ATTEMPTS; attempt++) {
+            if (attempt > 0) {
+                await this.sleep(ORDER_POLL_DELAY_MS);
+            }
+
+            try {
+                const order = orderId
+                    ? await this.fetchOrder(orderId)
+                    : await this.findOrderByText(gateSymbol, clientText);
+                if (order) {
+                    lastOrder = order;
+                    if (this.isFinalOrder(order)) {
+                        return this.buildOrderResult(gateSymbol, order, requestedAmount, multiplier);
+                    }
+                }
+            } catch (error: any) {
+                lastError = error;
+                logger.warn(TAG, `Gate order status query failed for ${orderId || clientText}: ${this.formatError(error)}`);
+            }
+        }
+
+        if (lastOrder) {
+            return this.buildOrderResult(gateSymbol, lastOrder, requestedAmount, multiplier);
+        }
+
+        if (lastError) {
+            throw new Error(`Gate order ${orderId || clientText} status could not be confirmed: ${this.formatError(lastError)}`);
+        }
+
+        throw new Error(`Gate order ${orderId || clientText} was not found after submission`);
+    }
+
+    private async reconcileSubmittedOrder(
+        gateSymbol: string,
+        clientText: string,
+        requestedAmount: number,
+        multiplier: number,
+    ): Promise<OrderResult | null> {
+        for (let attempt = 0; attempt < ORDER_POLL_ATTEMPTS; attempt++) {
+            await this.sleep(ORDER_POLL_DELAY_MS);
+            try {
+                const order = await this.findOrderByText(gateSymbol, clientText);
+                if (order) {
+                    return this.waitForOrderResult(
+                        gateSymbol,
+                        order.id ? String(order.id) : undefined,
+                        clientText,
+                        requestedAmount,
+                        multiplier,
+                        order,
+                    );
+                }
+            } catch (error: any) {
+                logger.warn(TAG, `Gate order reconciliation failed for ${clientText}: ${this.formatError(error)}`);
+            }
+        }
+
+        return null;
+    }
+
+    private async fetchOrder(orderId: string): Promise<GateOrder | null> {
+        try {
+            return await this.request<GateOrder>('GET', `/futures/${SETTLE}/orders/${orderId}`);
+        } catch (error: any) {
+            if (this.formatError(error).toLowerCase().includes('order_not_found')) {
+                return null;
+            }
+            throw error;
+        }
+    }
+
+    private async findOrderByText(gateSymbol: string, clientText: string): Promise<GateOrder | null> {
+        for (const status of ['open', 'finished']) {
+            const orders = await this.request<GateOrder[]>('GET', `/futures/${SETTLE}/orders`, {
+                contract: gateSymbol,
+                status,
+                limit: 100,
+            });
+
+            const matched = orders.find(order => order.text === clientText);
+            if (matched) {
+                return matched;
+            }
+        }
+
+        return null;
+    }
+
+    private async buildOrderResult(
+        gateSymbol: string,
+        order: GateOrder,
+        requestedAmount: number,
+        multiplier: number,
+    ): Promise<OrderResult> {
+        const trades = order.id ? await this.fetchOrderTrades(gateSymbol, String(order.id), multiplier) : [];
+        const tradeStats = this.summarizeTrades(trades, multiplier);
+
+        const orderSize = Math.abs(Number(order.size || 0));
+        const orderLeft = Math.abs(Number(order.left || 0));
+        const filledContracts = Math.max(0, orderSize - orderLeft);
+        const orderFilledQty = filledContracts * multiplier;
+        const filledQty = tradeStats.filledQty > 0 ? tradeStats.filledQty : orderFilledQty;
+        const avgPrice = Number(order.fill_price || 0) || tradeStats.avgPrice;
+
+        return {
+            orderId: String(order.id || order.text || ''),
+            avgPrice,
+            filledQty,
+            commission: tradeStats.commission,
+            commissionAsset: 'USDT',
+            status: this.normalizeOrderStatus(order, filledQty, requestedAmount),
+            raw: { order, trades },
+        };
+    }
+
+    private async fetchOrderTrades(gateSymbol: string, orderId: string, multiplier: number): Promise<GateTrade[]> {
+        let lastError: unknown = null;
+
+        for (let attempt = 0; attempt < TRADE_POLL_ATTEMPTS; attempt++) {
+            if (attempt > 0) {
+                await this.sleep(TRADE_POLL_DELAY_MS);
+            }
+
+            try {
+                const trades = await this.request<GateTrade[]>('GET', `/futures/${SETTLE}/my_trades`, {
+                    contract: gateSymbol,
+                    order: orderId,
+                });
+
+                if (Array.isArray(trades)) {
+                    return trades;
+                }
+            } catch (error: any) {
+                lastError = error;
+            }
+        }
+
+        if (lastError) {
+            logger.warn(TAG, `Failed to extract Gate trades for order ${orderId}, fee left 0: ${this.formatError(lastError)}`);
+        }
+
+        return [];
+    }
+
+    private summarizeTrades(trades: GateTrade[], multiplier: number): {
+        filledQty: number;
+        avgPrice: number;
+        commission: number;
+    } {
+        let filledQty = 0;
+        let notional = 0;
+        let commission = 0;
+
+        for (const trade of trades) {
+            const baseQty = Math.abs(Number(trade.size || 0)) * multiplier;
+            const price = Number(trade.price || 0);
+            filledQty += baseQty;
+            notional += baseQty * price;
+            commission += Math.abs(Number(trade.fee || 0));
+        }
+
+        return {
+            filledQty,
+            avgPrice: filledQty > 0 ? notional / filledQty : 0,
+            commission,
+        };
+    }
+
+    private assertFilledMarketOrder(result: OrderResult, orderRef: string, requestedAmount: number): void {
+        const isFullFill = result.filledQty >= requestedAmount * (1 - 1e-8);
+        if (result.filledQty <= 0 || result.avgPrice <= 0 || result.status !== 'closed' || !isFullFill) {
+            throw new Error(
+                `Gate market order ${orderRef} did not fully fill: status=${result.status}, filled=${result.filledQty}, requested=${requestedAmount}, avgPrice=${result.avgPrice}`,
+            );
+        }
+    }
+
+    private normalizeOrderStatus(order: GateOrder, filledQty: number, requestedAmount: number): string {
+        const isFullFill = filledQty >= requestedAmount * (1 - 1e-8);
+        if (isFullFill && (order.status === 'finished' || order.finish_as === 'filled')) {
+            return 'closed';
+        }
+
+        if (order.finish_as === 'cancelled' || order.finish_as === 'ioc') {
+            return 'canceled';
+        }
+
+        return order.status?.toLowerCase() || 'unknown';
+    }
+
+    private isFinalOrder(order: GateOrder): boolean {
+        return order.status !== undefined && order.status !== 'open';
+    }
+
+    private assertIsolatedLeverage(symbol: string, expected: number, position: GatePosition): void {
+        const actual = Number(position.lever ?? position.leverage);
+        if (!Number.isFinite(actual)) {
+            throw new Error(`Gate leverage response for ${symbol} does not include confirmed leverage`);
+        }
+
+        if (Math.abs(actual - expected) > 1e-9) {
+            throw new Error(`Gate leverage confirmation mismatch for ${symbol}: expected ${expected}, got ${actual}`);
+        }
+
+        if (position.pos_margin_mode && position.pos_margin_mode.toLowerCase() !== 'isolated') {
+            throw new Error(`Gate margin mode confirmation mismatch for ${symbol}: ${position.pos_margin_mode}`);
+        }
+    }
+
+    private getMultiplierOrThrow(gateSymbol: string, symbol: string): number {
+        const market = this.markets.get(gateSymbol);
+        const multiplier = Number(market?.quanto_multiplier);
+        if (!Number.isFinite(multiplier) || multiplier <= 0) {
+            throw new Error(`Gate quanto_multiplier is missing for ${symbol}`);
+        }
+        return multiplier;
+    }
+
+    private baseAmountToContracts(gateSymbol: string, amount: number, multiplier: number): number {
+        const market = this.markets.get(gateSymbol);
+        const step = Number(market?.order_size_round || 1);
+        const rawContracts = amount / multiplier;
+        const roundedContracts = Math.floor((rawContracts / step) + 1e-8) * step;
+        const normalized = Number(this.formatDecimal(roundedContracts, 16));
+
+        if (!Number.isFinite(normalized) || normalized <= 0) {
+            throw new Error(`Gate order size for ${gateSymbol} is below one valid contract step: amount=${amount}, multiplier=${multiplier}, step=${step}`);
+        }
+
+        return normalized;
+    }
+
+    private createOrderText(clientOrderId?: string): string {
+        if (clientOrderId) {
+            const raw = clientOrderId.startsWith('t-') ? clientOrderId.slice(2) : clientOrderId;
+            const sanitized = raw.replace(/[^0-9A-Za-z_.-]/g, '');
+            if (sanitized && Buffer.byteLength(sanitized, 'utf8') <= 16) {
+                return `t-${sanitized}`;
+            }
+
+            return `t-${crypto.createHash('sha256').update(clientOrderId).digest('hex').slice(0, 16)}`;
+        }
+
+        const randomPart = `${Date.now().toString(36)}${crypto.randomBytes(3).toString('hex')}`.slice(0, 16);
+        return `t-${randomPart}`;
+    }
+
+    private isTradeableUsdtContract(contract: GateContract): boolean {
+        const multiplier = Number(contract.quanto_multiplier);
+        return contract.type === 'direct'
+            && contract.name.endsWith('_USDT')
+            && Number.isFinite(multiplier)
+            && multiplier > 0;
+    }
+
+    private buildQueryString(query: Record<string, unknown>): string {
+        return Object.keys(query)
+            .filter(key => query[key] !== undefined && query[key] !== null)
+            .sort()
+            .map(key => `${encodeURIComponent(key)}=${encodeURIComponent(String(query[key]))}`)
+            .join('&');
+    }
+
+    private normalizeRequestError(error: any): Error {
+        if (error.response?.data) {
+            const status = error.response.status ? ` ${error.response.status}` : '';
+            return new Error(`Gate API Error${status}: ${JSON.stringify(error.response.data)}`);
+        }
+
+        if (error instanceof Error) {
+            return error;
+        }
+
+        return new Error(String(error));
+    }
+
+    private formatError(error: unknown): string {
+        return error instanceof Error ? error.message : String(error);
+    }
+
+    private formatDecimal(value: number, precision = 12): string {
+        return Number(value).toFixed(precision).replace(/\.?0+$/, '');
+    }
+
+    private sleep(ms: number): Promise<void> {
+        return new Promise(resolve => setTimeout(resolve, ms));
+    }
+}
+
+function parseNullableNumber(value: unknown): number | null {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : null;
+}
+
+function parseNullableTimestamp(value: unknown): number | null {
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed) || parsed <= 0) {
+        return null;
+    }
+
+    return parsed < 10_000_000_000 ? parsed * 1000 : parsed;
 }

@@ -19,7 +19,7 @@
 - фильтрует самые ликвидные пары;
 - проверяет market constraints;
 - выставляет isolated margin и leverage;
-- создает общие WebSocket clients;
+- создает общие orderbook providers;
 - делит пары на chunks;
 - запускает несколько `Trader` instances;
 - открывает и закрывает реальные сделки;
@@ -42,8 +42,8 @@
 - Node.js / ESM-style imports compiled by TypeScript.
 - TypeScript 6.0.x.
 - `tsx` for direct TypeScript runtime in `pnpm start`.
-- `ccxt` for exchange integrations.
-- `axios` for direct REST and Django API calls.
+- `fastify` for HTTP control plane.
+- `axios` for native Binance/Bybit/MEXC/Gate REST, orderbook snapshot bootstrap and Django API calls.
 - `dotenv` for `.env`.
 - `ws` dependency.
 - `pnpm` package manager.
@@ -56,7 +56,11 @@
   "description": "Real arbitrage trading bot for Binance/Bybit Futures",
   "scripts": {
     "start": "tsx src/main.ts",
-    "build": "tsc"
+    "build": "tsc",
+    "test": "tsx --test tests/*.test.ts"
+  },
+  "dependencies": {
+    "fastify": "^4.26.2"
   }
 }
 ```
@@ -91,22 +95,47 @@ arbitration-trader/
     ├── main.ts
     ├── config.ts
     ├── classes/
+    │   ├── TradeCounter.ts
+    │   ├── trade-state.ts
     │   ├── RuntimeManager.ts
     │   └── Trader.ts
+    ├── control-plane/
+    │   ├── server.ts
+    │   └── shutdown.ts
     ├── exchanges/
     │   ├── exchange-client.ts
+    │   ├── symbols.ts
     │   ├── binance-client.ts
     │   ├── bybit-client.ts
     │   ├── mexc-client.ts
-    │   └── gate-client.ts
+    │   ├── gate-client.ts
+    │   └── ws/
+    │       ├── orderbook-store.ts
+    │       ├── binance-orderbook-provider.ts
+    │       ├── bybit-orderbook-provider.ts
+    │       ├── gate-orderbook-provider.ts
+    │       ├── mexc-orderbook-provider.ts
+    │       └── orderbook-provider-factory.ts
     ├── services/
     │   ├── api.ts
-    │   └── market-info.ts
+    │   ├── close-sync-service.ts
+    │   ├── diagnostics.ts
+    │   ├── market-info.ts
+    │   ├── position-recovery.ts
+    │   ├── runtime-payload-validation.ts
+    │   ├── shadow-recorder.ts
+    │   └── signal-engine.ts
     ├── types/
     │   └── index.ts
     └── utils/
         ├── logger.ts
         └── math.ts
+└── tests/
+    ├── math.test.ts
+    ├── orderbook-store.test.ts
+    ├── runtime-payload-validation.test.ts
+    ├── signal-engine.test.ts
+    └── trade-counter.test.ts
 ```
 
 Сгенерированные/локальные директории после проверки:
@@ -125,7 +154,7 @@ Django
   |
   | POST /engine/trader/{start|sync|stop}
   v
-main.ts control plane
+Fastify control plane
   |
   v
 RuntimeManager
@@ -135,8 +164,9 @@ RuntimeManager
   +--> market discovery/filtering
   +--> MarketInfoService
   +--> leverage/margin setup
-  +--> shared ccxt.pro WebSocket clients
+  +--> shared orderbook providers
   +--> TradeCounter
+  +--> SignalEngine / CloseSyncService / PositionRecovery helpers
   +--> Trader chunks
               |
               +--> watch orderbooks
@@ -149,8 +179,9 @@ RuntimeManager
 Ключевые особенности:
 
 - Один процесс управляет всеми symbols.
-- Primary/secondary exchanges выбираются глобально через `.env`.
-- Все chunks используют одни и те же REST clients и WebSocket clients.
+- Primary/secondary exchanges выбираются через runtime payload от Django.
+- Все chunks используют одни и те же REST clients и orderbook providers.
+- `main.ts` только связывает `RuntimeManager`, Fastify control plane и process shutdown handlers.
 - `TradeCounter` общий для всех chunks и ограничивает число одновременных открытых сделок.
 - Django используется как persistence layer для real trades, но не управляет lifecycle этого trader-процесса.
 
@@ -164,53 +195,51 @@ RuntimeManager
 dotenv.config();
 ```
 
-Обязательные переменные:
+Обязательная переменная окружения:
 
-- `BINANCE_API_KEY`
-- `BINANCE_SECRET`
-- `BYBIT_API_KEY`
-- `BYBIT_SECRET`
+- `SERVICE_SHARED_TOKEN`
 
-Они читаются через `requireEnv()`, поэтому процесс упадет на старте, если их нет.
+Из `.env` также читаются инфраструктурные переменные:
 
-Опциональные credentials:
+- `DJANGO_API_URL`
+- `PORT`
+- `SHADOW_SIGNAL_LOG_PATH`
 
-- `GATE_API_KEY`
-- `GATE_SECRET`
-- `MEXC_API_KEY`
-- `MEXC_SECRET`
-
-Если они не заданы, используются пустые строки.
+Биржевые ключи и торговые параметры приходят в runtime payload от Django. `runtime-payload-validation.ts` проверяет payload до `setActiveRuntime(payload)`: id, owner, допустимые exchange names, положительные числовые лимиты, `primary_exchange != secondary_exchange` и наличие ключей для выбранных бирж.
 
 ### 5.1. Таблица переменных
 
 | Переменная | Default | Назначение |
 |---|---:|---|
 | `DJANGO_API_URL` | `http://127.0.0.1:8000/api` | Base URL Django API. |
-| `BINANCE_API_KEY` | required | Binance Futures key. |
-| `BINANCE_SECRET` | required | Binance Futures secret. |
-| `BYBIT_API_KEY` | required | Bybit key. |
-| `BYBIT_SECRET` | required | Bybit secret. |
-| `GATE_API_KEY` | empty | Gate key. |
-| `GATE_SECRET` | empty | Gate secret. |
-| `MEXC_API_KEY` | empty | MEXC key. |
-| `MEXC_SECRET` | empty | MEXC secret. |
-| `PRIMARY_EXCHANGE` | `binance` | Primary route exchange. |
-| `SECONDARY_EXCHANGE` | `bybit` | Secondary route exchange. |
-| `USE_TESTNET` | `false` | Testnet/sandbox mode where supported. |
-| `TRADE_AMOUNT_USDT` | `50` | Position notional before leverage. |
-| `LEVERAGE` | `10` | Leverage on both exchanges. |
-| `MAX_CONCURRENT_TRADES` | `3` | Global concurrent open trade limit. |
-| `TOP_LIQUID_PAIRS_COUNT` | `100` | Max number of liquid pairs to scan. |
-| `MAX_TRADE_DURATION_MINUTES` | `60` | Timeout before force close. |
-| `MAX_LEG_DRAWDOWN_PERCENT` | `80` | Per-leg leveraged drawdown limit. |
-| `OPEN_THRESHOLD` | `2.0` | Spread expansion over EMA baseline to open. |
-| `CLOSE_THRESHOLD` | `1.5` | True PnL threshold to close. |
-| `ORDERBOOK_LIMIT` | `50` | Orderbook depth subscription limit. |
-| `CHUNK_SIZE` | `10` | Symbols per `Trader` instance. |
-| `LOG_LEVEL` | `INFO` | Logger minimum level. |
+| `SERVICE_SHARED_TOKEN` | required | Shared token for Django -> trader control plane and Django trade API calls. |
+| `PORT` | `3002` | HTTP control plane port. |
+| `SHADOW_SIGNAL_LOG_PATH` | `logs/shadow-signals.jsonl` | JSONL file for shadow-mode entry signals. |
 
-Supported route names in `main.ts`:
+Runtime payload fields in `config`:
+
+| Field | Назначение |
+|---|---|
+| `primary_exchange`, `secondary_exchange` | Exchange route. |
+| `use_testnet` | Testnet/sandbox mode where supported. |
+| `trade_amount_usdt` | Position notional before leverage. |
+| `leverage` | Leverage on both exchanges. |
+| `max_concurrent_trades` | Global concurrent open trade limit. |
+| `top_liquid_pairs_count` | Max number of liquid pairs to scan. |
+| `max_trade_duration_minutes` | Timeout before force close. |
+| `max_leg_drawdown_percent` | Per-leg leveraged drawdown limit. |
+| `open_threshold` | Spread expansion over EMA baseline to open. |
+| `close_threshold` | True PnL threshold to close. |
+| `orderbook_limit` | Orderbook depth subscription limit. |
+| `chunk_size` | Symbols per `Trader` instance. |
+| `min_open_net_edge_percent` | Minimum hard economic entry edge after buffers. Default `0`. |
+| `entry_fee_buffer_percent` | Entry/exit fee buffer for entry signal. Default `0.20`. |
+| `entry_slippage_buffer_percent` | Slippage buffer for entry signal. Default `0.05`. |
+| `funding_buffer_percent` | Extra funding risk buffer. Default `0`. |
+| `latency_buffer_percent` | Latency/staleness buffer. Default `0.02`. |
+| `shadow_mode` | If `true`, entry signals are recorded without placing orders. Default `false`. |
+
+Supported route names:
 
 - `binance`
 - `bybit`
@@ -219,17 +248,40 @@ Supported route names in `main.ts`:
 
 Important:
 
-- `PRIMARY_EXCHANGE` and `SECONDARY_EXCHANGE` must be different.
-- Even if you select `gate` or `mexc`, current `config.ts` still requires Binance and Bybit credentials because they are mandatory via `requireEnv()`.
-- `DEPLOY_LINUX.md` currently shows `BINANCE_SECRET_KEY` / `BYBIT_SECRET_KEY`, but actual code expects `BINANCE_SECRET` / `BYBIT_SECRET`. Use the variable names from `.env.example` and `config.ts`.
+- `primary_exchange` and `secondary_exchange` must be different.
+- Credentials are required only for exchanges selected in the runtime payload.
+- Binance/Bybit/Gate/MEXC credentials are not stored in `.env`.
 
 ## 6. Entry Point: `main.ts`
 
-`main.ts` contains the full process bootstrap.
+`main.ts` contains only process wiring:
 
-### 6.1. Startup banner
+- create `RuntimeManager`;
+- register process shutdown handlers from `control-plane/shutdown.ts`;
+- create and start Fastify control plane from `control-plane/server.ts`.
 
-Logs:
+HTTP routing, token checks, payload parsing and error mapping live in `src/control-plane/server.ts`. Runtime command payload validation lives in `src/services/runtime-payload-validation.ts`.
+
+### 6.1. Control plane
+
+Fastify routes:
+
+- `GET /health`
+- `POST /engine/trader/start`
+- `POST /engine/trader/sync`
+- `POST /engine/trader/stop`
+- `POST /engine/trader/runtime/exchange-health`
+- `GET /engine/trader/runtime/active-coins`
+- `GET /engine/trader/runtime/open-trades-pnl`
+- `GET /engine/trader/runtime/system-load`
+
+All routes except `/health` require `X-Service-Token`.
+
+Invalid runtime payloads return HTTP 400. Runtime errors return HTTP 500.
+
+### 6.2. Startup banner
+
+`RuntimeManager.startRuntime()` logs:
 
 - real trading mode;
 - testnet status;
@@ -239,7 +291,7 @@ Logs:
 - max trade duration;
 - open/close thresholds.
 
-### 6.2. REST exchange clients
+### 6.3. REST exchange clients
 
 `createClient(name)` returns:
 
@@ -250,7 +302,7 @@ Logs:
 | `mexc` | `MexcClient` |
 | `gate` | `GateClient` |
 
-If unknown exchange name is configured, process logs error and exits.
+Unknown exchange names are rejected during runtime payload validation and by `RuntimeManager.createClient()`.
 
 REST clients are used for:
 
@@ -260,7 +312,7 @@ REST clients are used for:
 - leverage/margin setup;
 - real market orders.
 
-### 6.3. Latency measurement
+### 6.4. Latency measurement
 
 Flow:
 
@@ -270,7 +322,7 @@ Flow:
 
 This is informational only. It does not affect trading decisions.
 
-### 6.4. Market loading
+### 6.5. Market loading
 
 Calls:
 
@@ -286,7 +338,7 @@ Market metadata is later used by:
 - `Trader` amount validation;
 - exchange-specific order conversion.
 
-### 6.5. Common symbol discovery
+### 6.6. Common symbol discovery
 
 The trader:
 
@@ -294,18 +346,18 @@ The trader:
 2. Gets secondary USDT symbols.
 3. Keeps only intersection.
 
-Symbols are in ccxt futures format:
+Symbols use the internal unified futures format:
 
 ```text
 BTC/USDT:USDT
 ```
 
-### 6.6. Liquidity filtering
+### 6.7. Liquidity filtering
 
-The trader fetches primary exchange tickers and filters:
+The trader fetches tickers from both selected exchanges and filters:
 
-- require 24h quote volume >= `2_000_000`;
-- sort by quote volume descending;
+- require `min(primaryVolume, secondaryVolume) >= 2_000_000`;
+- sort by cross-exchange minimum quote volume descending;
 - keep first `TOP_LIQUID_PAIRS_COUNT`.
 
 Reason:
@@ -313,9 +365,9 @@ Reason:
 - illiquid symbols can show fake/unexecutable spreads;
 - lower depth increases slippage and partial-fill risk.
 
-If ticker fetch fails, bot proceeds with all common symbols.
+If ticker fetch fails and there are no open Django trades to restore, runtime startup fails closed. If open trades exist, the runtime starts only for recovery symbols and blocks new entries for those symbols after they are closed.
 
-### 6.7. Market info validation
+### 6.8. Market info validation
 
 Creates `MarketInfoService` and calls:
 
@@ -327,18 +379,26 @@ This:
 
 - fetches prices;
 - detects ticker homonyms;
+- stores funding rate / next funding snapshots when exchange tickers provide them;
 - merges min quantities and step sizes;
-- computes trade amount from `TRADE_AMOUNT_USDT`;
+- computes trade amount from `trade_amount_usdt`;
 - excludes symbols that cannot meet minimums.
 
 If no symbols remain, process exits.
 
-### 6.8. Leverage and isolated margin setup
+### 6.9. Leverage and isolated margin setup
 
 For each tradeable symbol:
 
 - set isolated margin on primary and secondary;
 - set leverage on primary and secondary.
+
+Before symbol setup, runtime validates account mode through each selected REST client:
+
+- Binance rejects hedge mode through `positionSide/dual`;
+- Bybit rejects detected hedge positions where `positionIdx != 0`;
+- Gate validates private API availability;
+- MEXC validates that the reported position mode is recognized by the native client.
 
 The setup is batched:
 
@@ -354,26 +414,39 @@ If no symbols remain after setup, process exits.
 Additional guarantees:
 
 - startup aborts if open-trade recovery from Django fails;
+- startup aborts if any open Django trade cannot be included in the runtime universe;
 - Gate/MEXC setup warnings are not treated as successful setup;
 - a symbol is allowed into scanning only after both exchanges confirmed the requested margin/leverage state.
+- confirmed leverage/margin setup is cached in-process by account fingerprint, exchange route, symbol and leverage, so repeated syncs skip already confirmed symbols.
 
-### 6.9. WebSocket clients
+### 6.10. Orderbook providers
 
-`createWsClient(name)` returns ccxt.pro exchange instance:
+`createOrderBookProvider(name)` returns an `OrderBookProvider`:
 
-- `pro.binanceusdm`
-- `pro.bybit({ defaultType: 'swap' })`
-- `pro.mexc({ defaultType: 'swap' })`
-- `pro.gate({ defaultType: 'swap' })`
+| Config name | Provider |
+|---|---|
+| `binance` | Native Binance USD-M Futures depth stream provider. |
+| `bybit` | Native Bybit V5 public linear orderbook provider. |
+| `mexc` | Native MEXC Contract `push.depth` provider. |
+| `gate` | Native Gate USDT Futures `futures.order_book_update` provider. |
 
-These are shared by all `Trader` chunks.
+Providers are shared by all `Trader` chunks and expose only normalized orderbook snapshots through:
+
+```ts
+getOrderBook(symbol): OrderBookSnapshot | null
+onUpdate(listener): () => void
+```
 
 Important:
 
-- WS clients are created without API credentials.
+- Providers are created without API credentials.
 - They are used for public orderbook streaming.
+- Binance native provider blocks trading for a symbol while the local book is unsynced.
+- Bybit native provider uses V5 `orderbook.{depth}.{symbol}` snapshots/deltas, heartbeat ping every 20 seconds, reconnect/resubscribe, and stale-book blocking.
+- Gate native provider subscribes to `futures.order_book_update`, fetches REST snapshots with `with_id=true`, validates `U`/`u` continuity, converts contract sizes to base coin amounts through `quanto_multiplier`, sends `X-Gate-Size-Decimal: 1`, and blocks trading while the book is unsynced or stale.
+- MEXC native provider subscribes to `sub.depth` with `compress: false`, fetches REST depth snapshots, validates contiguous `version` increments, converts contract volumes to base coin amounts through `contractSize`, and blocks trading while the book is unsynced or stale.
 
-### 6.10. TradeCounter
+### 6.11. TradeCounter
 
 Creates one shared:
 
@@ -381,9 +454,9 @@ Creates one shared:
 const tradeCounter = new TradeCounter();
 ```
 
-It enforces `MAX_CONCURRENT_TRADES` across all chunks.
+It enforces `max_concurrent_trades` across all chunks.
 
-### 6.11. Chunking
+### 6.12. Chunking
 
 Final tradeable symbols are split into chunks of `CHUNK_SIZE`.
 
@@ -402,21 +475,23 @@ new Trader(
 )
 ```
 
-### 6.12. Recovery from Django
+### 6.13. Recovery from Django
 
-Before starting traders:
+Before liquidity filtering finishes, runtime loads open trades:
 
 ```ts
-const openTrades = await api.getOpenTrades();
+const openTrades = await api.getOpenTrades(config.runtimeConfigId);
 ```
+
+Open trade symbols are added to the runtime universe even if they are not part of the current liquid scanning set. If a recovery symbol is not scannable, its `PairState.canOpenNewTrades` is `false`, so the runtime can monitor/close the restored exposure without opening a new trade on that symbol.
 
 Then each open trade is assigned to the `Trader` whose `symbols` include `trade.coin`.
 
-If no matching trader chunk exists, trade is ignored with warning.
+If no matching trader chunk exists, runtime startup fails. Open trades are not ignored.
 
 If `getOpenTrades()` fails, runtime startup is aborted. The trader does not continue with an empty in-memory state while exchange exposure may still exist.
 
-### 6.13. Shutdown
+### 6.14. Shutdown
 
 Handlers:
 
@@ -434,9 +509,11 @@ Graceful shutdown:
 
 `stop(true)` means active positions should be closed before exit.
 
+`unhandledRejection` is treated as fatal: the process starts controlled shutdown and exits with non-zero status so a supervisor can restart it.
+
 ## 7. `TradeCounter`
 
-Файл: `src/classes/Trader.ts`.
+Файл: `src/classes/TradeCounter.ts`.
 
 `TradeCounter` is shared across all `Trader` instances.
 
@@ -467,18 +544,19 @@ Important:
 
 Файл: `src/classes/Trader.ts`.
 
-`Trader` owns a subset of symbols. It does not own exchange clients; they are shared and injected from `main.ts`.
+`Trader` owns a subset of symbols. It does not own exchange clients; they are shared and injected from `RuntimeManager`.
 
 Constructor dependencies:
 
 - trader id;
 - symbols chunk;
-- primary WebSocket exchange;
-- secondary WebSocket exchange;
+- primary `OrderBookProvider`;
+- secondary `OrderBookProvider`;
 - primary REST client;
 - secondary REST client;
 - `MarketInfoService`;
-- shared `TradeCounter`.
+- shared `TradeCounter`;
+- `entryDisabledSymbols` for recovery-only symbols.
 
 ### 8.1. PairState
 
@@ -492,6 +570,8 @@ Each symbol has:
 | `openedAtMs` | Open timestamp for timeout checks. |
 | `busy` | Mutex preventing duplicate open/close. |
 | `cooldownUntil` | Re-entry block after failure. |
+| `pendingCloseSync` | Exchange close payload that still must be persisted to Django. |
+| `canOpenNewTrades` | Blocks new entries for recovery-only symbols. |
 
 Constants:
 
@@ -520,11 +600,11 @@ Risk:
 Starts:
 
 - timeout watchdog interval;
-- two watch loops per symbol:
-  - primary orderbook;
-  - secondary orderbook.
+- update listeners on primary and secondary `OrderBookProvider`.
 
-`start()` awaits `Promise.all(loops)`, so normally it never resolves until stopped.
+`start()` schedules one spread check per symbol when provider updates arrive. Per-symbol scheduling prevents overlapping spread checks for the same symbol.
+
+`start()` normally never resolves until `stop()` is called.
 
 ### 8.4. `stop(closePositions=false)`
 
@@ -532,36 +612,36 @@ Behavior:
 
 - `isRunning=false`;
 - clear timeout timer;
+- unsubscribe provider update listeners;
 - if `closePositions=true`, call `closeAllPositions('shutdown')`;
 - log stopped.
 
 Used by graceful shutdown.
 
-### 8.5. `watchLoop(exchange, symbol, exName)`
+### 8.5. `scheduleCheck(symbol)`
 
-Loop:
+Provider callbacks call `scheduleCheck(symbol)`.
 
-1. `exchange.watchOrderBook(symbol, config.orderbookLimit)`.
-2. Reset consecutive errors.
-3. `checkSpreads(symbol)`.
-4. On error:
-   - increment error count;
-   - log;
-   - wait `min(2000 * consecutiveErrors, 30000)`.
+Behavior:
 
-Each symbol has two loops, so `checkSpreads` can be called from primary and secondary updates. `state.busy` prevents duplicate opens/closes.
+- skip when trader is stopped;
+- skip when a spread check is already scheduled;
+- skip when a spread check is already running for the symbol;
+- run `checkSpreads(symbol)` in a microtask;
+- log spread-check errors without crashing the provider callback.
 
 ### 8.6. `getPrices(symbol, targetCoinsFallback?, isEmergency=false)`
 
 Reads:
 
-- `primaryWs.orderbooks[symbol]`;
-- `secondaryWs.orderbooks[symbol]`.
+- `primaryBooks.getOrderBook(symbol)`;
+- `secondaryBooks.getOrderBook(symbol)`.
 
 Requires:
 
 - primary bids/asks;
 - secondary bids/asks.
+- provider snapshot must be synced.
 
 Determines target size:
 
@@ -595,30 +675,35 @@ High-level:
 Idle flow:
 
 1. Read current primary best bid.
-2. Convert `TRADE_AMOUNT_USDT` into base coin amount.
+2. Convert `trade_amount_usdt` into base coin amount.
 3. Round down to unified step size.
 4. Reject if below min quantity or min notional.
 5. Get strict VWAP prices.
-6. Calculate buy and sell open spreads.
-7. Update EMA baselines:
+6. Pass prices, market info and baselines to `SignalEngine`.
+7. `SignalEngine` calculates buy/sell spreads and updates EMA baselines:
 
 ```text
 baseline = baseline * (1 - 0.002) + currentSpread * 0.002
 ```
 
-8. Check `TradeCounter.canOpen()`.
-9. Check cooldown.
-10. Open buy if:
+8. `SignalEngine` applies relative threshold:
 
 ```text
-currentBuySpread >= baselineBuy + OPEN_THRESHOLD
+currentSpread >= baselineSpread + open_threshold
 ```
 
-11. Open sell if:
+9. `SignalEngine` applies hard economic threshold:
 
 ```text
-currentSellSpread >= baselineSell + OPEN_THRESHOLD
+expected_net_edge = spread - entry_fee_buffer - entry_slippage_buffer - projected_funding_cost - funding_buffer - latency_buffer
+expected_net_edge >= min_open_net_edge_percent
 ```
+
+10. Check `TradeCounter.canOpen()`.
+11. Check cooldown.
+12. Open the selected direction if both signal and economic thresholds pass.
+
+Funding cost uses cached funding rates from `MarketInfoService` when next funding time is inside `max_trade_duration_minutes`. Unknown funding rates contribute `0`, while `funding_buffer_percent` remains a static conservative buffer.
 
 Direction semantics:
 
@@ -637,31 +722,32 @@ Direction semantics:
 Flow:
 
 1. Set `state.busy=true`.
-2. Reserve global trade slot.
-3. Determine order sides.
-4. Place both market orders concurrently via `Promise.allSettled`.
-5. If any leg rejects:
+2. If `shadow_mode=true`, write the entry signal into `SHADOW_SIGNAL_LOG_PATH`, set cooldown and return without placing orders.
+3. Reserve global trade slot.
+4. Determine order sides.
+5. Place both market orders concurrently via `Promise.allSettled`.
+6. If any leg rejects:
    - log atomic failure;
    - close any fulfilled leg with reduce-only opposite order;
    - wait 1 second;
-   - run `handleOpenCleanup`;
-   - release trade slot;
+   - run safe cleanup;
+   - release trade slot even if cleanup reports a critical error;
    - set cooldown;
    - return.
-6. Use exchange fill prices or fallback VWAP prices.
-7. Sum commissions.
-8. Recalculate real open spread from fill prices.
-9. Create Django `Trade` via `api.openTrade`.
-10. Store `state.activeTrade`.
-11. Store `openedAtMs`.
-12. Slot remains reserved until close.
-13. On catch:
+7. Use exchange fill prices or fallback VWAP prices.
+8. Sum commissions.
+9. Recalculate real open spread from fill prices.
+10. Create Django `Trade` via `api.openTrade`.
+11. Store `state.activeTrade`.
+12. Store `openedAtMs`.
+13. Slot remains reserved until close.
+14. On catch:
    - log;
-   - cleanup positions;
-   - release slot;
+   - run safe cleanup;
+   - release slot even if cleanup reports a critical error;
    - reset baselines;
    - set cooldown.
-14. Finally clear busy flag.
+15. Finally clear busy flag.
 
 Important:
 
@@ -707,30 +793,32 @@ Flow:
 1. If busy, return.
 2. Set busy.
 3. Determine close sides.
-4. Fetch current positions on both exchanges.
-5. Determine actual sizes.
-6. Close only legs that still have positions.
-7. Use reduce-only market orders.
-8. Fallback to current book/open price if no close order is needed or price is missing.
-9. Calculate:
+4. Fetch current positions on both exchanges through `position-recovery.ts`.
+5. If a leg is missing, wait briefly and recheck before treating it as confirmed flat.
+6. Verify detected position side matches the expected leg side.
+7. Determine actual sizes.
+8. Close only legs that still have positions.
+9. Use reduce-only market orders.
+10. Fallback to current book/open price if no close order is needed or price is missing.
+11. Calculate:
    - close commission;
    - total commission;
    - real PnL;
    - close spread;
    - status.
-10. Update Django with retries:
+12. Update Django through `CloseSyncService` with retries:
    - up to 10 attempts;
    - 5s delay between attempts.
-11. If Django still does not accept the close payload:
+13. If Django still does not accept the close payload:
    - keep `activeTrade` in local state;
    - keep the trade slot reserved;
    - store the exact close payload in pending sync state;
    - retry Django close sync until it succeeds.
-12. Only after successful close persistence:
+14. Only after successful close persistence:
    - clear active trade and opened timestamp;
    - release trade slot;
    - reset or update baselines.
-13. On exchange close error, do not clear local state; next tick will retry.
+15. On exchange close error, do not clear local state; next tick will retry.
 
 Close status:
 
@@ -881,7 +969,7 @@ Flow:
    - set `minNotional = max(primary.minNotional, secondary.minNotional)`;
    - compare prices;
    - skip if deviation > 40%;
-   - compute `TRADE_AMOUNT_USDT / currentPrice`;
+   - compute `trade_amount_usdt / currentPrice`;
    - round down to step size;
    - reject if below min constraints;
    - cache `UnifiedMarketInfo`.
@@ -921,7 +1009,9 @@ Every exchange client implements:
 ```ts
 interface IExchangeClient {
   readonly name: string;
-  readonly ccxtInstance: any;
+  fetchTime(): Promise<number>;
+  fetchTickers(symbols?): Promise<Record<string, ExchangeTicker>>;
+  fetchPositions(symbols): Promise<ExchangePosition[]>;
   loadMarkets(): Promise<void>;
   setLeverage(symbol, leverage): Promise<void>;
   setIsolatedMargin(symbol): Promise<void>;
@@ -946,54 +1036,165 @@ Base URLs:
 
 Symbol conversion:
 
-- ccxt `BTC/USDT:USDT`
+- internal `BTC/USDT:USDT`
 - Binance REST `BTCUSDT`
 
 Key behavior:
 
 - direct HMAC-SHA256 signing;
-- `fetchTime`, `fetchTickers`, `fetchPositions` ccxt-like surface;
+- direct `fetchTime()` via `/fapi/v1/time`;
+- direct `fetchTickers()` via `/fapi/v1/ticker/24hr`;
+- direct `fetchPositions()` via `/fapi/v3/positionRisk`;
 - load perpetual USDT markets from `/fapi/v1/exchangeInfo`;
 - set leverage and margin type;
 - create market orders;
+- support optional `clientOrderId` as Binance `newClientOrderId`;
 - poll order if average price is missing;
 - extract commission from `/fapi/v1/userTrades`;
 - approximate BNB commission as USDT using notional * 0.045%.
+
+### 13.1. Binance native orderbook provider
+
+Файлы:
+
+- `src/exchanges/ws/binance-orderbook-provider.ts`
+- `src/exchanges/ws/orderbook-store.ts`
+
+Base URLs:
+
+- REST snapshot production: `https://fapi.binance.com/fapi/v1/depth`
+- REST snapshot testnet: `https://testnet.binancefuture.com/fapi/v1/depth`
+- WS production: `wss://fstream.binance.com/stream?streams=...`
+- WS testnet: `wss://stream.binancefuture.com/stream?streams=...`
+
+Behavior:
+
+1. Subscribe to `<symbol>@depth@100ms` streams.
+2. Buffer diff-depth events per symbol.
+3. Fetch REST depth snapshot.
+4. Drop buffered events older than snapshot `lastUpdateId`.
+5. Apply the first buffered event that bridges the snapshot sequence.
+6. Apply later events only while Binance `pu` matches the local previous update id.
+7. Mark the symbol unsynced and resync from REST snapshot on a sequence gap.
+8. Return `null` from `getOrderBook(symbol)` while a symbol is unsynced.
+9. Reconnect with exponential backoff and resubscribe all symbols after WS disconnect.
+
+Depth snapshots use the nearest Binance-supported depth limit from `5, 10, 20, 50, 100, 500, 1000` based on `ORDERBOOK_LIMIT`.
 
 ## 14. BybitClient
 
 Файл: `src/exchanges/bybit-client.ts`.
 
-Type: ccxt-based adapter.
+Type: direct signed REST client for Bybit V5 USDT linear perpetuals.
+
+Base URLs:
+
+- testnet: `https://api-testnet.bybit.com`
+- production: `https://api.bybit.com`
+
+Symbol conversion:
+
+- internal `BTC/USDT:USDT`
+- Bybit REST `BTCUSDT`
 
 Key behavior:
 
-- `defaultType: 'swap'`;
-- optional sandbox;
-- load markets through ccxt;
-- set leverage and isolated margin;
-- create market orders;
-- poll `fetchOrder()` up to 5 times for final average/status;
-- normalize fees to approximate USDT.
+- direct HMAC-SHA256 signing with `X-BAPI-*` headers;
+- direct `fetchTime()` via `/v5/market/time`;
+- direct `fetchTickers()` via `/v5/market/tickers?category=linear`;
+- direct `fetchPositions()` via `/v5/position/list`;
+- load tradable USDT linear perpetual markets from `/v5/market/instruments-info`;
+- set isolated margin through `/v5/position/switch-isolated`;
+- set leverage through `/v5/position/set-leverage`;
+- create market orders through `/v5/order/create`;
+- send `positionIdx: 0`, so the account route is expected to use one-way position mode;
+- generate `orderLinkId` when the caller does not provide `clientOrderId`;
+- do not blindly retry order placement after transport failures; reconcile by `orderLinkId` before surfacing the error;
+- poll `/v5/order/realtime` and `/v5/order/history` for final order state;
+- read `/v5/execution/list` to compute average fill price and USDT/USDC commission;
+- reject non-filled or partially filled market orders so `Trader` cleanup can flatten real positions through `fetchPositions()`.
+
+### 14.1. Bybit native orderbook provider
+
+Файл: `src/exchanges/ws/bybit-orderbook-provider.ts`.
+
+Base URLs:
+
+- testnet: `wss://stream-testnet.bybit.com/v5/public/linear`
+- production: `wss://stream.bybit.com/v5/public/linear`
+
+Behavior:
+
+1. Subscribe to `orderbook.{depth}.{symbol}` topics.
+2. Normalize configured depth to Bybit-supported levels: `1`, `50`, `200`, `1000`.
+3. Apply `snapshot` messages as full local book resets.
+4. Apply `delta` messages as absolute level updates; amount `0` deletes the level.
+5. Ignore stale/out-of-order deltas whose update id is not newer than the local book.
+6. Mark all books unsynced after WebSocket disconnect and block trading until fresh data arrives.
+7. Return `null` from `getOrderBook(symbol)` when the book is unsynced or older than 10 seconds.
+8. Send Bybit heartbeat ping every 20 seconds.
+9. Reconnect with exponential backoff and resubscribe all symbols after disconnect.
 
 ## 15. MexcClient
 
 Файл: `src/exchanges/mexc-client.ts`.
 
-Type: ccxt-based futures adapter.
+Type: direct signed MEXC Contract REST client.
+
+Base URL:
+
+- production: `https://contract.mexc.com`
+
+Symbol conversion:
+
+- internal `BTC/USDT:USDT`
+- MEXC `BTC_USDT`
 
 Key behavior:
 
-- `defaultType: 'swap'`;
-- leverage setup failures are warnings;
-- isolated margin has fallback implicit API attempt;
-- market order polling for missing average/status;
-- only USDT/USDC fees are counted.
+- direct MEXC Contract HMAC-SHA256 signing with `ApiKey`, `Request-Time` and `Signature` headers;
+- fetch server time through `/api/v1/contract/ping`;
+- load USDT perpetual contracts from `/api/v1/contract/detail`;
+- fetch 24h tickers from `/api/v1/contract/ticker`;
+- fetch open positions from `/api/v1/private/position/open_positions`;
+- ошибки private positions endpoint пробрасываются вызывающему коду, чтобы close/cleanup logic не трактовала неизвестное состояние позиции MEXC как flat;
+- set isolated leverage through `/api/v1/private/position/change_leverage` for long and short sides;
+- treat `setIsolatedMargin()` as a MEXC-specific precondition because isolated mode is sent as `openType: 1` on leverage and order requests;
+- convert base coin amount to MEXC contract `vol` through `contractSize` and `volUnit`;
+- use side `1` for open long, `3` for open short, `2` for close short and `4` for close long;
+- submit market orders with `type: 5`, `openType: 1` and `externalOid`;
+- reconcile transport/order-submit failures by querying `/api/v1/private/order/external/{symbol}/{externalOid}` before surfacing the error;
+- poll final order details and deal details;
+- count only USDT/USDC fees as quote-equivalent commission;
+- convert filled contracts back to base quantity;
+- reject zero-fill and partial-fill market orders so `Trader` cleanup can flatten real positions through `fetchPositions()`.
 
 Important:
 
 - `MEXC_API_KEY`/`MEXC_SECRET` are optional in config.
 - If route uses `mexc` without credentials, real order operations will fail.
+- MEXC futures testnet is not configured in this project. If `use_testnet=true`, MEXC private operations and the native MEXC provider fail closed instead of touching production endpoints as a testnet substitute.
+- `Trader` closes positions through normalized `ExchangePosition.amount`. MEXC `contracts` stores native contract count, while `amount` stores base coin quantity.
+
+### 15.1. MEXC native orderbook provider
+
+Файл: `src/exchanges/ws/mexc-orderbook-provider.ts`.
+
+Base URL:
+
+- production: `wss://contract.mexc.com/edge`
+
+Behavior:
+
+1. Load MEXC contract metadata from `/api/v1/contract/detail` and require `contractSize` for subscribed symbols.
+2. Subscribe to `sub.depth` with `compress: false` for incremental depth updates.
+3. Fetch REST snapshots from `/api/v1/contract/depth/{symbol}` and support the current `{ success, code, data }` response wrapper.
+4. Cache WebSocket updates while the REST snapshot is fetched.
+5. Apply only updates that continue the local `version` by exactly `+1`.
+6. Mark a symbol unsynced and resync it when a version gap or snapshot failure is detected.
+7. Convert every orderbook level from MEXC contract volume to base coin amount before exposing snapshots to `Trader`.
+8. Return `null` from `getOrderBook(symbol)` while the book is unsynced or older than 10 seconds.
+9. Send MEXC `ping` heartbeat every 20 seconds and reconnect/resubscribe after disconnect.
 
 ## 16. GateClient
 
@@ -1004,11 +1205,11 @@ Type: direct signed Gate Futures REST client.
 Base URLs:
 
 - testnet: `https://fx-api-testnet.gateio.ws/api/v4`
-- production: `https://api.gateio.ws/api/v4`
+- production: `https://fx-api.gateio.ws/api/v4`
 
 Symbol conversion:
 
-- ccxt `BTC/USDT:USDT`
+- internal `BTC/USDT:USDT`
 - Gate `BTC_USDT`
 
 Key behavior:
@@ -1016,15 +1217,40 @@ Key behavior:
 - direct Gate v4 HMAC-SHA512 signing;
 - fetch tickers;
 - fetch positions;
+- ошибки private position endpoint пробрасываются вызывающему коду, чтобы close/cleanup logic не трактовала неизвестное состояние позиции Gate как flat;
 - load contracts;
-- set leverage;
-- best-effort isolated margin;
+- set isolated leverage through positive `leverage` on `POST /futures/usdt/positions/{contract}/leverage`;
+- treat `setIsolatedMargin()` as a Gate-specific precondition check because Gate's isolated mode is confirmed by positive leverage;
 - convert base coin amount to Gate contract count via `quanto_multiplier`;
 - use positive size for buy, negative for sell;
 - submit IOC market-style orders with `price: "0"`;
+- send `text` custom order ids with the required `t-` prefix;
+- reconcile transport/order-submit failures by searching open and finished orders by `text` before surfacing the error;
 - poll final order details;
 - extract commission from `my_trades`;
 - convert filled contracts back to base quantity.
+- reject zero-fill and partial-fill market orders so `Trader` cleanup can flatten real positions through `fetchPositions()`.
+
+### 16.1. Gate native orderbook provider
+
+Файл: `src/exchanges/ws/gate-orderbook-provider.ts`.
+
+Base URLs:
+
+- testnet: `wss://ws-testnet.gate.com/v4/ws/futures/usdt`
+- production: `wss://fx-ws.gateio.ws/v4/ws/usdt`
+
+Behavior:
+
+1. Load Gate contract metadata from `/futures/usdt/contracts` and require `quanto_multiplier` for subscribed symbols.
+2. Connect with `X-Gate-Size-Decimal: 1` so pushed contract sizes are not rounded down by the legacy integer payload mode.
+3. Subscribe to `futures.order_book_update` with `[contract, "100ms", level]`, where level is normalized to `20`, `50` or `100`.
+4. Cache WebSocket updates while `/futures/usdt/order_book?with_id=true` snapshot is fetched.
+5. Apply only updates that bridge the snapshot id and then require contiguous `U`/`u` sequence ranges.
+6. Mark a symbol unsynced and resync it when a sequence gap or snapshot failure is detected.
+7. Convert every orderbook level from Gate contract count to base coin amount before exposing snapshots to `Trader`.
+8. Return `null` from `getOrderBook(symbol)` while the book is unsynced or older than 10 seconds.
+9. Send `futures.ping` heartbeat every 20 seconds and reconnect/resubscribe after disconnect.
 
 Important:
 
@@ -1145,67 +1371,111 @@ pm2 start dist/main.js --name "arbitration-trader"
 
 ## 20. Verification performed
 
-Performed on 2026-04-23:
+Performed on 2026-04-24:
 
-```bash
-pnpm install
-pnpm build
-rg "[А-Яа-яЁё]" src test_binance.ts test_gate.ts .env.example
+```powershell
+.\node_modules\.bin\tsc.CMD
+.\node_modules\.bin\tsc.CMD --ignoreConfig --target es2022 --module Node16 --moduleResolution node16 --esModuleInterop --strict --skipLibCheck --rootDir . --outDir dist\test-run tests\math.test.ts tests\runtime-payload-validation.test.ts tests\trade-counter.test.ts tests\signal-engine.test.ts tests\orderbook-store.test.ts
+node dist\test-run\tests\math.test.js
+node dist\test-run\tests\runtime-payload-validation.test.js
+node dist\test-run\tests\trade-counter.test.js
+node dist\test-run\tests\signal-engine.test.js
+node dist\test-run\tests\orderbook-store.test.js
+rg "\bccxt\b|ccxtInstance|watchOrderBook" src/exchanges/bybit-client.ts src/exchanges/ws/bybit-orderbook-provider.ts
+rg "\bccxt\b|ccxtInstance|watchOrderBook" src/exchanges/gate-client.ts src/exchanges/ws/gate-orderbook-provider.ts
+rg "\bccxt\b|ccxtInstance|watchOrderBook|orderbooks" src package.json pnpm-lock.yaml
+node -e "<public Gate REST/WS smoke without API keys or orders>"
+node -e "<public MEXC REST smoke without API keys or orders>"
+node -e "<public MEXC WebSocket/provider smoke without API keys or orders>"
 ```
 
 Results:
 
-- Dependencies installed successfully.
-- `pnpm build` completed successfully.
-- No Cyrillic text remains in `src`, `test_binance.ts`, `test_gate.ts`, `.env.example`.
+- TypeScript build completed successfully through the local `tsc` binary.
+- Unit tests for math utilities, runtime payload validation, `TradeCounter`, `SignalEngine` and `OrderBookStore` passed when compiled to `dist/test-run` and executed with `node`.
+- Bybit REST and Bybit WebSocket files have no `ccxt`, `ccxtInstance` or `watchOrderBook` usage.
+- Gate REST and Gate WebSocket files have no `ccxt`, `ccxtInstance` or `watchOrderBook` usage.
+- Runtime source, `package.json` and `pnpm-lock.yaml` have no `ccxt`, `ccxtInstance`, `watchOrderBook` or legacy lowercase `orderbooks` usage.
+- Gate production public REST snapshot `GET https://fx-api.gateio.ws/api/v4/futures/usdt/order_book?contract=BTC_USDT&interval=0&limit=20&with_id=true` returned an orderbook id with 20 bids and 20 asks.
+- Gate testnet public WebSocket `wss://ws-testnet.gate.com/v4/ws/futures/usdt` accepted `futures.order_book_update` subscription for `BTC_USDT` and returned updates with `U`/`u` sequences.
+- Gate testnet public REST endpoints `https://fx-api-testnet.gateio.ws/api/v4/futures/usdt/contracts` and `/tickers` returned HTTP 502 from this environment.
+- MEXC production public REST endpoints returned HTTP 200 for `/api/v1/contract/ping`, `/api/v1/contract/detail?symbol=BTC_USDT`, `/api/v1/contract/ticker?symbol=BTC_USDT` and `/api/v1/contract/depth/BTC_USDT?limit=20`.
+- MEXC REST `detail` loaded 754 USDT perpetual symbols in this environment; `BTC/USDT:USDT` market info normalized to `minQty=0.0001`, `stepSize=0.0001`, `pricePrecision=1`, `quantityPrecision=4`.
+- MEXC production public WebSocket `wss://contract.mexc.com/edge` accepted `sub.depth` for `BTC_USDT` with `compress: false` and returned contiguous `push.depth` versions.
+- Compiled `MexcOrderBookProvider` returned a normalized `BTC/USDT:USDT` book with 20 bids and 20 asks; the top BTC depth was exposed in base coin amount, not native contract volume.
 
 Note:
 
-- `pnpm install` created local `node_modules/`.
-- `pnpm build` created local `dist/`.
-- These do not appear as git changes in current status.
+- Global `pnpm` is not available in the current shell; use `pnpm build` in an environment where `pnpm` is installed.
+- `tsx --test tests/*.test.ts` cannot run in the current sandbox because the Node test runner/esbuild service spawn is blocked with `EPERM`; compiled test files were executed directly with `node`.
+- `fastify` is declared in `package.json`; local `node_modules` in the current shell does not include a package manager to install the new dependency.
+- Bybit testnet/private smoke checks were not executed in this environment.
+- Gate private and order smoke checks were not executed in this environment.
+- MEXC private and order smoke checks were not executed in this environment.
 
-## 21. Current git-touched files
+## 21. Key source files
 
-Code/config files updated with English comments:
+Core source files:
 
 - `.env.example`
 - `src/config.ts`
 - `src/main.ts`
+- `src/control-plane/server.ts`
+- `src/control-plane/shutdown.ts`
+- `src/classes/TradeCounter.ts`
+- `src/classes/trade-state.ts`
 - `src/classes/Trader.ts`
 - `src/services/api.ts`
+- `src/services/close-sync-service.ts`
+- `src/services/diagnostics.ts`
 - `src/services/market-info.ts`
+- `src/services/position-recovery.ts`
+- `src/services/runtime-payload-validation.ts`
+- `src/services/shadow-recorder.ts`
+- `src/services/signal-engine.ts`
 - `src/types/index.ts`
 - `src/utils/logger.ts`
 - `src/utils/math.ts`
 - `src/exchanges/exchange-client.ts`
+- `src/exchanges/symbols.ts`
 - `src/exchanges/binance-client.ts`
 - `src/exchanges/bybit-client.ts`
 - `src/exchanges/mexc-client.ts`
 - `src/exchanges/gate-client.ts`
+- `src/exchanges/ws/orderbook-store.ts`
+- `src/exchanges/ws/binance-orderbook-provider.ts`
+- `src/exchanges/ws/bybit-orderbook-provider.ts`
+- `src/exchanges/ws/gate-orderbook-provider.ts`
+- `src/exchanges/ws/mexc-orderbook-provider.ts`
+- `src/exchanges/ws/orderbook-provider-factory.ts`
+- `tests/math.test.ts`
+- `tests/orderbook-store.test.ts`
+- `tests/runtime-payload-validation.test.ts`
+- `tests/signal-engine.test.ts`
+- `tests/trade-counter.test.ts`
 - `test_binance.ts`
 - `test_gate.ts`
 
-Documentation added:
+Project documentation:
 
 - `DOCS.md`
 
 ## 22. Important risks and technical debt
 
-### 22.1. Real trading by default
+### 22.1. Runtime can enable real trading
 
-`USE_TESTNET=false` by default in `.env.example`.
+`use_testnet` is controlled by the Django runtime payload. Production mode is possible when Django sends `use_testnet=false`.
 
-This is dangerous for development. Consider making testnet default or adding an explicit confirmation flag for production.
+This is dangerous for development when Django sends a production runtime. Keep an explicit production confirmation in Django before sending `use_testnet=false`.
 
-### 22.2. Mandatory Binance/Bybit credentials
+### 22.2. Runtime payload contract alignment
 
-Even if route is `gate/mexc`, `config.ts` requires Binance and Bybit credentials. This limits exchange routing flexibility.
+Trader requires credentials only for exchanges selected in the runtime payload. Django must keep sending the selected exchange keys and optional risk-buffer fields with compatible names.
 
 Recommended:
 
-- require credentials only for selected exchanges;
-- validate selected exchanges before reading their required secrets.
+- keep Django serializers and frontend forms aligned with `RuntimeConfigPayload`;
+- reject inactive or stale runtime configs before sending lifecycle commands.
 
 ### 22.3. No process-level distributed lock
 
@@ -1218,9 +1488,9 @@ Mitigation:
 - single PM2 instance;
 - exchange-account-level operating discipline.
 
-### 22.4. Django API unauthenticated
+### 22.4. Django service-token trust boundary
 
-Trader does not send auth to Django. Current Django endpoint must stay private or use service auth.
+Trader sends `X-Service-Token` to Django real-trades endpoints and requires the same header on its control plane. The shared token must be rotated and kept out of logs.
 
 ### 22.5. Recovery matching by symbol only
 
@@ -1233,18 +1503,12 @@ Better:
 - add process/account id;
 - add bot relation in Django real Trade.
 
-### 22.6. No automated test suite
+### 22.6. Automated test coverage remains partial
 
-There are manual smoke scripts only. Math and state transitions should have tests.
+The repository includes unit tests for math utilities, runtime payload validation, `TradeCounter`, `SignalEngine` and `OrderBookStore`. Exchange execution and full `Trader` state-machine flows still need mocked integration tests.
 
 Recommended minimum:
 
-- `calculateOpenSpread`;
-- `calculateTruePnL`;
-- `calculateRealPnL`;
-- `calculateVWAP`;
-- `checkLegDrawdown`;
-- `TradeCounter`;
 - `Trader.executeOpen` with mocked clients;
 - partial open rollback;
 - close retry loop;
@@ -1252,7 +1516,7 @@ Recommended minimum:
 
 ### 22.7. Exchange-specific reduceOnly support
 
-The strategy assumes `reduceOnly` works consistently through all clients. Confirm behavior for MEXC/Gate and ccxt parameter naming.
+The strategy assumes close and rollback orders cannot flip exposure. Binance, Bybit and Gate native clients send exchange-specific reduce-only fields directly. MEXC native close orders use side `2`/`4` for close-short/close-long and send `reduceOnly` only when the account reports one-way position mode, because MEXC hedge mode rejects that flag. Confirm close-side behavior with a small account-level smoke test before relying on MEXC in production.
 
 ### 22.8. Market-order slippage
 
@@ -1266,18 +1530,32 @@ BNB fee conversion is approximate. Non-USDT fees on some exchanges are ignored o
 
 Fix `DEPLOY_LINUX.md` secret variable names before production deployment.
 
+### 22.11. Bybit endpoint region restrictions
+
+The native Bybit client uses the standard mainnet REST and WebSocket domains:
+
+- `https://api.bybit.com`
+- `wss://stream.bybit.com/v5/public/linear`
+
+Bybit can reject API traffic from restricted regions or require regional domains for some account registrations. If health checks return HTTP 403 or regional access errors, configure and validate the correct Bybit domain before production trading.
+
+### 22.12. Gate testnet REST availability
+
+Gate public testnet WebSocket responds on `wss://ws-testnet.gate.com/v4/ws/futures/usdt`, but public testnet REST endpoints on `https://fx-api-testnet.gateio.ws/api/v4` returned HTTP 502 in the current environment. Gate testnet runtime startup depends on REST contracts/tickers/orderbook snapshots, so validate Gate testnet REST availability before using Gate with `use_testnet=true`.
+
+### 22.13. MEXC futures testnet guard
+
+MEXC Contract production public REST and WebSocket endpoints are available from this environment, but a separate futures testnet endpoint is not configured in the project. When `use_testnet=true`, MEXC private REST operations and the MEXC orderbook provider fail closed so the runtime does not accidentally treat production MEXC as a sandbox. Validate MEXC private permissions and order behavior with an explicit low-risk account-level smoke before enabling MEXC production routes.
+
 ## 23. Suggested stabilization plan
 
-1. Change `.env.example` default to `USE_TESTNET=true` or require explicit production confirmation.
-2. Make credentials required only for selected exchanges.
-3. Fix `DEPLOY_LINUX.md` variable names.
-4. Add service authentication to Django real-trades API.
-5. Add strategy/account/process identifiers to Django trades for safe recovery.
-6. Add automated tests for math utilities.
-7. Add mocked exchange tests for open/rollback/close flows.
-8. Add structured logging and secret redaction policy.
-9. Add persistent counters for WS errors, close retries and cleanup events.
-10. Add lock/lease if more than one process can run.
+1. Require explicit production confirmation in Django before sending `use_testnet=false`.
+2. Add strategy/account/process identifiers to Django trades for safer recovery.
+3. Add mocked exchange tests for open/rollback/close flows.
+4. Add structured logging and secret redaction policy.
+5. Add persistent counters for WS errors, close retries and cleanup events.
+6. Add lock/lease if more than one process can run.
+7. Add production monitoring for shadow-mode signals, funding-adjusted edge and realized slippage.
 
 ## 24. Workflow summary
 
@@ -1354,33 +1632,34 @@ Diagnostic behavior:
 
 ### 24.4. Runtime bootstrap sequence
 
-`RuntimeManager.startRuntime()` performs the following steps:
+Fastify validates the runtime payload before `RuntimeManager.startRuntime()` stores it. `RuntimeManager.startRuntime()` performs the following steps:
 
 1. Store runtime payload in `config.ts`.
 2. Create primary and secondary REST clients.
-3. Validate that exchanges differ.
+3. Validate selected account modes.
 4. Measure approximate latency.
 5. Load markets on both exchanges.
 6. Build the intersection of USDT futures symbols.
-7. Filter by primary-exchange liquidity.
-8. Initialize `MarketInfoService`.
-9. Merge and validate market constraints.
-10. Configure isolated margin and leverage on both exchanges.
-11. Create shared WebSocket clients.
-12. Split symbols into chunks.
-13. Fetch open Django trades for the current `runtime_config_id`.
-14. Create `Trader` instances for chunks.
-15. Restore open trades into matching traders.
-16. Start all `Trader` workers.
+7. Fetch open Django trades for the current `runtime_config_id`.
+8. Filter scannable symbols by minimum cross-exchange quote volume.
+9. Add recovery symbols to the runtime universe.
+10. Initialize `MarketInfoService`.
+11. Merge and validate market constraints and funding snapshots.
+12. Configure isolated margin and leverage on both exchanges, using in-process confirmed setup cache.
+13. Create shared orderbook providers and subscribe final tradeable symbols.
+14. Split symbols into chunks.
+15. Create `Trader` instances for chunks.
+16. Restore open trades into matching traders.
+17. Start all `Trader` workers.
 
-If recovery of open trades from Django fails at step 13, runtime startup is aborted.
+If recovery of open trades from Django fails or any open trade cannot be assigned to a trader chunk, runtime startup is aborted.
 
 ### 24.5. Symbol selection logic
 
 The runtime trades only symbols that pass all of the following:
 
 1. Present on both exchanges as USDT perpetual/futures symbols.
-2. Have primary-exchange `quoteVolume >= 2_000_000`.
+2. Have `min(primaryQuoteVolume, secondaryQuoteVolume) >= 2_000_000`.
 3. Fit within `top_liquid_pairs_count`.
 4. Pass `MarketInfoService` validation:
    - merged `stepSize`
@@ -1391,6 +1670,8 @@ The runtime trades only symbols that pass all of the following:
 6. Successfully confirm isolated margin and leverage setup on both exchanges.
 
 Warnings from exchange setup are not treated as successful configuration.
+
+Open trades from Django bypass liquidity selection for recovery, but symbols that are not in the scannable liquidity set have `canOpenNewTrades=false`.
 
 ### 24.6. Trader runtime state
 
@@ -1404,13 +1685,13 @@ Each `Trader` owns a chunk of symbols and keeps per-symbol mutable state:
 - `cooldownUntil`
 - `pendingCloseSync`
 
-Two watch loops run per symbol, one per exchange WebSocket feed. `busy` acts as a local mutex to prevent duplicate open/close handling from concurrent book updates.
+Provider update callbacks schedule spread checks per symbol. `busy` acts as a local mutex to prevent duplicate open/close handling from concurrent book updates.
 
 ### 24.7. Price and size calculation
 
 The strategy uses VWAP instead of top-of-book:
 
-1. Read both orderbooks from ccxt.pro in-memory cache.
+1. Read both orderbooks from normalized `OrderBookProvider` snapshots.
 2. Determine target size:
    - entry uses current configured trade size;
    - close uses exact stored Django trade amount.
@@ -1440,9 +1721,13 @@ When a symbol has no active trade:
 2. Update separate EMA baselines for buy and sell directions.
 3. Check global `TradeCounter`.
 4. Enforce per-symbol cooldown.
-5. Open when:
+5. Skip entry if `canOpenNewTrades=false`.
+6. Open when:
    - `currentBuySpread >= baselineBuy + openThreshold`, or
    - `currentSellSpread >= baselineSell + openThreshold`.
+7. Require hard economic edge:
+   - subtract fee, slippage, funding and latency buffers;
+   - require `expected_net_edge >= min_open_net_edge_percent`.
 
 Direction semantics:
 
@@ -1456,14 +1741,19 @@ Direction semantics:
 `executeOpen()`:
 
 1. Locks the symbol with `busy`.
-2. Reserves a trade slot atomically.
-3. Sends both market orders concurrently.
-4. On partial failure:
+2. In shadow mode, writes a JSONL signal and returns without orders.
+3. Reserves a trade slot atomically.
+4. Sends both market orders concurrently.
+5. On partial failure:
    - attempt reverse reduce-only rollback;
    - run full position cleanup;
    - release slot;
    - apply cooldown.
-5. On success:
+6. On cleanup failure:
+   - log the cleanup error as critical;
+   - still release the local trade slot;
+   - still apply cooldown and reset baselines.
+7. On success:
    - use actual fill prices or VWAP fallback;
    - sum fees;
    - recompute real open spread;
@@ -1472,7 +1762,9 @@ Direction semantics:
 
 ### 24.9. Recovery behavior
 
-At startup, open trades are loaded from Django for the current runtime only and distributed by `trade.coin` to the matching `Trader`.
+At startup, open trades are loaded from Django for the current runtime before scanner chunks are finalized. Recovery symbols are included in the runtime universe even when they fail liquidity selection. If a recovery symbol is not part of the scannable set, `canOpenNewTrades=false` prevents new entries after that exposure is closed.
+
+Open trades are distributed by `trade.coin` to the matching `Trader`. Startup fails if any open trade has no matching chunk.
 
 `restoreOpenTrades()`:
 
@@ -1498,7 +1790,7 @@ When a symbol has `activeTrade`, no new entry is evaluated. Exit checks run in t
 
 1. Lock symbol with `busy`.
 2. Determine close side per exchange.
-3. Fetch real positions from both exchanges.
+3. Получить реальные позиции с обеих бирж. Если любая биржа не может подтвердить позиции, close attempt завершается ошибкой и повторяется позже вместо записи flat-состояния в Django.
 4. Close only legs that are still open.
 5. Use reduce-only market orders.
 6. Use fallback prices if a leg is already flat or execution price is missing.
@@ -1543,7 +1835,7 @@ On `SIGINT`, `SIGTERM`, or runtime stop:
 2. Each `Trader` runs `stop(true)`.
 3. Active trades are closed with emergency pricing.
 4. If only Django close sync is pending, it is retried first.
-5. Shared WebSocket clients are closed.
+5. Shared orderbook providers are closed.
 
 If a `Trader` worker rejects unexpectedly:
 
@@ -1556,7 +1848,7 @@ If a `Trader` worker rejects unexpectedly:
 
 1. Only one runtime can be active in a process.
 2. Market constraints are preloaded at bootstrap and not recomputed during trading.
-3. WebSocket clients are shared across all trader chunks.
+3. Orderbook providers are shared across all trader chunks.
 4. Entry/profit checks require full visible depth; emergency exits prioritize flattening over exact pricing.
 5. Cleanup after failed opens relies on real `fetchPositions`, not only local assumptions.
 6. Close persistence in Django is treated as required state synchronization, not best-effort logging.

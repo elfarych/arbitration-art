@@ -30,6 +30,12 @@ export interface TraderRuntimeConfigPayload {
     orderbook_limit: number;
     chunk_size: number;
     is_active: boolean;
+    min_open_net_edge_percent?: number | string;
+    entry_fee_buffer_percent?: number | string;
+    entry_slippage_buffer_percent?: number | string;
+    funding_buffer_percent?: number | string;
+    latency_buffer_percent?: number | string;
+    shadow_mode?: boolean;
 }
 
 export interface TraderRuntimePayload {
@@ -168,5 +174,33 @@ export const config = {
 
     get topLiquidPairsCount(): number {
         return Number(requireActiveRuntime().config.top_liquid_pairs_count);
+    },
+
+    get minOpenNetEdgePercent(): number {
+        return Number(requireActiveRuntime().config.min_open_net_edge_percent ?? 0);
+    },
+
+    get entryFeeBufferPercent(): number {
+        return Number(requireActiveRuntime().config.entry_fee_buffer_percent ?? 0.20);
+    },
+
+    get entrySlippageBufferPercent(): number {
+        return Number(requireActiveRuntime().config.entry_slippage_buffer_percent ?? 0.05);
+    },
+
+    get fundingBufferPercent(): number {
+        return Number(requireActiveRuntime().config.funding_buffer_percent ?? 0);
+    },
+
+    get latencyBufferPercent(): number {
+        return Number(requireActiveRuntime().config.latency_buffer_percent ?? 0.02);
+    },
+
+    get shadowMode(): boolean {
+        return Boolean(requireActiveRuntime().config.shadow_mode);
+    },
+
+    get shadowSignalLogPath(): string {
+        return process.env.SHADOW_SIGNAL_LOG_PATH || 'logs/shadow-signals.jsonl';
     },
 } as const;
