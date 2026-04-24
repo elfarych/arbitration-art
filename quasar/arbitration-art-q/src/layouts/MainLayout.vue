@@ -10,6 +10,7 @@
 
         <div class="row q-gutter-sm q-mr-md text-weight-medium">
           <q-btn flat no-caps label="Мои боты" to="/" />
+          <q-btn flat no-caps label="Trader Runtime" to="/trader-runtime" />
           <q-btn flat no-caps label="Скринер" text-color="warning" to="/screener" />
         </div>
 

@@ -15,6 +15,10 @@
 - Список пользовательских bot configs.
 - Создание, редактирование, активация/деактивация и удаление ботов.
 - Force-close команда для bot-engine через Django.
+- Отдельный раздел управления standalone `TraderRuntimeConfig` для `arbitration-trader`.
+- Создание, редактирование, запуск/остановка/синхронизация и архивирование runtime config standalone trader.
+- Диагностика standalone trader через Django proxy: exchange health, active coins, open trades PnL, system load.
+- Просмотр runtime errors и real trades, связанных с `TraderRuntimeConfig`.
 - Live-карточки ботов со spread monitoring по стаканам бирж.
 - Эмуляционная логика открытия/закрытия trades на frontend-стороне.
 - Просмотр истории emulation trades.
@@ -106,6 +110,8 @@ quasar/arbitration-art-q/
     │   └── AuthLayout.vue
     ├── pages/
     │   ├── IndexPage.vue
+    │   ├── TraderRuntimePage.vue
+    │   ├── ProfilePage.vue
     │   ├── ScreenerPage.vue
     │   ├── ErrorNotFound.vue
     │   └── auth/LoginPage.vue
@@ -116,10 +122,13 @@ quasar/arbitration-art-q/
     │   ├── index.ts
     │   ├── auth.ts
     │   ├── bots/
+    │   ├── profile/
+    │   ├── trader-runtime/
     │   ├── exchanges/
     │   └── screener/
     └── components/
-        └── bots/
+        ├── bots/
+        └── trader-runtime/
 ```
 
 ## 5. Quasar config
@@ -274,6 +283,8 @@ Routes:
 |---|---|---|---|
 | `/login` | `AuthLayout` | `LoginPage` | Авторизация |
 | `/` | `MainLayout` | `IndexPage` | Мои боты |
+| `/trader-runtime` | `MainLayout` | `TraderRuntimePage` | Standalone trader runtime |
+| `/profile` | `MainLayout` | `ProfilePage` | Профиль и API-ключи бирж |
 | `/screener` | `MainLayout` | `ScreenerPage` | Скринер спредов |
 | `/:catchAll(.*)*` | none | `ErrorNotFound` | 404 |
 
@@ -304,7 +315,7 @@ Behavior:
 
 - `authStore.isAuthenticated` зависит от `currentUser`, но guard также доверяет наличию `access_token` в `localStorage`.
 - Если token просрочен, route пройдет, но API interceptor позже попробует refresh или отправит на `/login`.
-- `goToProfile()` в `MainLayout` ведет на `/profile`, но такого route нет. Это текущий broken navigation.
+- `goToProfile()` в `MainLayout` ведет на `/profile`.
 
 ## 9. Boot: Axios
 
@@ -418,6 +429,7 @@ success: 'Action was successful'
 - brand button `Arbitration Art` -> `/`;
 - nav:
   - `Мои боты` -> `/`
+  - `Trader Runtime` -> `/trader-runtime`
   - `Скринер` -> `/screener`
 - user avatar/email если `authStore.currentUser`;
 - spinner while loading user;
@@ -428,9 +440,7 @@ On mount:
 - если нет `currentUser`, вызывает `authStore.fetchUser()`.
 - при ошибке пишет warning.
 
-Broken route:
-
-- click по user info вызывает `router.push('/profile')`, но route `/profile` отсутствует.
+Click по user info вызывает `router.push('/profile')`.
 
 ## 12. Pages
 
@@ -464,7 +474,50 @@ Backend endpoints:
 - `POST /auth/login/`
 - `GET /auth/me/` after successful login.
 
-### 12.2. IndexPage
+### 12.2. ProfilePage
+
+Файл: `src/pages/ProfilePage.vue`.
+
+Назначение: профиль текущего пользователя и управление API-ключами бирж.
+
+State:
+
+- `authStore.currentUser`;
+- `useProfileStore().exchangeKeys`;
+- `useProfileStore().loading`;
+- `useProfileStore().saving`;
+- local form state for new key/secret values.
+
+On mount:
+
+```ts
+authStore.fetchUser()
+profileStore.fetchExchangeKeys()
+```
+
+UI:
+
+- account panel with email, username and registration date;
+- logout button;
+- exchange key sections for Binance, Bybit, Gate and MEXC;
+- masked previews returned by backend;
+- password-style secret inputs with visibility toggle;
+- per-exchange clear button;
+- save button that sends only non-empty fields.
+
+Backend endpoints:
+
+- `GET /auth/exchange-keys/`
+- `PATCH /auth/exchange-keys/`
+- `POST /auth/logout/`
+
+Важно:
+
+- raw saved secrets are not returned by backend;
+- empty fields in the form do not overwrite saved values;
+- clear action sends empty strings for selected exchange key and secret.
+
+### 12.3. IndexPage
 
 Файл: `src/pages/IndexPage.vue`.
 
@@ -497,7 +550,50 @@ Children:
 - `BotFormDialog`
 - `SpreadHistoryDialog`
 
-### 12.3. ScreenerPage
+### 12.4. TraderRuntimePage
+
+Файл: `src/pages/TraderRuntimePage.vue`.
+
+Назначение: управление Django `TraderRuntimeConfig` для standalone `arbitration-trader`.
+
+State:
+
+- `useTraderRuntimeStore().configs`, где UI использует первый неархивированный config как единственный пользовательский runtime config;
+- `useTraderRuntimeStore().loading`
+- dialog state for create/edit;
+- diagnostics state: exchange health, active coins, open trades PnL, system load;
+- related backend data: runtime errors and real trades.
+
+On mount:
+
+```ts
+store.fetchConfigs()
+```
+
+Actions:
+
+- Создать runtime config -> open `TraderRuntimeConfigDialog`, доступно только когда runtime config отсутствует.
+- Edit -> open `TraderRuntimeConfigDialog` with the current config.
+- Start -> `PATCH /bots/runtime-configs/{id}/` with `is_active=true`.
+- Stop -> `PATCH /bots/runtime-configs/{id}/` with `is_active=false`.
+- Sync -> `PATCH /bots/runtime-configs/{id}/` with `is_active=true` for active config.
+- Exchange health -> `GET /bots/runtime-configs/{id}/exchange-health/`.
+- Runtime diagnostics -> calls active coins, open trades PnL and system load endpoints.
+- Real trades -> `GET /bots/real-trades/?runtime_config_id={id}`.
+- Runtime errors -> `GET /bots/runtime-config-errors/?runtime_config_id={id}`.
+
+Важно:
+
+- Django serializer создает `TraderRuntimeConfig` inactive, даже если frontend отправит `is_active=true`.
+- Запуск/остановка реализованы через изменение `is_active`; Django `post_save` signal отправляет lifecycle-команду в `arbitration-trader`.
+- Backend constraint разрешает один неархивированный `TraderRuntimeConfig` на пользователя.
+- UI не показывает список runtime configs, archived configs и кнопку архивирования.
+
+Children:
+
+- `TraderRuntimeConfigDialog`
+
+### 12.5. ScreenerPage
 
 Файл: `src/pages/ScreenerPage.vue`.
 
@@ -533,7 +629,7 @@ Exchange options:
 - `minVolume` есть в store, но UI и scan logic его не используют.
 - Scan использует top-of-book bid/ask из REST tickers, не VWAP depth.
 
-### 12.4. ErrorNotFound
+### 12.6. ErrorNotFound
 
 Стандартная 404 страница на английском:
 
@@ -572,11 +668,53 @@ Actions:
 | `fetchUser` | `GET /auth/me/`, set currentUser |
 | `logout` | `POST /auth/logout/`, затем clearSession |
 
-Текущий UI не содержит logout button.
+`ProfilePage` содержит logout button.
 
-## 14. Bots store и API
+## 14. Profile store и API
 
 ### 14.1. Store
+
+Файл: `src/stores/profile/profile.store.ts`.
+
+State:
+
+- `exchangeKeys`
+- `loading`
+- `saving`
+
+Actions:
+
+| Action | Что делает |
+|---|---|
+| `fetchExchangeKeys` | получает masked состояние ключей текущего пользователя |
+| `updateExchangeKeys` | PATCH переданных key/secret полей |
+| `clearExchangeKeys` | очищает API key и secret одной биржи |
+
+### 14.2. API client
+
+Файл: `src/stores/profile/api/exchangeKeys.ts`.
+
+Endpoints:
+
+| Method | Path | Client method |
+|---|---|---|
+| `GET` | `/auth/exchange-keys/` | `exchangeKeysApi.get` |
+| `PATCH` | `/auth/exchange-keys/` | `exchangeKeysApi.update` |
+
+GET response shape:
+
+```ts
+Record<'binance' | 'bybit' | 'gate' | 'mexc', {
+  has_api_key: boolean
+  has_secret: boolean
+  api_key_preview: string
+  secret_preview: string
+}>
+```
+
+## 15. Bots store и API
+
+### 15.1. Store
 
 Файл: `src/stores/bots/bots.store.ts`.
 
@@ -599,7 +737,7 @@ Actions:
 - локально меняет `bot.is_active`;
 - если API failed, откатывает значение.
 
-### 14.2. API client
+### 15.2. API client
 
 Файл: `src/stores/bots/api/botConfig.ts`.
 
@@ -639,7 +777,7 @@ Assumption:
 
 If backend pagination changes off, this method would break.
 
-### 14.3. Emulation trades API
+### 15.3. Emulation trades API
 
 Same file.
 
@@ -657,7 +795,123 @@ Important:
 - Client compensates by calling `data.results.filter(t => t.bot === botId)`.
 - Comment in code already notes this assumption.
 
-## 15. BotFormDialog
+## 16. Trader runtime store и API
+
+### 16.1. Store
+
+Файл: `src/stores/trader-runtime/traderRuntime.store.ts`.
+
+State:
+
+- `configs: TraderRuntimeConfig[]`
+- `loading`
+- `saving`
+- `diagnosticsLoading`
+- `exchangeHealth`
+- `activeCoins`
+- `openTradesPnl`
+- `systemLoad`
+- `errors`
+- `trades`
+
+Actions:
+
+| Action | Что делает |
+|---|---|
+| `fetchConfigs` | загружает текущий неархивированный runtime config |
+| `createConfig` | создает inactive `TraderRuntimeConfig` |
+| `updateConfig` | PATCH runtime config и заменяет запись в state |
+| `startConfig` | PATCH `is_active=true` |
+| `stopConfig` | PATCH `is_active=false` |
+| `syncConfig` | PATCH `is_active=true` для active config |
+| `archiveConfig` | DELETE runtime config, backend архивирует запись |
+| `fetchExchangeHealth` | получает private exchange health через Django proxy |
+| `fetchActiveCoins` | получает active coins/trade count |
+| `fetchOpenTradesPnl` | получает live PnL открытых runtime trades |
+| `fetchSystemLoad` | получает CPU/memory/risk state trader процесса |
+| `refreshDiagnostics` | параллельно получает exchange health, active coins, PnL и system load |
+| `fetchErrors` | загружает `TraderRuntimeConfigError` |
+| `fetchTrades` | загружает real trades по `runtime_config_id` |
+| `clearRuntimeData` | очищает выбранные diagnostics/tables |
+
+### 16.2. API client
+
+Файл: `src/stores/trader-runtime/api/traderRuntimeConfig.ts`.
+
+`TraderRuntimeConfig` fields mirror Django backend:
+
+- name;
+- service URL;
+- primary/secondary exchange;
+- testnet flag;
+- trade amount USDT;
+- leverage;
+- max concurrent trades;
+- top liquid pairs count;
+- max trade duration;
+- max leg drawdown;
+- open/close thresholds;
+- orderbook limit;
+- chunk size;
+- active/status/sync metadata;
+- archive metadata;
+- timestamps.
+
+Endpoints:
+
+| Method | Path | Client method |
+|---|---|---|
+| `GET` | `/bots/runtime-configs/` | `traderRuntimeConfigApi.list` |
+| `GET` | `/bots/runtime-configs/{id}/` | `traderRuntimeConfigApi.get` |
+| `POST` | `/bots/runtime-configs/` | `traderRuntimeConfigApi.create` |
+| `PATCH` | `/bots/runtime-configs/{id}/` | `traderRuntimeConfigApi.update` |
+| `DELETE` | `/bots/runtime-configs/{id}/` | `traderRuntimeConfigApi.archive` |
+| `GET` | `/bots/runtime-configs/{id}/exchange-health/` | `traderRuntimeConfigApi.exchangeHealth` |
+| `GET` | `/bots/runtime-configs/{id}/active-coins/` | `traderRuntimeConfigApi.activeCoins` |
+| `GET` | `/bots/runtime-configs/{id}/open-trades-pnl/` | `traderRuntimeConfigApi.openTradesPnl` |
+| `GET` | `/bots/runtime-configs/{id}/system-load/` | `traderRuntimeConfigApi.systemLoad` |
+| `GET` | `/bots/runtime-config-errors/?runtime_config_id={id}` | `traderRuntimeErrorsApi.list` |
+| `GET` | `/bots/real-trades/?runtime_config_id={id}` | `runtimeTradesApi.list` |
+
+`list()` helpers accept both DRF paginated response and plain arrays:
+
+```ts
+T[] | { results: T[] }
+```
+
+### 16.3. TraderRuntimeConfigDialog
+
+Файл: `src/components/trader-runtime/TraderRuntimeConfigDialog.vue`.
+
+Назначение: create/edit form for `TraderRuntimeConfig`.
+
+Fields:
+
+- name;
+- service_url;
+- primary_exchange;
+- secondary_exchange;
+- trade_amount_usdt;
+- leverage;
+- max_concurrent_trades;
+- top_liquid_pairs_count;
+- open_threshold;
+- close_threshold;
+- max_trade_duration_minutes;
+- max_leg_drawdown_percent;
+- orderbook_limit;
+- chunk_size;
+- is_active only in edit.
+
+`use_testnet` is not included in the frontend payload. Backend model default keeps new configs at `use_testnet=false`.
+
+Validation:
+
+- required values;
+- positive numeric limits where required;
+- primary and secondary exchanges must be different.
+
+## 17. BotFormDialog
 
 Файл: `src/components/bots/BotFormDialog.vue`.
 
@@ -716,7 +970,7 @@ Important:
 - `trade_mode` toggle is disabled on edit.
 - Save button disabled until coin validation passes for new bot.
 
-## 16. BotCard
+## 18. BotCard
 
 Файл: `src/components/bots/BotCard.vue`.
 
@@ -749,7 +1003,7 @@ Uses:
 - `SpreadChart`;
 - `BotTradesDialog`.
 
-### 16.1. Live monitor lifecycle
+### 18.1. Live monitor lifecycle
 
 On mount:
 
@@ -777,7 +1031,7 @@ On unmount:
 - `stop(bot.id)`;
 - clear countdown interval.
 
-### 16.2. Inline editing
+### 18.2. Inline editing
 
 Card supports autosave:
 
@@ -788,7 +1042,7 @@ Card supports autosave:
   - popup edit;
   - debounced backend save after 1.5s.
 
-### 16.3. Frontend emulation trade flow
+### 18.3. Frontend emulation trade flow
 
 Open:
 
@@ -816,7 +1070,7 @@ Important:
 - Real mode badge exists, but this card still runs frontend emulation state for displayed trades.
 - There is no retry loop for failed close update in frontend emulation.
 
-### 16.4. Current PnL formula
+### 18.4. Current PnL formula
 
 For `buy`:
 
@@ -834,7 +1088,7 @@ For `sell`:
 
 Then divided by `secondary_open_price`.
 
-## 17. SpreadMonitor
+## 19. SpreadMonitor
 
 Файл: `src/stores/exchanges/spreadMonitor.ts`.
 
@@ -863,7 +1117,7 @@ monitors: Map<number, {
 
 Key: `botId`.
 
-### 17.1. SpreadStats
+### 19.1. SpreadStats
 
 Fields:
 
@@ -876,7 +1130,7 @@ Fields:
 - volume fields;
 - `insufficientExchanges`.
 
-### 17.2. VWAP
+### 19.2. VWAP
 
 `calculateVWAP(book, amount)`:
 
@@ -884,7 +1138,7 @@ Fields:
 - returns `{ vwap, insufficient }`;
 - insufficient if accumulated volume < `amount * 0.9999`.
 
-### 17.3. Streaming
+### 19.3. Streaming
 
 `streamDepth` dispatches by exchange:
 
@@ -898,7 +1152,7 @@ Each monitor opens two WebSocket connections:
 - primary exchange depth;
 - secondary exchange depth.
 
-### 17.4. Spread formulas
+### 19.4. Spread formulas
 
 For `buy`:
 
@@ -926,7 +1180,7 @@ History:
 
 - max 200 snapshots.
 
-## 18. SpreadChart
+## 20. SpreadChart
 
 Файл: `src/components/bots/SpreadChart.vue`.
 
@@ -948,7 +1202,7 @@ It redraws on latest snapshot timestamp with `requestAnimationFrame`.
 
 This component does not use `lightweight-charts`; it uses raw canvas.
 
-## 19. BotTradesDialog
+## 21. BotTradesDialog
 
 Файл: `src/components/bots/BotTradesDialog.vue`.
 
@@ -973,7 +1227,7 @@ On hide:
 
 - clears local trades.
 
-## 20. SpreadHistoryDialog
+## 22. SpreadHistoryDialog
 
 Файл: `src/components/bots/SpreadHistoryDialog.vue`.
 
@@ -1008,19 +1262,19 @@ closeS = (secondaryClose - primaryClose) / primaryClose * 100
 - They do not branch by `bot.order_type`.
 - For `buy` direction this may not match live monitor formula.
 
-## 21. Exchanges store
+## 23. Exchanges store
 
 Файл: `src/stores/exchanges/exchanges.store.ts`.
 
 Actions:
 
-### 21.1. `fetchExchangeInfo`
+### 23.1. `fetchExchangeInfo`
 
 Delegates to `exchangeInfoService.getInfo`.
 
 Returns funding/ticker info for primary and secondary exchanges.
 
-### 21.2. `validateSymbol`
+### 23.2. `validateSymbol`
 
 Checks symbol on primary and secondary exchange by calling appropriate API client.
 
@@ -1033,7 +1287,7 @@ Supported values:
 - `bybit_futures`
 - fallback branch effectively MEXC.
 
-### 21.3. `getSpreadHistory`
+### 23.3. `getSpreadHistory`
 
 Fetches 1-minute klines for last 6 hours:
 
@@ -1053,7 +1307,7 @@ Potential issue:
 - Formula ignores order type.
 - Kline timestamp alignment between exchanges may not always match exactly.
 
-## 22. Exchange API modules
+## 24. Exchange API modules
 
 Directory:
 
@@ -1061,7 +1315,7 @@ Directory:
 src/stores/exchanges/api/
 ```
 
-### 22.1. Binance Futures
+### 24.1. Binance Futures
 
 Файл: `binanceApi.ts`.
 
@@ -1090,7 +1344,7 @@ WebSocket:
 - `wss://fstream.binance.com/market/ws/{symbol}@bookTicker`
 - `wss://fstream.binance.com/market/ws/{symbol}@depth20@100ms`
 
-### 22.2. Binance Spot
+### 24.2. Binance Spot
 
 Файл: `binanceSpotApi.ts`.
 
@@ -1107,7 +1361,7 @@ WebSocket:
 
 Funding fields are returned as zero because spot has no funding.
 
-### 22.3. Bybit
+### 24.3. Bybit
 
 Файл: `bybitApi.ts`.
 
@@ -1135,7 +1389,7 @@ Klines:
 - `/market/kline?category=linear&interval=1`
 - response reversed to ascending order.
 
-### 22.4. MEXC
+### 24.4. MEXC
 
 Файл: `mexcApi.ts`.
 
@@ -1164,7 +1418,7 @@ Subscriptions:
 
 Includes 30s ping interval.
 
-### 22.5. ExchangeInfo service
+### 24.5. ExchangeInfo service
 
 Файл: `exchangeInfo.ts`.
 
@@ -1175,7 +1429,7 @@ Maps exchange id to corresponding API client:
 - `mexc_futures` -> `mexcApi`
 - `bybit_futures` -> `bybitApi`
 
-## 23. Screener store
+## 25. Screener store
 
 Файл: `src/stores/screener/screener.store.ts`.
 
@@ -1207,9 +1461,9 @@ Important:
 - No volume filtering despite `minVolume` state.
 - Uses ticker bid/ask, not depth VWAP.
 
-## 24. Styling and theme
+## 26. Styling and theme
 
-### 24.1. Variables
+### 26.1. Variables
 
 Файл: `src/css/quasar.variables.sass`.
 
@@ -1234,7 +1488,7 @@ Layout style:
 - 8px generic border radius;
 - small dense controls.
 
-### 24.2. Global app Sass
+### 26.2. Global app Sass
 
 Файл: `src/css/app.sass`.
 
@@ -1251,7 +1505,7 @@ Important:
 - Global `.q-field__control` overrides every Quasar field control.
 - This affects all forms and future components.
 
-## 25. Backend contracts
+## 27. Backend contracts
 
 The frontend expects Django API under `process.env.API_URL`.
 
@@ -1263,6 +1517,8 @@ Auth:
 - `POST /auth/refresh/`
 - `POST /auth/logout/`
 - `GET /auth/me/`
+- `GET /auth/exchange-keys/`
+- `PATCH /auth/exchange-keys/`
 
 Bots:
 
@@ -1279,13 +1535,28 @@ Emulation trades:
 - `POST /bots/trades/`
 - `PATCH /bots/trades/{id}/`
 
+Trader runtime:
+
+- `GET /bots/runtime-configs/`
+- `POST /bots/runtime-configs/`
+- `GET /bots/runtime-configs/{id}/`
+- `PATCH /bots/runtime-configs/{id}/`
+- `DELETE /bots/runtime-configs/{id}/`
+- `GET /bots/runtime-configs/{id}/exchange-health/`
+- `GET /bots/runtime-configs/{id}/active-coins/`
+- `GET /bots/runtime-configs/{id}/open-trades-pnl/`
+- `GET /bots/runtime-configs/{id}/system-load/`
+- `GET /bots/runtime-config-errors/?runtime_config_id={id}`
+- `GET /bots/real-trades/?runtime_config_id={id}`
+
 Response assumptions:
 
 - list endpoints are paginated with `results`.
+- trader-runtime list helpers also accept plain array responses.
 - Decimal fields can be parsed as numbers or are already numeric.
 - JWT header is `Authorization: Bearer <access>`.
 
-## 26. Environment
+## 28. Environment
 
 No `.env.example` was found in the Quasar project.
 
@@ -1305,37 +1576,26 @@ If `API_URL` is not set, Axios baseURL becomes `undefined`, so API requests beco
 
 For Quasar/Vite, confirm env exposure rules before relying on arbitrary `process.env.*` in browser code. Quasar supports env injection through `quasar.config.ts build.env` and dotenv patterns depending on setup.
 
-## 27. Known issues and risks
+## 29. Known issues and risks
 
-### 27.1. `/profile` route отсутствует
-
-`MainLayout.goToProfile()` pushes `/profile`, but route is not defined.
-
-Fix:
-
-- add profile route/page;
-- or remove click handler;
-- or make avatar open menu with logout.
-
-### 27.2. No logout UI
-
-`authStore.logout()` exists, but layout does not expose it.
-
-### 27.3. Tokens in localStorage
+### 29.1. Tokens in localStorage
 
 Access/refresh tokens are stored in `localStorage`.
 
 Risk:
 
 - XSS can steal tokens.
+- Long-lived refresh token is browser-readable.
 
-Alternative:
+### 29.2. Exchange secrets are stored by backend
 
-- httpOnly cookies;
-- shorter access lifetime;
-- CSP hardening.
+Profile page sends exchange API keys to Django and displays only masked previews returned by backend. The backend model still stores secrets in regular text fields, so production deployment needs DB/admin access control and encryption or a secret manager.
 
-### 27.4. Production exchange REST proxy missing
+### 29.3. No global logout UI
+
+`ProfilePage` contains logout, but `MainLayout` still does not expose a dedicated logout menu.
+
+### 29.4. Production exchange REST proxy missing
 
 Dev server proxies exchange REST paths. Production deployment needs equivalent proxy.
 
@@ -1347,7 +1607,7 @@ Without it:
 
 will hit the frontend host and fail unless routed by backend/reverse proxy.
 
-### 27.5. Browser connects directly to exchange WebSockets
+### 29.5. Browser connects directly to exchange WebSockets
 
 WebSocket code connects directly to Binance/Bybit/MEXC endpoints from browser.
 
@@ -1358,7 +1618,7 @@ Risks:
 - no reconnect/backoff logic in most clients;
 - multiple bot cards create multiple websocket connections.
 
-### 27.6. Frontend emulation state is volatile
+### 29.6. Frontend emulation state is volatile
 
 BotCard manages `tradeState` and `activeTrade` locally.
 
@@ -1368,52 +1628,51 @@ Recovery from Django happens on mount, but:
 - local state resets on threshold changes;
 - multiple tabs can create duplicate emulation trades.
 
-### 27.7. Live formula and historical formula may differ
+### 29.7. Live formula and historical formula may differ
 
 `SpreadMonitor` branches by order type.
 
 `exchangesStore.getSpreadHistory` does not branch by order type.
 
-### 27.8. Screener uses top-of-book only
+### 29.8. Screener uses top-of-book only
 
 Screener does not use VWAP/depth, so results may be less executable than BotCard live spread.
 
-### 27.9. `botTradesApi.list` relies on client-side filtering
+### 29.9. `botTradesApi.list` relies on client-side filtering
 
 It sends `?bot=...`, but backend may ignore it. Then client filters returned paginated page only.
 
 If there are more than one page of trades, this can miss trades for a bot.
 
-### 27.10. `example-store.ts` and `components/models.ts` are Quasar template leftovers
+### 29.10. `example-store.ts` and `components/models.ts` are Quasar template leftovers
 
 They appear unused and can be removed if no imports exist.
 
-### 27.11. Type looseness in tables
+### 29.11. Type looseness in tables
 
 Several columns use `as any`.
 
 This bypasses strict TypeScript benefits for table definitions.
 
-### 27.12. Real mode UX can be confusing
+### 29.12. Real mode UX can be confusing
 
 `BotCard` displays real trading badge and force-close action, but local emulation logic still exists in the card. Make clear which state comes from frontend emulation vs backend engine/real trades.
 
-## 28. Suggested improvements
+## 30. Suggested improvements
 
 1. Add `.env.example` for Quasar with `API_URL`.
 2. Add logout menu in `MainLayout`.
-3. Fix or remove `/profile` navigation.
-4. Move exchange REST proxy requirements into deployment docs.
-5. Add production reverse proxy config for exchange REST paths.
-6. Add reconnect/backoff logic for WebSocket clients.
-7. Move frontend emulation trade lifecycle into a store/composable with retries.
-8. Add backend filtering for `bot` on emulation trades or fetch all pages before client filtering.
-9. Align historical spread formulas with order type.
-10. Add tests for stores and spread formulas.
-11. Remove template leftovers if unused.
+3. Move exchange REST proxy requirements into deployment docs.
+4. Add production reverse proxy config for exchange REST paths.
+5. Add reconnect/backoff logic for WebSocket clients.
+6. Move frontend emulation trade lifecycle into a store/composable with retries.
+7. Add backend filtering for `bot` on emulation trades or fetch all pages before client filtering.
+8. Align historical spread formulas with order type.
+9. Add tests for stores and spread formulas.
+10. Remove template leftovers if unused.
 12. Add lint/typecheck scripts if Quasar project supports them.
 
-## 29. Validation checklist
+## 31. Validation checklist
 
 Before shipping frontend changes:
 

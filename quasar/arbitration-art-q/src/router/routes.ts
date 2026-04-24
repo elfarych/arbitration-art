@@ -14,6 +14,8 @@ const routes: RouteRecordRaw[] = [
     meta: { requiresAuth: true },
     children: [
       { path: '', component: () => import('pages/IndexPage.vue') },
+      { path: 'trader-runtime', component: () => import('pages/TraderRuntimePage.vue') },
+      { path: 'profile', component: () => import('pages/ProfilePage.vue') },
       { path: 'screener', component: () => import('pages/ScreenerPage.vue') }
     ],
   },

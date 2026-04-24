@@ -268,10 +268,12 @@ Root URL config: `arbitration_art_django/urls.py`.
 | `bybit_secret` | `CharField(255, blank=True)` | Bybit secret. |
 | `gate_api_key` | `CharField(255, blank=True)` | Gate API key. |
 | `gate_secret` | `CharField(255, blank=True)` | Gate secret. |
+| `mexc_api_key` | `CharField(255, blank=True)` | MEXC API key. |
+| `mexc_secret` | `CharField(255, blank=True)` | MEXC secret. |
 
 Важное замечание: в текущем коде ключи хранятся обычным текстом в БД. Для production это высокий риск. Минимально нужно ограничить доступ к БД/admin, лучше добавить шифрование на уровне поля или secret storage.
 
-Модель сейчас не зарегистрирована в `apps/users/admin.py` и не имеет публичного serializer/view в API. При этом bot-engine payload читает ее через `bot.owner.exchange_keys`, если relation существует.
+Модель сейчас не зарегистрирована в `apps/users/admin.py`. Authenticated user управляет своими ключами через `/api/auth/exchange-keys/`. API не возвращает сырые значения ключей и secrets: GET возвращает только флаги наличия и masked previews. PATCH принимает новые значения и обновляет только переданные поля; пустая строка очищает конкретное поле.
 
 ### 7.3. User serializer
 
@@ -288,6 +290,13 @@ date_joined
 
 Все поля read-only.
 
+`UserExchangeKeysSerializer` используется для текущего пользователя:
+
+- write-only поля: `binance_api_key`, `binance_secret`, `bybit_api_key`, `bybit_secret`, `gate_api_key`, `gate_secret`, `mexc_api_key`, `mexc_secret`;
+- GET representation сгруппирован по биржам `binance`, `bybit`, `gate`, `mexc`;
+- каждая биржа возвращает `has_api_key`, `has_secret`, `api_key_preview`, `secret_preview`;
+- serializer не возвращает сырые secret values.
+
 ### 7.4. Auth API
 
 Prefix: `/api/auth/`.
@@ -298,6 +307,8 @@ Prefix: `/api/auth/`.
 | `POST` | `/api/auth/refresh/` | `TokenRefreshView` | public | Обновить access token через refresh token. |
 | `POST` | `/api/auth/logout/` | `LogoutView` | authenticated | Blacklist переданного refresh token. |
 | `GET` | `/api/auth/me/` | `MeView` | authenticated | Получить профиль текущего пользователя. |
+| `GET` | `/api/auth/exchange-keys/` | `ExchangeKeysView` | authenticated | Получить masked состояние API-ключей текущего пользователя. |
+| `PATCH` | `/api/auth/exchange-keys/` | `ExchangeKeysView` | authenticated | Обновить или очистить API-ключи текущего пользователя. |
 
 Login использует стандартный Simple JWT serializer. Так как `USERNAME_FIELD = "email"`, ожидаемый credential field - `email`.
 
@@ -1366,15 +1377,9 @@ BOT_ENGINE_TIMEOUT_SECONDS=5
 - status filters для trades;
 - serializer validation для choices/decimal fields.
 
-### 17.6. `UserExchangeKeys` без API/admin
+### 17.6. `UserExchangeKeys` без admin
 
-Модель есть, engine ее использует, но нет способа управлять ключами через текущий API и нет admin registration.
-
-Нужно понять, кто создает `UserExchangeKeys`:
-
-- вручную через shell?
-- через отдельный frontend endpoint, который еще не написан?
-- через fixture/import?
+Модель есть, engine/trader payload ее использует, а пользовательское управление идет через `/api/auth/exchange-keys/`. Admin registration для ручного просмотра/поддержки не настроена.
 
 ### 17.7. `Trade` без owner/bot relation
 

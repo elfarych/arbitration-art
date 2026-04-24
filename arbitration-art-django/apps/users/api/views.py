@@ -3,7 +3,8 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework_simplejwt.tokens import RefreshToken
 
-from apps.users.api.serializers import UserSerializer
+from apps.users.api.serializers import UserExchangeKeysSerializer, UserSerializer
+from apps.users.models import UserExchangeKeys
 
 
 class MeView(generics.RetrieveAPIView):
@@ -14,6 +15,17 @@ class MeView(generics.RetrieveAPIView):
 
     def get_object(self):
         return self.request.user
+
+
+class ExchangeKeysView(generics.RetrieveUpdateAPIView):
+    """Return masked exchange key state and update current user's keys."""
+
+    serializer_class = UserExchangeKeysSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_object(self):
+        exchange_keys, _ = UserExchangeKeys.objects.get_or_create(user=self.request.user)
+        return exchange_keys
 
 
 class LogoutView(APIView):
