@@ -118,3 +118,15 @@ def fetch_trader_runtime_system_load(runtime_config_id: int) -> Any:
         ),
         params={"runtime_config_id": runtime_config.id},
     )
+
+
+def fetch_trader_runtime_server_info(runtime_config_id: int) -> Any:
+    runtime_config = _get_runtime_config(runtime_config_id)
+    return _perform_request(
+        "GET",
+        join_control_url(
+            runtime_config.service_url,
+            "/engine/trader/runtime/server-info",
+        ),
+        params={"runtime_config_id": runtime_config.id},
+    )

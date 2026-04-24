@@ -107,6 +107,13 @@ export interface SystemLoadResponse {
   memory_used_percent: number;
 }
 
+export interface ServerInfoResponse {
+  requested_runtime_config_id: number | null;
+  hostname: string;
+  server_ip: string | null;
+  ip_addresses: string[];
+}
+
 export type RuntimeConfigErrorType =
   | 'start'
   | 'sync'
@@ -200,6 +207,11 @@ export const traderRuntimeConfigApi = {
 
   async systemLoad(id: number): Promise<SystemLoadResponse> {
     const { data } = await api.get<SystemLoadResponse>(`/bots/runtime-configs/${id}/system-load/`);
+    return data;
+  },
+
+  async serverInfo(id: number): Promise<ServerInfoResponse> {
+    const { data } = await api.get<ServerInfoResponse>(`/bots/runtime-configs/${id}/server-info/`);
     return data;
   },
 };

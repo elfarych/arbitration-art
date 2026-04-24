@@ -1,6 +1,7 @@
 import { config } from '../config.js';
 import type { RuntimeManager } from '../classes/RuntimeManager.js';
 import { api } from '../services/api.js';
+import { getServerInfoSnapshot } from '../services/server-info.js';
 import {
     parseRuntimeCommandPayload,
     parseRuntimeConfigId,
@@ -150,6 +151,11 @@ export async function createControlPlaneServer(runtimeManager: RuntimeManager): 
             risk_locked: status.riskLocked,
             ...data,
         };
+    });
+
+    app.get('/engine/trader/runtime/server-info', async request => {
+        const runtimeConfigId = parseRuntimeConfigId(request.query?.runtime_config_id);
+        return getServerInfoSnapshot(runtimeConfigId);
     });
 
     return {

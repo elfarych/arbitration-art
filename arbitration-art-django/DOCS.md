@@ -662,6 +662,7 @@ Endpoints:
 | `GET` | `/api/bots/runtime-configs/{id}/active-coins/` | Получить набор монет, по которым активный runtime держит открытые сделки. |
 | `GET` | `/api/bots/runtime-configs/{id}/open-trades-pnl/` | Получить live PnL по текущим открытым сделкам активного runtime. |
 | `GET` | `/api/bots/runtime-configs/{id}/system-load/` | Получить текущую нагрузку CPU/RAM на сервере `arbitration-trader`. |
+| `GET` | `/api/bots/runtime-configs/{id}/server-info/` | Получить hostname и IP-адреса сервера `arbitration-trader`. |
 
 Serializer fields:
 
@@ -720,6 +721,7 @@ updated_at
 - `exchange-health` отправляет полный runtime payload вместе с ключами пользователя и не зависит от того, активен ли сейчас runtime в процессе `arbitration-trader`.
 - `active-coins` и `open-trades-pnl` читают только текущий active runtime внутри `arbitration-trader`; если запрошенный `runtime_config_id` не совпадает с активным, сервис возвращает пустой набор и `is_requested_runtime_active=false`.
 - `system-load` возвращает system-wide метрики хоста `arbitration-trader` плюс `active_runtime_config_id` для сопоставления с текущим runtime.
+- `server-info` возвращает `hostname`, primary non-internal IPv4 в `server_ip` и список non-internal IPv4 адресов в `ip_addresses`; endpoint нужен frontend для отображения IP торгового сервера.
 
 ### 9.3. `TraderRuntimeConfigErrorViewSet`
 

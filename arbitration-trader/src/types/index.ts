@@ -94,6 +94,13 @@ export interface SystemLoadSnapshot {
     memory_used_percent: number;
 }
 
+export interface ServerInfoSnapshot {
+    requested_runtime_config_id: number | null;
+    hostname: string;
+    server_ip: string | null;
+    ip_addresses: string[];
+}
+
 // ──────────── Exchange Data ────────────
 
 export interface ExchangeTicker {

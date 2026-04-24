@@ -34,6 +34,9 @@
                 <div class="text-h6 text-title-color">{{ runtimeConfig.name }}</div>
                 <q-badge :color="runtimeConfig.is_active ? 'positive' : 'grey-7'" :label="runtimeConfig.is_active ? 'ACTIVE' : 'STOPPED'" />
               </div>
+              <div class="text-caption text-grey-5 q-mb-xs">
+                IP торгового сервера: <span class="text-white">{{ serverIpLabel }}</span>
+              </div>
               <div class="text-caption text-grey-5">{{ runtimeConfig.service_url }}</div>
             </div>
 
@@ -112,7 +115,6 @@
           <q-card-section class="row items-center justify-between">
             <div class="text-h6 text-title-color">Диагностика</div>
             <div class="row q-gutter-sm">
-              <q-btn no-caps outline color="primary" icon="health_and_safety" label="Биржи" :loading="diagnosticsLoading" @click="loadExchangeHealth" />
               <q-btn no-caps outline color="primary" icon="memory" label="Runtime" :loading="diagnosticsLoading" @click="refreshDiagnostics" />
             </div>
           </q-card-section>
@@ -263,6 +265,7 @@ const {
   activeCoins,
   openTradesPnl,
   systemLoad,
+  serverInfo,
   errors,
   trades,
 } = storeToRefs(store);
@@ -272,6 +275,14 @@ const editingConfig = ref<TraderRuntimeConfig | null>(null);
 
 const runtimeConfig = computed(() => {
   return configs.value[0] ?? null;
+});
+
+const serverIpLabel = computed(() => {
+  if (!serverInfo.value) {
+    return 'нет данных';
+  }
+
+  return serverInfo.value.server_ip || 'не найден';
 });
 
 const exchangeLabels: Record<string, string> = {
@@ -350,6 +361,7 @@ async function reload() {
 
 async function loadRelatedData(id: number) {
   await Promise.allSettled([
+    store.fetchServerInfo(id),
     store.fetchErrors(id),
     store.fetchTrades(id),
   ]);
@@ -443,21 +455,6 @@ async function refreshDiagnostics() {
   } catch (error) {
     console.error(error);
     $q.notify({ color: 'negative', message: 'Не удалось получить диагностику runtime' });
-    await store.fetchErrors(config.id).catch(() => undefined);
-  }
-}
-
-async function loadExchangeHealth() {
-  const config = runtimeConfig.value;
-  if (!config) {
-    return;
-  }
-
-  try {
-    await store.fetchExchangeHealth(config.id);
-  } catch (error) {
-    console.error(error);
-    $q.notify({ color: 'negative', message: 'Не удалось проверить биржи' });
     await store.fetchErrors(config.id).catch(() => undefined);
   }
 }

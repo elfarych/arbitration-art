@@ -561,7 +561,7 @@ State:
 - `useTraderRuntimeStore().configs`, где UI использует первый неархивированный config как единственный пользовательский runtime config;
 - `useTraderRuntimeStore().loading`
 - dialog state for create/edit;
-- diagnostics state: exchange health, active coins, open trades PnL, system load;
+- diagnostics state: exchange health, active coins, open trades PnL, system load and server info;
 - related backend data: runtime errors and real trades.
 
 On mount:
@@ -577,8 +577,8 @@ Actions:
 - Start -> `PATCH /bots/runtime-configs/{id}/` with `is_active=true`.
 - Stop -> `PATCH /bots/runtime-configs/{id}/` with `is_active=false`.
 - Sync -> `PATCH /bots/runtime-configs/{id}/` with `is_active=true` for active config.
-- Exchange health -> `GET /bots/runtime-configs/{id}/exchange-health/`.
-- Runtime diagnostics -> calls active coins, open trades PnL and system load endpoints.
+- Server info -> `GET /bots/runtime-configs/{id}/server-info/`.
+- Runtime diagnostics -> calls exchange health, active coins, open trades PnL and system load endpoints.
 - Real trades -> `GET /bots/real-trades/?runtime_config_id={id}`.
 - Runtime errors -> `GET /bots/runtime-config-errors/?runtime_config_id={id}`.
 
@@ -588,6 +588,7 @@ Actions:
 - Запуск/остановка реализованы через изменение `is_active`; Django `post_save` signal отправляет lifecycle-команду в `arbitration-trader`.
 - Backend constraint разрешает один неархивированный `TraderRuntimeConfig` на пользователя.
 - UI не показывает список runtime configs, archived configs и кнопку архивирования.
+- Под названием runtime config показывается `server_ip`, полученный через Django proxy из `arbitration-trader`.
 
 Children:
 
@@ -811,6 +812,7 @@ State:
 - `activeCoins`
 - `openTradesPnl`
 - `systemLoad`
+- `serverInfo`
 - `errors`
 - `trades`
 
@@ -829,6 +831,7 @@ Actions:
 | `fetchActiveCoins` | получает active coins/trade count |
 | `fetchOpenTradesPnl` | получает live PnL открытых runtime trades |
 | `fetchSystemLoad` | получает CPU/memory/risk state trader процесса |
+| `fetchServerInfo` | получает hostname и IP торгового сервера через Django proxy |
 | `refreshDiagnostics` | параллельно получает exchange health, active coins, PnL и system load |
 | `fetchErrors` | загружает `TraderRuntimeConfigError` |
 | `fetchTrades` | загружает real trades по `runtime_config_id` |
@@ -870,6 +873,7 @@ Endpoints:
 | `GET` | `/bots/runtime-configs/{id}/active-coins/` | `traderRuntimeConfigApi.activeCoins` |
 | `GET` | `/bots/runtime-configs/{id}/open-trades-pnl/` | `traderRuntimeConfigApi.openTradesPnl` |
 | `GET` | `/bots/runtime-configs/{id}/system-load/` | `traderRuntimeConfigApi.systemLoad` |
+| `GET` | `/bots/runtime-configs/{id}/server-info/` | `traderRuntimeConfigApi.serverInfo` |
 | `GET` | `/bots/runtime-config-errors/?runtime_config_id={id}` | `traderRuntimeErrorsApi.list` |
 | `GET` | `/bots/real-trades/?runtime_config_id={id}` | `runtimeTradesApi.list` |
 
@@ -1546,6 +1550,7 @@ Trader runtime:
 - `GET /bots/runtime-configs/{id}/active-coins/`
 - `GET /bots/runtime-configs/{id}/open-trades-pnl/`
 - `GET /bots/runtime-configs/{id}/system-load/`
+- `GET /bots/runtime-configs/{id}/server-info/`
 - `GET /bots/runtime-config-errors/?runtime_config_id={id}`
 - `GET /bots/real-trades/?runtime_config_id={id}`
 

@@ -24,6 +24,7 @@ from apps.bots.services.trader_runtime_info import (
     fetch_trader_runtime_active_coins,
     fetch_trader_runtime_exchange_health,
     fetch_trader_runtime_open_trades_pnl,
+    fetch_trader_runtime_server_info,
     fetch_trader_runtime_system_load,
 )
 
@@ -138,6 +139,19 @@ class TraderRuntimeConfigViewSet(viewsets.ModelViewSet):
         runtime_config = self.get_object()
         try:
             payload = fetch_trader_runtime_system_load(runtime_config.id)
+        except TraderRuntimeInfoError as exc:
+            return Response(
+                {"detail": str(exc)},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+
+        return Response(payload)
+
+    @action(detail=True, methods=["get"], url_path="server-info")
+    def server_info(self, request, pk=None):
+        runtime_config = self.get_object()
+        try:
+            payload = fetch_trader_runtime_server_info(runtime_config.id)
         except TraderRuntimeInfoError as exc:
             return Response(
                 {"detail": str(exc)},

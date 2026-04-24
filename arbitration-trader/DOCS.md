@@ -308,6 +308,7 @@ Fastify routes:
 - `GET /engine/trader/runtime/active-coins`
 - `GET /engine/trader/runtime/open-trades-pnl`
 - `GET /engine/trader/runtime/system-load`
+- `GET /engine/trader/runtime/server-info`
 
 All routes except `/health` require `X-Service-Token`.
 
@@ -1672,6 +1673,7 @@ The HTTP server exposes:
 - `GET /engine/trader/runtime/active-coins`
 - `GET /engine/trader/runtime/open-trades-pnl`
 - `GET /engine/trader/runtime/system-load`
+- `GET /engine/trader/runtime/server-info`
 
 All endpoints except `/health` require `X-Service-Token`.
 
@@ -1707,6 +1709,9 @@ Diagnostic behavior:
 4. `GET /engine/trader/runtime/system-load`
    - samples system-wide CPU utilization over a short interval;
    - returns total/used/free RAM in bytes and percent usage for the host running the trader process.
+5. `GET /engine/trader/runtime/server-info`
+   - reads host network interfaces from the trader process;
+   - returns `hostname`, primary non-internal IPv4 as `server_ip`, all non-internal IPv4 values in `ip_addresses` and the requested runtime config id.
 
 ### 24.4. Runtime bootstrap sequence
 

@@ -7,6 +7,7 @@ import {
   type ExchangeHealthResponse,
   type OpenTradesPnlResponse,
   type RuntimeTrade,
+  type ServerInfoResponse,
   type SystemLoadResponse,
   type TraderRuntimeConfig,
   type TraderRuntimeConfigError,
@@ -23,6 +24,7 @@ export const useTraderRuntimeStore = defineStore('traderRuntime', {
     activeCoins: null as ActiveCoinsResponse | null,
     openTradesPnl: null as OpenTradesPnlResponse | null,
     systemLoad: null as SystemLoadResponse | null,
+    serverInfo: null as ServerInfoResponse | null,
     errors: [] as TraderRuntimeConfigError[],
     trades: [] as RuntimeTrade[],
   }),
@@ -95,6 +97,12 @@ export const useTraderRuntimeStore = defineStore('traderRuntime', {
       return this.systemLoad;
     },
 
+    async fetchServerInfo(id: number) {
+      this.serverInfo = null;
+      this.serverInfo = await traderRuntimeConfigApi.serverInfo(id);
+      return this.serverInfo;
+    },
+
     async refreshDiagnostics(id: number) {
       this.diagnosticsLoading = true;
       try {
@@ -126,6 +134,7 @@ export const useTraderRuntimeStore = defineStore('traderRuntime', {
       this.activeCoins = null;
       this.openTradesPnl = null;
       this.systemLoad = null;
+      this.serverInfo = null;
       this.errors = [];
       this.trades = [];
     },
