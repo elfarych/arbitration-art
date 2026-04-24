@@ -2,6 +2,7 @@ import type { IExchangeClient } from '../exchanges/exchange-client.js';
 import type { ExchangeTicker, UnifiedMarketInfo } from '../types/index.js';
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
+import { commonDecimalStep, roundDownToStep } from '../utils/math.js';
 
 const TAG = 'MarketInfo';
 
@@ -61,8 +62,9 @@ export class MarketInfoService {
                 continue;
             }
 
-            // Use the strictest constraints from both exchanges.
-            const stepSize = Math.max(primaryInfo.stepSize, secondaryInfo.stepSize);
+            // Use a lot step that is valid for both exchanges, including
+            // non-power-of-ten increments such as 0.0005 or non-divisible steps.
+            const stepSize = commonDecimalStep(primaryInfo.stepSize, secondaryInfo.stepSize);
             const minQty = Math.max(primaryInfo.minQty, secondaryInfo.minQty);
             const minNotional = Math.max(primaryInfo.minNotional, secondaryInfo.minNotional);
 
@@ -88,7 +90,7 @@ export class MarketInfoService {
                 // Convert configured USDT budget into base-coin amount and then
                 // round down to a lot size that is valid on both exchanges.
                 const rawAmount = config.tradeAmountUsdt / currentPrice;
-                tradeAmount = Math.floor(rawAmount / stepSize) * stepSize;
+                tradeAmount = roundDownToStep(rawAmount, stepSize);
                 
                 // Validate against both quantity and notional minimums.
                 const notionalValue = tradeAmount * currentPrice;
@@ -96,10 +98,6 @@ export class MarketInfoService {
                     logger.debug(TAG, `Skipping ${symbol}: calculated amount ${tradeAmount} does not meet minimums. (${tradeAmount} < ${minQty} or ${notionalValue} < ${minNotional})`);
                     continue;
                 }
-
-                // Clean up float errors, ensuring precision is at least 0.
-                const precision = Math.max(0, Math.round(-Math.log10(stepSize)));
-                tradeAmount = parseFloat(tradeAmount.toFixed(precision));
             }
 
             const unified: UnifiedMarketInfo = {

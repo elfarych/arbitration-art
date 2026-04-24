@@ -8,6 +8,7 @@ import { OrderBookStore } from './orderbook-store.js';
 
 const TAG = 'BinanceOrderBookWs';
 const MAX_BUFFERED_EVENTS = 2000;
+const MAX_STALE_MS = 10_000;
 
 type BinanceDepthLevel = [string, string];
 
@@ -30,18 +31,21 @@ export class BinanceOrderBookProvider implements OrderBookProvider {
     private readonly store: OrderBookStore;
     private readonly useTestnet: boolean;
     private readonly depthLimit: number;
+    private readonly maxStaleMs: number;
     private ws: WebSocket | null = null;
     private symbols: string[] = [];
     private listeners = new Set<(symbol: string) => void>();
     private buffers = new Map<string, BinanceDepthEvent[]>();
+    private staleSymbols = new Set<string>();
     private resyncTimers = new Map<string, ReturnType<typeof setTimeout>>();
     private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
     private reconnectAttempts = 0;
     private isClosed = false;
 
-    constructor(options: { useTestnet?: boolean; depthLimit?: number } = {}) {
+    constructor(options: { useTestnet?: boolean; depthLimit?: number; maxStaleMs?: number } = {}) {
         this.useTestnet = options.useTestnet ?? config.useTestnet;
         this.depthLimit = this.normalizeDepthLimit(options.depthLimit ?? config.orderbookLimit);
+        this.maxStaleMs = options.maxStaleMs ?? MAX_STALE_MS;
         this.store = new OrderBookStore(this.depthLimit);
         this.httpClient = axios.create({
             baseURL: this.useTestnet
@@ -72,6 +76,7 @@ export class BinanceOrderBookProvider implements OrderBookProvider {
         this.symbols = this.symbols.filter(symbol => !removed.has(symbol));
         for (const symbol of symbols) {
             this.buffers.delete(symbol);
+            this.staleSymbols.delete(symbol);
             const timer = this.resyncTimers.get(symbol);
             if (timer) {
                 clearTimeout(timer);
@@ -86,6 +91,15 @@ export class BinanceOrderBookProvider implements OrderBookProvider {
             return null;
         }
 
+        if (Date.now() - snapshot.localTimestamp >= this.maxStaleMs) {
+            if (!this.staleSymbols.has(symbol)) {
+                this.staleSymbols.add(symbol);
+                logger.warn(TAG, `Orderbook for ${symbol} is stale; blocking trading until the next Binance depth update.`);
+            }
+            return null;
+        }
+
+        this.staleSymbols.delete(symbol);
         return snapshot;
     }
 
@@ -224,6 +238,7 @@ export class BinanceOrderBookProvider implements OrderBookProvider {
                 lastUpdateId,
                 Number(snapshot.E ?? snapshot.T) || null,
             );
+            this.staleSymbols.delete(symbol);
 
             const buffered = this.buffers.get(symbol) ?? [];
             this.buffers.set(symbol, []);
@@ -289,6 +304,7 @@ export class BinanceOrderBookProvider implements OrderBookProvider {
             event.u,
             event.T ?? event.E ?? null,
         );
+        this.staleSymbols.delete(symbol);
     }
 
     private bufferEvent(symbol: string, event: BinanceDepthEvent): void {
@@ -307,6 +323,7 @@ export class BinanceOrderBookProvider implements OrderBookProvider {
 
         logger.warn(TAG, `Resyncing ${symbol}: ${reason}`);
         this.store.markUnsynced(symbol);
+        this.staleSymbols.delete(symbol);
         const timer = setTimeout(() => {
             this.resyncTimers.delete(symbol);
             void this.initializeSymbol(symbol);
@@ -322,6 +339,7 @@ export class BinanceOrderBookProvider implements OrderBookProvider {
         for (const symbol of this.symbols) {
             this.store.markUnsynced(symbol);
             this.buffers.set(symbol, []);
+            this.staleSymbols.delete(symbol);
         }
 
         const delay = Math.min(1000 * (2 ** this.reconnectAttempts), 30000);

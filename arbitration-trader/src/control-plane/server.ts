@@ -68,10 +68,24 @@ export async function createControlPlaneServer(runtimeManager: RuntimeManager): 
         reply.code(statusCode).send({ success: false, error: error.message });
     });
 
-    app.get('/health', async () => ({
-        success: true,
-        active_runtime_config_id: runtimeManager.getStatus().activeRuntimeConfigId,
-    }));
+    app.get('/health', async request => {
+        if (!config.publicHealthDetails && !hasValidServiceToken(request)) {
+            return {
+                success: true,
+                status: 'ok',
+            };
+        }
+
+        const status = runtimeManager.getStatus();
+        return {
+            success: true,
+            active_runtime_config_id: status.activeRuntimeConfigId,
+            runtime_state: status.runtimeState,
+            risk_locked: status.riskLocked,
+            risk_incidents: status.riskIncidents,
+            open_exposure: status.openExposure,
+        };
+    });
 
     app.post('/engine/trader/start', async request => {
         const payload = parseRuntimeCommandPayload(request.body);
@@ -116,9 +130,12 @@ export async function createControlPlaneServer(runtimeManager: RuntimeManager): 
     app.get('/engine/trader/runtime/system-load', async request => {
         const runtimeConfigId = parseRuntimeConfigId(request.query?.runtime_config_id);
         const data = await runtimeManager.getSystemLoad();
+        const status = runtimeManager.getStatus();
         return {
             requested_runtime_config_id: runtimeConfigId ?? null,
-            active_runtime_config_id: runtimeManager.getStatus().activeRuntimeConfigId,
+            active_runtime_config_id: status.activeRuntimeConfigId,
+            runtime_state: status.runtimeState,
+            risk_locked: status.riskLocked,
             ...data,
         };
     });

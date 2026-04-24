@@ -1,5 +1,6 @@
 import * as crypto from 'node:crypto';
 import { clearActiveRuntime, config, setActiveRuntime } from '../config.js';
+import { RuntimeRiskLock } from './risk-lock.js';
 import { Trader } from './Trader.js';
 import { TradeCounter } from './TradeCounter.js';
 import { BinanceClient } from '../exchanges/binance-client.js';
@@ -8,9 +9,12 @@ import { GateClient } from '../exchanges/gate-client.js';
 import { MexcClient } from '../exchanges/mexc-client.js';
 import type { ExchangeClientOptions, IExchangeClient } from '../exchanges/exchange-client.js';
 import { createOrderBookProvider } from '../exchanges/ws/orderbook-provider-factory.js';
+import { assertAccountPositionsReconciled } from '../services/account-reconciliation.js';
 import { api } from '../services/api.js';
 import { getSystemLoadSnapshot } from '../services/diagnostics.js';
+import { executionJournal } from '../services/execution-journal.js';
 import { MarketInfoService } from '../services/market-info.js';
+import { RuntimeProcessLock } from '../services/runtime-process-lock.js';
 import type {
     ExchangeHealthCheckResult,
     OrderBookProvider,
@@ -25,6 +29,8 @@ const TAG = 'RuntimeManager';
 interface ActiveRuntimeHandle {
     payload: RuntimeCommandPayload;
     traders: Trader[];
+    riskLock: RuntimeRiskLock;
+    state: 'running' | 'stopping_with_open_exposure';
     primaryClient: IExchangeClient;
     secondaryClient: IExchangeClient;
     primaryBooks: OrderBookProvider;
@@ -38,6 +44,7 @@ export class RuntimeManager {
     private activeRuntime: ActiveRuntimeHandle | null = null;
     private operationChain: Promise<void> = Promise.resolve();
     private confirmedSetupKeys = new Set<string>();
+    private readonly processLock = new RuntimeProcessLock();
 
     private withLock<T>(operation: () => Promise<T>): Promise<T> {
         const nextOperation = this.operationChain.then(operation, operation);
@@ -95,9 +102,27 @@ export class RuntimeManager {
         });
     }
 
-    public getStatus(): { activeRuntimeConfigId: number | null } {
+    public getStatus(): {
+        activeRuntimeConfigId: number | null;
+        runtimeState: 'idle' | 'running' | 'risk_locked' | 'stopping_with_open_exposure';
+        riskLocked: boolean;
+        riskIncidents: ReturnType<RuntimeRiskLock['getStatus']>['incidents'];
+        openExposure: boolean;
+    } {
+        const riskStatus = this.activeRuntime?.riskLock.getStatus() ?? { isLocked: false, incidents: [] };
+        const openExposure = this.activeRuntime?.traders.some(trader => trader.hasOpenExposure()) ?? false;
+        const runtimeState = !this.activeRuntime
+            ? 'idle'
+            : riskStatus.isLocked
+                ? 'risk_locked'
+                : this.activeRuntime.state;
+
         return {
             activeRuntimeConfigId: this.activeRuntime?.payload.runtime_config_id ?? null,
+            runtimeState,
+            riskLocked: riskStatus.isLocked,
+            riskIncidents: riskStatus.incidents,
+            openExposure,
         };
     }
 
@@ -226,6 +251,21 @@ export class RuntimeManager {
             logger.info(TAG, `  Open Threshold: ${config.openThreshold}%, Close Threshold: ${config.closeThreshold}%`);
             logger.info(TAG, '═══════════════════════════════════════════');
 
+            if (!config.useTestnet && !config.allowProductionTrading) {
+                throw new Error('Production trading is disabled for this process. Set ALLOW_PRODUCTION_TRADING=true only for an explicitly prepared production runtime.');
+            }
+
+            const accountFingerprint = this.buildRouteAccountFingerprint(payload);
+            this.validateProductionSafety(payload, accountFingerprint);
+
+            await this.processLock.acquire({
+                runtime_config_id: payload.runtime_config_id,
+                owner_id: payload.owner_id,
+                account_fingerprint: accountFingerprint,
+            });
+
+            await executionJournal.assertNoUnsafeUnresolvedRuntime(payload.runtime_config_id);
+
             const primaryClient = this.createClient(config.primaryExchange);
             const secondaryClient = this.createClient(config.secondaryExchange);
 
@@ -278,6 +318,17 @@ export class RuntimeManager {
             logger.info(TAG, 'Checking for open trades from previous session...');
             const openTrades = await api.getOpenTrades(config.runtimeConfigId);
             logger.info(TAG, `Found ${openTrades.length} open trades to restore.`);
+
+            logger.info(TAG, 'Running account-wide startup position reconciliation...');
+            await assertAccountPositionsReconciled({
+                payload,
+                primaryClient,
+                secondaryClient,
+                openTrades,
+                sizeTolerancePercent: config.positionSizeTolerancePercent,
+            });
+            logger.info(TAG, 'Account-wide startup position reconciliation passed.');
+
             const recoverySymbols = [...new Set(openTrades.map(trade => trade.coin))];
 
             const missingRecoverySymbols = recoverySymbols.filter(symbol => !primarySymbols.has(symbol) || !secondarySymbols.includes(symbol));
@@ -419,6 +470,7 @@ export class RuntimeManager {
 
             logger.info(TAG, `Split into ${chunks.length} chunks of ${config.chunkSize}.`);
 
+            const riskLock = new RuntimeRiskLock();
             const traders: Trader[] = chunks.map((chunk, index) => (
                 new Trader(
                     index + 1,
@@ -429,6 +481,7 @@ export class RuntimeManager {
                     secondaryClient,
                     marketInfo,
                     tradeCounter,
+                    riskLock,
                     entryDisabledSymbols,
                 )
             ));
@@ -450,6 +503,8 @@ export class RuntimeManager {
             this.activeRuntime = {
                 payload,
                 traders,
+                riskLock,
+                state: 'running',
                 primaryClient,
                 secondaryClient,
                 primaryBooks,
@@ -477,6 +532,9 @@ export class RuntimeManager {
             }
 
             clearActiveRuntime();
+            await this.processLock.release().catch((releaseError: any) => {
+                logger.error(TAG, `Failed to release process lock after startup error: ${releaseError.message}`);
+            });
             throw error;
         }
     }
@@ -490,9 +548,26 @@ export class RuntimeManager {
 
         logger.info(TAG, `Stopping runtime ${current.payload.runtime_config_id} gracefully.`);
 
-        this.activeRuntime = null;
+        current.state = 'stopping_with_open_exposure';
 
-        await Promise.allSettled(current.traders.map(trader => trader.stop(true)));
+        const stopResults = await Promise.allSettled(current.traders.map(trader => trader.stop(true)));
+        const stopErrors = stopResults
+            .filter((result): result is PromiseRejectedResult => result.status === 'rejected')
+            .map(result => result.reason instanceof Error ? result.reason.message : String(result.reason));
+        const remainingExposure = current.traders.flatMap(trader => trader.getExposureSummary());
+
+        if (stopErrors.length > 0 || remainingExposure.length > 0 || current.riskLock.isLocked) {
+            const riskStatus = current.riskLock.getStatus();
+            const details = [
+                ...stopErrors,
+                ...(remainingExposure.length > 0 ? [`remaining exposure: ${remainingExposure.join(', ')}`] : []),
+                ...(riskStatus.isLocked ? [`risk incidents: ${riskStatus.incidents.map(incident => `${incident.key}:${incident.reason}`).join(', ')}`] : []),
+            ].filter(Boolean);
+            logger.error(TAG, `Runtime ${current.payload.runtime_config_id} was not stopped because exposure is not confirmed flat: ${details.join('; ')}`);
+            throw new Error(`Runtime ${current.payload.runtime_config_id} still has open or unmanaged exposure. ${details.join('; ')}`);
+        }
+
+        this.activeRuntime = null;
 
         try {
             await current.primaryBooks.close();
@@ -512,6 +587,7 @@ export class RuntimeManager {
         ]);
 
         clearActiveRuntime();
+        await this.processLock.release();
         logger.info(TAG, `Runtime ${current.payload.runtime_config_id} stopped.`);
     }
 
@@ -564,23 +640,89 @@ export class RuntimeManager {
     }
 
     private buildSetupCacheKey(payload: RuntimeCommandPayload, symbol: string): string {
-        const selectedKeys = [
-            this.exchangeApiKey(payload.config.primary_exchange, payload),
-            this.exchangeApiKey(payload.config.secondary_exchange, payload),
-        ].join('|');
-        const accountFingerprint = crypto
-            .createHash('sha256')
-            .update(selectedKeys)
-            .digest('hex')
-            .slice(0, 16);
+        const accountFingerprint = this.buildRouteAccountFingerprint(payload);
 
         return [
             accountFingerprint,
+            payload.config.use_testnet ? 'testnet' : 'production',
             payload.config.primary_exchange,
             payload.config.secondary_exchange,
             symbol,
             payload.config.leverage,
         ].join(':');
+    }
+
+    private validateProductionSafety(payload: RuntimeCommandPayload, accountFingerprint: string): void {
+        if (payload.config.use_testnet) {
+            return;
+        }
+
+        if (config.traderEnvironment !== config.productionTradingEnvironment) {
+            throw new Error(
+                `Production runtime rejected: TRADER_ENVIRONMENT=${config.traderEnvironment} `
+                + `does not match PRODUCTION_TRADING_ENVIRONMENT=${config.productionTradingEnvironment}.`,
+            );
+        }
+
+        if (config.productionAccountFingerprintAllowlist.size === 0) {
+            throw new Error(
+                `Production runtime rejected: PRODUCTION_ACCOUNT_FINGERPRINTS is empty. `
+                + `Current route fingerprint is ${accountFingerprint}.`,
+            );
+        }
+
+        if (!config.productionAccountFingerprintAllowlist.has(accountFingerprint)) {
+            throw new Error(
+                `Production runtime rejected: account fingerprint ${accountFingerprint} is not in PRODUCTION_ACCOUNT_FINGERPRINTS.`,
+            );
+        }
+
+        if (config.maxProductionTradeAmountUsdt === null) {
+            throw new Error('Production runtime rejected: MAX_PRODUCTION_TRADE_AMOUNT_USDT must be configured.');
+        }
+
+        const tradeAmountUsdt = Number(payload.config.trade_amount_usdt);
+        if (tradeAmountUsdt > config.maxProductionTradeAmountUsdt) {
+            throw new Error(
+                `Production runtime rejected: trade_amount_usdt=${tradeAmountUsdt} exceeds `
+                + `MAX_PRODUCTION_TRADE_AMOUNT_USDT=${config.maxProductionTradeAmountUsdt}.`,
+            );
+        }
+
+        if (config.maxProductionConcurrentTrades === null) {
+            throw new Error('Production runtime rejected: MAX_PRODUCTION_CONCURRENT_TRADES must be configured.');
+        }
+
+        if (payload.config.max_concurrent_trades > config.maxProductionConcurrentTrades) {
+            throw new Error(
+                `Production runtime rejected: max_concurrent_trades=${payload.config.max_concurrent_trades} exceeds `
+                + `MAX_PRODUCTION_CONCURRENT_TRADES=${config.maxProductionConcurrentTrades}.`,
+            );
+        }
+
+        if (config.maxProductionLeverage === null) {
+            throw new Error('Production runtime rejected: MAX_PRODUCTION_LEVERAGE must be configured.');
+        }
+
+        if (payload.config.leverage > config.maxProductionLeverage) {
+            throw new Error(
+                `Production runtime rejected: leverage=${payload.config.leverage} exceeds `
+                + `MAX_PRODUCTION_LEVERAGE=${config.maxProductionLeverage}.`,
+            );
+        }
+    }
+
+    private buildRouteAccountFingerprint(payload: RuntimeCommandPayload): string {
+        const selectedKeys = [
+            this.exchangeApiKey(payload.config.primary_exchange, payload),
+            this.exchangeApiKey(payload.config.secondary_exchange, payload),
+        ].join('|');
+
+        return crypto
+            .createHash('sha256')
+            .update(selectedKeys)
+            .digest('hex')
+            .slice(0, 16);
     }
 
     private exchangeApiKey(exchange: string, payload: RuntimeCommandPayload): string {

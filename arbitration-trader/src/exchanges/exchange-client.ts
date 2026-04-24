@@ -29,6 +29,9 @@ export interface IExchangeClient {
     /** Fetch normalized open positions for internal symbols */
     fetchPositions(symbols: string[]): Promise<ExchangePosition[]>;
 
+    /** Fetch all normalized open USDT futures positions visible to this API key */
+    fetchAllOpenPositions(): Promise<ExchangePosition[]>;
+
     /** Load all market data (call once at bootstrap) */
     loadMarkets(): Promise<void>;
 

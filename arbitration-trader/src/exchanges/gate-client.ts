@@ -5,6 +5,7 @@ import type { ExchangePosition, ExchangeTicker, OrderResult, SymbolMarketInfo } 
 import { gateToUnified, unifiedToGate } from './symbols.js';
 import { logger } from '../utils/logger.js';
 import { config } from '../config.js';
+import { decimalPlaces } from '../utils/math.js';
 
 const TAG = 'GateClient';
 const SETTLE = 'usdt';
@@ -125,24 +126,12 @@ export class GateClient implements IExchangeClient {
             try {
                 const gateSymbol = unifiedToGate(symbol);
                 const data = await this.request<GatePosition>('GET', `/futures/${SETTLE}/positions/${gateSymbol}`);
-                const nativeSize = Number(data.size || 0);
-                if (!Number.isFinite(nativeSize) || nativeSize === 0) {
+                const position = this.normalizePosition(data, symbol);
+                if (!position) {
                     continue;
                 }
 
-                const multiplier = this.getMultiplierOrThrow(gateSymbol, symbol);
-                const baseAmount = Math.abs(nativeSize) * multiplier;
-
-                results.push({
-                    symbol,
-                    // Trader currently closes positions with `contracts ?? amount`,
-                    // so both fields intentionally carry base amount for Gate.
-                    contracts: baseAmount,
-                    amount: baseAmount,
-                    side: nativeSize > 0 ? 'long' : 'short',
-                    entryPrice: Number(data.entry_price || 0),
-                    raw: data,
-                });
+                results.push(position);
             } catch (error: any) {
                 const message = this.formatError(error);
                 logger.error(TAG, `Failed to fetch positions for ${symbol}: ${message}`);
@@ -151,6 +140,13 @@ export class GateClient implements IExchangeClient {
         }
 
         return results;
+    }
+
+    async fetchAllOpenPositions(): Promise<ExchangePosition[]> {
+        const data = await this.request<GatePosition[]>('GET', `/futures/${SETTLE}/positions`);
+        return data
+            .map(position => this.normalizePosition(position))
+            .filter((position): position is ExchangePosition => position !== null);
     }
 
     async pingPrivate(): Promise<void> {
@@ -280,8 +276,8 @@ export class GateClient implements IExchangeClient {
             minQty: minQtyBase,
             stepSize: stepSizeBase,
             minNotional: 0,
-            pricePrecision: priceStep > 0 ? Math.max(0, Math.round(-Math.log10(priceStep))) : 8,
-            quantityPrecision: Math.max(0, Math.round(-Math.log10(stepSizeBase))),
+            pricePrecision: priceStep > 0 ? decimalPlaces(priceStep) : 8,
+            quantityPrecision: decimalPlaces(stepSizeBase),
         };
     }
 
@@ -291,6 +287,37 @@ export class GateClient implements IExchangeClient {
             symbols.push(gateToUnified(contract.name));
         }
         return symbols;
+    }
+
+    private normalizePosition(position: GatePosition, expectedSymbol?: string): ExchangePosition | null {
+        const gateSymbol = position.contract;
+        if (!gateSymbol) {
+            return null;
+        }
+
+        const symbol = expectedSymbol ?? gateToUnified(gateSymbol);
+        if (expectedSymbol && unifiedToGate(expectedSymbol) !== gateSymbol) {
+            return null;
+        }
+
+        const nativeSize = Number(position.size || 0);
+        if (!Number.isFinite(nativeSize) || nativeSize === 0) {
+            return null;
+        }
+
+        const multiplier = this.getMultiplierOrThrow(gateSymbol, symbol);
+        const baseAmount = Math.abs(nativeSize) * multiplier;
+
+        return {
+            symbol,
+            // Trader closes positions with `contracts ?? amount`, so both fields
+            // intentionally carry base amount for Gate.
+            contracts: baseAmount,
+            amount: baseAmount,
+            side: nativeSize > 0 ? 'long' : 'short',
+            entryPrice: Number(position.entry_price || 0),
+            raw: position,
+        };
     }
 
     private sign(method: string, endpoint: string, query: string, payload: string): Record<string, string> {

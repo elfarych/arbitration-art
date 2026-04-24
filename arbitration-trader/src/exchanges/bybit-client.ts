@@ -198,6 +198,13 @@ export class BybitClient implements IExchangeClient {
             .filter((position): position is ExchangePosition => position !== null);
     }
 
+    async fetchAllOpenPositions(): Promise<ExchangePosition[]> {
+        const positions = await this.fetchPositionList({ category: CATEGORY, settleCoin: SETTLE_COIN, limit: 200 });
+        return positions
+            .map(position => this.normalizePosition(position, null))
+            .filter((position): position is ExchangePosition => position !== null);
+    }
+
     async loadMarkets(): Promise<void> {
         this.markets.clear();
 
@@ -461,13 +468,13 @@ export class BybitClient implements IExchangeClient {
         return positions;
     }
 
-    private normalizePosition(position: BybitPosition, requested: Set<string>): ExchangePosition | null {
+    private normalizePosition(position: BybitPosition, requested: Set<string> | null): ExchangePosition | null {
         if (!position.symbol?.endsWith(SETTLE_COIN)) {
             return null;
         }
 
         const symbol = bybitToUnified(position.symbol);
-        if (!requested.has(symbol)) {
+        if (requested && !requested.has(symbol)) {
             return null;
         }
 

@@ -19,6 +19,10 @@ export function registerProcessShutdown(runtimeManager: RuntimeManager, serverRe
             await runtimeManager.shutdown();
         } catch (error: any) {
             logger.error(TAG, `Runtime shutdown failed: ${error.message}`);
+            logger.error(TAG, 'Process remains alive so the active runtime can keep retrying close/reconciliation.');
+            process.exitCode = exitCode === 0 ? 1 : exitCode;
+            isShuttingDown = false;
+            return;
         }
 
         try {

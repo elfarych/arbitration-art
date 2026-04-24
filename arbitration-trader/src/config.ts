@@ -79,6 +79,18 @@ export const config = {
     djangoApiUrl: process.env.DJANGO_API_URL || 'http://127.0.0.1:8000/api',
     port: Number(process.env.PORT || '3002'),
     serviceToken: requireEnv('SERVICE_SHARED_TOKEN'),
+    allowProductionTrading: process.env.ALLOW_PRODUCTION_TRADING === 'true',
+    traderEnvironment: process.env.TRADER_ENVIRONMENT || 'development',
+    productionTradingEnvironment: process.env.PRODUCTION_TRADING_ENVIRONMENT || 'production',
+    publicHealthDetails: process.env.PUBLIC_HEALTH_DETAILS === 'true',
+    processLockPath: process.env.TRADER_PROCESS_LOCK_PATH || 'locks/trader-runtime.lock',
+    executionJournalPath: process.env.EXECUTION_JOURNAL_PATH || 'logs/execution-journal.jsonl',
+    failOnUnresolvedExecutionJournal: process.env.FAIL_ON_UNRESOLVED_EXECUTION_JOURNAL !== 'false',
+    productionAccountFingerprintAllowlist: parseCsvSet(process.env.PRODUCTION_ACCOUNT_FINGERPRINTS),
+    maxProductionTradeAmountUsdt: parseOptionalPositiveNumber(process.env.MAX_PRODUCTION_TRADE_AMOUNT_USDT),
+    maxProductionConcurrentTrades: parseOptionalPositiveInteger(process.env.MAX_PRODUCTION_CONCURRENT_TRADES),
+    maxProductionLeverage: parseOptionalPositiveInteger(process.env.MAX_PRODUCTION_LEVERAGE),
+    positionSizeTolerancePercent: parseOptionalPositiveNumber(process.env.POSITION_SIZE_TOLERANCE_PERCENT) ?? 0.1,
 
     get runtimeConfigId(): number {
         return requireActiveRuntime().runtime_config_id;
@@ -204,3 +216,38 @@ export const config = {
         return process.env.SHADOW_SIGNAL_LOG_PATH || 'logs/shadow-signals.jsonl';
     },
 } as const;
+
+function parseCsvSet(value: string | undefined): Set<string> {
+    return new Set(
+        (value || '')
+            .split(',')
+            .map(item => item.trim())
+            .filter(Boolean),
+    );
+}
+
+function parseOptionalPositiveNumber(value: string | undefined): number | null {
+    if (value === undefined || value.trim() === '') {
+        return null;
+    }
+
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed) || parsed <= 0) {
+        throw new Error(`[Config] Expected a positive finite number, got: ${value}`);
+    }
+
+    return parsed;
+}
+
+function parseOptionalPositiveInteger(value: string | undefined): number | null {
+    const parsed = parseOptionalPositiveNumber(value);
+    if (parsed === null) {
+        return null;
+    }
+
+    if (!Number.isInteger(parsed)) {
+        throw new Error(`[Config] Expected a positive integer, got: ${value}`);
+    }
+
+    return parsed;
+}

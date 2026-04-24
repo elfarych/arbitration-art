@@ -3,9 +3,13 @@ import assert from 'node:assert/strict';
 import {
     calculateOpenSpread,
     calculateRealPnL,
+    calculateRealPnLByLegSizes,
     calculateTruePnL,
     calculateVWAP,
     checkLegDrawdown,
+    commonDecimalStep,
+    decimalPlaces,
+    roundDownToStep,
 } from '../src/utils/math.js';
 
 test('calculateOpenSpread returns directional spread', () => {
@@ -37,6 +41,13 @@ test('calculateRealPnL subtracts real commissions', () => {
     assert.equal(result.profitPercentage, 3.75);
 });
 
+test('calculateRealPnLByLegSizes supports mismatched leg sizes', () => {
+    const result = calculateRealPnLByLegSizes(100, 103, 102, 101, 2, 1, 'buy', 0.5);
+
+    assert.equal(result.profitUsdt, 5.5);
+    assert.equal(result.profitPercentage, 2.75);
+});
+
 test('calculateVWAP rejects insufficient non-emergency depth', () => {
     assert.equal(Number.isNaN(calculateVWAP([[100, 1]], 2)), true);
     assert.equal(calculateVWAP([[100, 1]], 2, true), 100);
@@ -51,4 +62,10 @@ test('checkLegDrawdown returns worst leveraged losing leg', () => {
     );
 
     assert.equal(drawdown, 50);
+});
+
+test('decimal lot helpers support non-power-of-ten and non-divisible steps', () => {
+    assert.equal(decimalPlaces(0.0005), 4);
+    assert.equal(commonDecimalStep(0.002, 0.003), 0.006);
+    assert.equal(roundDownToStep(1.2349, 0.0005), 1.2345);
 });

@@ -197,34 +197,20 @@ export class MexcClient implements IExchangeClient {
             return [];
         }
 
-        const requested = new Set(symbols);
         const results: ExchangePosition[] = [];
 
         for (const symbol of symbols) {
             const mexcSymbol = unifiedToMexc(symbol);
-            const contractSize = this.getContractSizeOrThrow(mexcSymbol, symbol);
 
             try {
                 const positions = await this.fetchNativePositions(mexcSymbol);
                 for (const position of positions) {
-                    if (position.symbol !== mexcSymbol || !requested.has(symbol)) {
+                    const normalized = this.normalizePosition(position, symbol);
+                    if (!normalized) {
                         continue;
                     }
 
-                    const contracts = Math.abs(Number(position.holdVol || 0));
-                    if (!Number.isFinite(contracts) || contracts <= 0) {
-                        continue;
-                    }
-
-                    const amount = contracts * contractSize;
-                    results.push({
-                        symbol,
-                        contracts,
-                        amount,
-                        side: position.positionType === POSITION_TYPE_SHORT ? 'short' : 'long',
-                        entryPrice: Number(position.holdAvgPrice ?? position.openAvgPrice ?? 0),
-                        raw: position,
-                    });
+                    results.push(normalized);
                 }
             } catch (error: any) {
                 const message = this.formatError(error);
@@ -234,6 +220,13 @@ export class MexcClient implements IExchangeClient {
         }
 
         return results;
+    }
+
+    async fetchAllOpenPositions(): Promise<ExchangePosition[]> {
+        const positions = await this.fetchNativePositions();
+        return positions
+            .map(position => this.normalizePosition(position))
+            .filter((position): position is ExchangePosition => position !== null);
     }
 
     async loadMarkets(): Promise<void> {
@@ -491,14 +484,43 @@ export class MexcClient implements IExchangeClient {
         return new MexcApiError(code, `MEXC API Error ${code ?? 'unknown'}: ${message}`, payload);
     }
 
-    private async fetchNativePositions(mexcSymbol: string): Promise<MexcPosition[]> {
+    private async fetchNativePositions(mexcSymbol?: string): Promise<MexcPosition[]> {
+        const params = mexcSymbol ? { symbol: mexcSymbol } : {};
         const data = await this.request<MexcPosition[] | MexcPosition>(
             'GET',
             '/api/v1/private/position/open_positions',
-            { symbol: mexcSymbol },
+            params,
         );
 
         return Array.isArray(data) ? data : [data].filter(Boolean);
+    }
+
+    private normalizePosition(position: MexcPosition, expectedSymbol?: string): ExchangePosition | null {
+        if (!position.symbol) {
+            return null;
+        }
+
+        const symbol = expectedSymbol ?? mexcToUnified(position.symbol);
+        if (expectedSymbol && unifiedToMexc(expectedSymbol) !== position.symbol) {
+            return null;
+        }
+
+        const contracts = Math.abs(Number(position.holdVol || 0));
+        if (!Number.isFinite(contracts) || contracts <= 0) {
+            return null;
+        }
+
+        const contractSize = this.getContractSizeOrThrow(position.symbol, symbol);
+        const amount = contracts * contractSize;
+
+        return {
+            symbol,
+            contracts,
+            amount,
+            side: position.positionType === POSITION_TYPE_SHORT ? 'short' : 'long',
+            entryPrice: Number(position.holdAvgPrice ?? position.openAvgPrice ?? 0),
+            raw: position,
+        };
     }
 
     private async changeLeverageForSide(

@@ -1,139 +1,119 @@
-# 🚀 Руководство по деплою Arbitration Trader на Linux (Ubuntu / Fedora)
+# Руководство по деплою Arbitration Trader на Linux
 
-При развертывании высокочастотного арбитражного бота на арендованном Linux-сервере (VPS) критически важно обеспечить три вещи: **Абсолютно точное системное время**, **надежный менеджер процессов (PM2)** и **правильное окружение**.
+`arbitration-trader` - standalone Node.js/TypeScript сервис реальной торговли. Он не хранит биржевые ключи в `.env`: ключи и торговые параметры приходят из Django runtime payload. Локальный `.env` содержит инфраструктурные переменные процесса, safety guards, пути lock/journal и production caps.
 
-Ниже представлена пошаговая инструкция от запуска "голого" сервера до работающего бота.
+## 1. Системное время
 
----
+Для signed exchange REST API требуется точное время сервера. На Ubuntu/Debian:
 
-## Шаг 1. Первичная настройка и синхронизация времени (КРИТИЧНО)
-
-Если часы сервера разойдутся с API-шлюзами Binance/Bybit хотя бы на 500 миллисекунд — ваши ордера будут отклоняться с ошибкой `Timestamp for this request is outside of the recvWindow`.
-
-### Настройка времени для ОС Ubuntu / Debian:
 ```bash
-# 1. Запустить обновление пакетов
-sudo apt update && sudo apt upgrade -y
-
-# 2. Включить аппаратную встроенную синхронизацию (systemd)
-sudo timedatectl set-ntp true
-
-# 3. (Опционально, но рекомендуется) Установить Chrony для сверхточной синхронизации
-sudo apt install chrony -y
+sudo apt update
+sudo apt install -y chrony
 sudo systemctl enable --now chrony
-```
-
-### Настройка времени для ОС Fedora / CentOS / RHEL:
-```bash
-# 1. Запустить обновление
-sudo dnf update -y
-
-# 2. Установить и запустить Chrony
-sudo dnf install chrony -y
-sudo systemctl enable --now chronyd
-```
-
-### Проверка часов (Для любой ОС):
-Выполните команду отслеживания. Значение `System time` отклонения должно быть в пределах `0.000...` секунд.
-```bash
 chronyc tracking
 ```
 
----
+Отклонение должно быть минимальным. Ошибки времени приводят к отказам signed requests и могут оставить runtime без возможности быстро закрыть позицию.
 
-## Шаг 2. Установка Node.js и pnpm
+## 2. Node.js и зависимости
 
-Бот написан на TypeScript под современный стек. Рекомендуется использовать Node.js версии 20.x (LTS).
+Используйте Node.js версии, совместимой с текущим проектом, и `pnpm`.
 
 ```bash
-# 1. Установите cURL (если нет)
-sudo apt install curl -y # Ubuntu
-# sudo dnf install curl -y # Fedora
-
-# 2. Установите Node.js 20.x через NodeSource
-curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
-sudo apt install -y nodejs # Ubuntu
-# sudo dnf install -y nodejs # Fedora
-
-# 3. Установка пакетного менеджера pnpm и TypeScript глобально
-sudo npm install -g pnpm typescript tsx
+sudo apt install -y curl
+curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
+sudo apt install -y nodejs
+sudo npm install -g pnpm
 ```
 
----
-
-## Шаг 3. Деплой проекта и установка зависимостей
-
-Перенесите файлы проекта на ваш сервер (через `git clone`, `scp` или FTP) в папку, например, `/var/www/arbitration-trader`.
+Установка проекта:
 
 ```bash
-# 1. Перейдите в папку проекта
 cd /var/www/arbitration-trader
-
-# 2. Установите все зависимости без генерации package-lock.json
 pnpm install
+pnpm run build
+pnpm test
 ```
 
----
+## 3. `.env`
 
-## Шаг 4. Конфигурация (.env)
-
-На боевом сервере вам потребуются **боевые (Mainnet)** API-ключи, и нужно отключить режим песочницы.
+Создайте `.env` из `.env.example`:
 
 ```bash
-# Создайте копию конфига
 cp .env.example .env
-
-# Откройте конфиг в редакторе nano
 nano .env
 ```
 
-Внутри файла обязательно убедитесь в правильности ключей:
+Минимальный набор:
+
 ```env
-# CRITICAL: Отключение песочницы для реальной торговли
-USE_TESTNET=false
-
-# Вставьте ваши реальные ключи от счетов Futures/Derivatives
-BINANCE_API_KEY=ваш_реальный_ключ
-BINANCE_SECRET_KEY=ваш_реальный_секрет
-
-BYBIT_API_KEY=ваш_реальный_ключ
-BYBIT_SECRET_KEY=ваш_реальный_секрет
-
-# Укажите IP-адрес вашего Django-бэкенда (если он на другом сервере)
-DJANGO_API_URL=http://ваш-айпи:8000/api
+DJANGO_API_URL=http://127.0.0.1:8000/api
+SERVICE_SHARED_TOKEN=replace-with-strong-shared-token
+PORT=3002
+SHADOW_SIGNAL_LOG_PATH=logs/shadow-signals.jsonl
+EXECUTION_JOURNAL_PATH=logs/execution-journal.jsonl
+TRADER_PROCESS_LOCK_PATH=locks/trader-runtime.lock
+PUBLIC_HEALTH_DETAILS=false
+FAIL_ON_UNRESOLVED_EXECUTION_JOURNAL=true
+POSITION_SIZE_TOLERANCE_PERCENT=0.1
+ALLOW_PRODUCTION_TRADING=false
+TRADER_ENVIRONMENT=development
+PRODUCTION_TRADING_ENVIRONMENT=production
+PRODUCTION_ACCOUNT_FINGERPRINTS=
+MAX_PRODUCTION_TRADE_AMOUNT_USDT=
+MAX_PRODUCTION_CONCURRENT_TRADES=
+MAX_PRODUCTION_LEVERAGE=
 ```
-*(Для сохранения в nano: нажмите `Ctrl+O`, затем `Enter`, затем `Ctrl+X`)*
 
----
+В `.env` не должны находиться `BINANCE_API_KEY`, `BINANCE_SECRET_KEY`, `BYBIT_API_KEY`, `BYBIT_SECRET_KEY`, `GATE_*` или `MEXC_*`. Эти значения приходят из Django payload для конкретного `TraderRuntimeConfig`.
 
-## Шаг 5. Запуск через PM2 (Продакшн)
+`ALLOW_PRODUCTION_TRADING=false` блокирует runtime payload с `use_testnet=false`. Для production процесса live payload принимается только когда дополнительно настроены `TRADER_ENVIRONMENT=production`, allowlist `PRODUCTION_ACCOUNT_FINGERPRINTS` для выбранной пары API keys и hard caps `MAX_PRODUCTION_TRADE_AMOUNT_USDT`, `MAX_PRODUCTION_CONCURRENT_TRADES`, `MAX_PRODUCTION_LEVERAGE`. Переключать live guards можно только после отдельной операционной подготовки: выделенный аккаунт, ограниченный баланс, private network/firewall, проверенный `SERVICE_SHARED_TOKEN`, monitoring/alerts и runbook для stuck positions.
 
-Вы не можете просто написать `tsx src/main.ts` — если вы закроете терминал (SSH-клиент), бот умрет. Нам нужен демонизатор процессов `PM2`.
+## 4. Запуск через PM2
 
 ```bash
-# 1. Установите PM2 глобально
 sudo npm install -g pm2
-
-# 2. Скомпилируйте TypeScript проект в чистый JavaScript (папка dist/)
+cd /var/www/arbitration-trader
 pnpm run build
-
-# 3. Запустите бота через PM2
-pm2 start dist/main.js --name "arbitration-trader"
-
-# 4. Добавьте PM2 в автозагрузку (чтобы бот поднимался сам при ребуте VPS)
-pm2 startup
-# (PM2 выдаст длинную команду в терминале, скопируйте её и выполните)
+pm2 start dist/main.js --name arbitration-trader --time
 pm2 save
+pm2 startup
 ```
 
----
+Команды:
 
-## 🛠 Полезные команды для администрирования
+```bash
+pm2 logs arbitration-trader
+pm2 monit
+pm2 restart arbitration-trader
+```
 
-- `pm2 logs arbitration-trader` — смотреть логи торговли в реальном времени.
-- `pm2 stop arbitration-trader` — временно остановить бота.
-- `pm2 restart arbitration-trader` — перезагрузить бота (например, если изменили файл `.env`).
-- `pm2 monit` — классная консольная утилита мониторинга ОЗУ и CPU процесса.
+Не запускайте несколько PM2 instances на один и тот же exchange account. `TRADER_PROCESS_LOCK_PATH` защищает только один host/deployment directory; для нескольких серверов нужен внешний DB/Redis lock.
 
-> [!IMPORTANT] 
-> Если вы вносите правки в код на локальном компьютере, не забудьте после переноса файлов на Linux-сервер обязательно писать `pnpm run build` перед тем как делать `pm2 restart arbitration-trader`. PM2 в продакшене запускает именно скомпилированный JS-билд из папки `/dist`, а не сырой TypeScript!
+## 5. Health и stop behavior
+
+`GET /health` без `X-Service-Token` возвращает только public-safe `{ success: true, status: "ok" }`, если `PUBLIC_HEALTH_DETAILS=false`. Детальный `GET /health` с `X-Service-Token` возвращает:
+
+- `active_runtime_config_id`;
+- `runtime_state`: `idle`, `running`, `risk_locked`, `stopping_with_open_exposure`;
+- `risk_locked`;
+- `risk_incidents`;
+- `open_exposure`.
+
+`POST /engine/trader/stop` не считается успешным, если позиции, pending close sync или unmanaged exposure не подтверждены как закрытые/синхронизированные. В таком случае runtime остается активным, блокирует новые входы и продолжает retry cleanup/close sync. PM2 или внешний supervisor не должен принудительно убивать процесс до flat/reconciled состояния.
+
+## 6. Production checklist
+
+Перед реальными деньгами:
+
+1. Проверить `pnpm run build` и `pnpm test`.
+2. Проверить детальный `/health` с `X-Service-Token` и service-token auth из Django.
+3. Запустить testnet/shadow mode.
+4. Проверить exchange health для выбранного runtime config.
+5. Проверить, что `EXECUTION_JOURNAL_PATH` и `TRADER_PROCESS_LOCK_PATH` находятся на persistent disk и доступны пользователю PM2.
+6. Настроить production account fingerprint allowlist и hard caps.
+7. Сделать private smoke с минимальным размером и заранее ограниченным балансом.
+8. Настроить firewall/private network/reverse proxy так, чтобы control plane не был публичным.
+9. Настроить alerts на `risk_locked=true`, `runtime_state=stopping_with_open_exposure`, pending close sync и частые stale orderbooks.
+
+Оставшиеся production blockers описаны в `DOCS.md`: database-backed execution ledger/state machine, external distributed account lock, полноценный metrics endpoint и max daily/session loss controls.

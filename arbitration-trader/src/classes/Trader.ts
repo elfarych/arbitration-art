@@ -1,13 +1,15 @@
-import { calculateOpenSpread, calculateTruePnL, calculateRealPnL, d, checkLegDrawdown, calculateVWAP } from '../utils/math.js';
+import { calculateOpenSpread, calculateTruePnL, calculateRealPnL, calculateRealPnLByLegSizes, d, checkLegDrawdown, calculateVWAP, roundDownToStep } from '../utils/math.js';
 import { api } from '../services/api.js';
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
 import { CloseSyncService } from '../services/close-sync-service.js';
+import { executionJournal } from '../services/execution-journal.js';
 import { fetchConfirmedPosition } from '../services/position-recovery.js';
 import { shadowRecorder } from '../services/shadow-recorder.js';
 import { SignalEngine } from '../services/signal-engine.js';
 import type { IExchangeClient } from '../exchanges/exchange-client.js';
 import type { MarketInfoService } from '../services/market-info.js';
+import type { RuntimeRiskLock } from './risk-lock.js';
 import type { TradeCounter } from './TradeCounter.js';
 import { createPairState, type CloseTriggerReason, type PairState } from './trade-state.js';
 import type {
@@ -20,6 +22,8 @@ import type {
 
 const COOLDOWN_MS = 30_000; // 30s cooldown after failed order
 const TIMEOUT_CHECK_INTERVAL_MS = 10_000; // Check timeouts every 10s
+const UNMANAGED_CLEANUP_RETRY_MS = 10_000;
+const RECONCILIATION_INTERVAL_MS = 60_000;
 
 /**
  * Watches a chunk of symbols and executes arbitrage trades for that chunk.
@@ -33,10 +37,12 @@ export class Trader {
     private isRunning = true;
     private states: Map<string, PairState> = new Map();
     private timeoutTimer: ReturnType<typeof setInterval> | null = null;
+    private reconciliationTimer: ReturnType<typeof setInterval> | null = null;
     private unsubscribeCallbacks: Array<() => void> = [];
     private scheduledChecks = new Set<string>();
     private runningChecks = new Set<string>();
     private stopResolve: (() => void) | null = null;
+    private isStopping = false;
     private readonly signalEngine = new SignalEngine();
     private readonly closeSync: CloseSyncService;
 
@@ -49,6 +55,7 @@ export class Trader {
         private secondaryClient: IExchangeClient,
         private marketInfo: MarketInfoService,
         private tradeCounter: TradeCounter,
+        private riskLock: RuntimeRiskLock,
         private entryDisabledSymbols: Set<string> = new Set(),
     ) {
         this.tag = `Trader-${id}`;
@@ -67,14 +74,25 @@ export class Trader {
         for (const trade of openTrades) {
             const sym = trade.coin;
             const state = this.states.get(sym);
-            if (state && !state.activeTrade) {
-                // Reserve a global slot because restored trades already occupy
-                // real exchange exposure and must count toward concurrency.
-                state.activeTrade = trade;
-                state.openedAtMs = new Date(trade.opened_at).getTime();
-                this.tradeCounter.forceReserve();
-                logger.info(this.tag, `♻️ Restored open trade ${sym} (ID: ${trade.id}, ${trade.order_type})`);
+            if (!state) {
+                continue;
             }
+
+            if (state.activeTrade) {
+                throw new Error(`Duplicate restored open trade for ${sym}: ${state.activeTrade.id} and ${trade.id}.`);
+            }
+
+            const openedAtMs = new Date(trade.opened_at).getTime();
+            if (!Number.isFinite(openedAtMs) || openedAtMs <= 0) {
+                throw new Error(`Open trade ${trade.id} for ${sym} has invalid opened_at: ${trade.opened_at}`);
+            }
+
+            // Reserve a global slot because restored trades already occupy
+            // real exchange exposure and must count toward concurrency.
+            state.activeTrade = trade;
+            state.openedAtMs = openedAtMs;
+            this.tradeCounter.forceReserve();
+            logger.info(this.tag, `♻️ Restored open trade ${sym} (ID: ${trade.id}, ${trade.order_type})`);
         }
     }
 
@@ -145,10 +163,14 @@ export class Trader {
     public async start(): Promise<void> {
         logger.info(this.tag, `Starting loops for ${this.symbols.length} pairs...`);
         this.isRunning = true;
+        this.isStopping = false;
 
         // Start the timeout watchdog separately from websocket ticks so positions
         // can be closed even when a symbol stops receiving frequent book updates.
         this.timeoutTimer = setInterval(() => this.checkTimeouts(), TIMEOUT_CHECK_INTERVAL_MS);
+        this.reconciliationTimer = setInterval(() => {
+            void this.reconcileTrackedPositions();
+        }, RECONCILIATION_INTERVAL_MS);
 
         const handleUpdate = (symbol: string) => {
             if (this.states.has(symbol)) {
@@ -173,6 +195,42 @@ export class Trader {
      * Stop the trader. If closePositions is true, close all active positions on exchanges.
      */
     public async stop(closePositions: boolean = false): Promise<void> {
+        if (closePositions) {
+            // Stop accepting entries first, but keep timers and subscriptions
+            // alive until all exposure is confirmed flat or synced.
+            this.isStopping = true;
+            await this.closeAllPositions('shutdown');
+            if (this.riskLock.isLocked) {
+                throw new Error('Runtime risk lock is active; trader remains online for reconciliation.');
+            }
+        }
+
+        this.finishStop();
+    }
+
+    public hasOpenExposure(): boolean {
+        return this.getExposureSummary().length > 0;
+    }
+
+    public getExposureSummary(): string[] {
+        const result: string[] = [];
+
+        for (const [symbol, state] of this.states.entries()) {
+            if (state.activeTrade) {
+                result.push(`${symbol}:active_trade`);
+            }
+            if (state.pendingCloseSync) {
+                result.push(`${symbol}:pending_close_sync`);
+            }
+            if (state.unmanagedExposure) {
+                result.push(`${symbol}:unmanaged_exposure`);
+            }
+        }
+
+        return result;
+    }
+
+    private finishStop(): void {
         this.isRunning = false;
 
         if (this.timeoutTimer) {
@@ -180,16 +238,15 @@ export class Trader {
             this.timeoutTimer = null;
         }
 
+        if (this.reconciliationTimer) {
+            clearInterval(this.reconciliationTimer);
+            this.reconciliationTimer = null;
+        }
+
         for (const unsubscribe of this.unsubscribeCallbacks) {
             unsubscribe();
         }
         this.unsubscribeCallbacks = [];
-
-        if (closePositions) {
-            // Used during graceful shutdown to flatten all active positions before
-            // the process exits.
-            await this.closeAllPositions('shutdown');
-        }
 
         this.stopResolve?.();
         this.stopResolve = null;
@@ -268,6 +325,11 @@ export class Trader {
         // busy flag prevents duplicate open/close operations.
         if (state.busy) return;
 
+        if (state.unmanagedExposure) {
+            await this.retryUnmanagedExposureCleanup(symbol, state);
+            return;
+        }
+
         if (state.pendingCloseSync) {
             await this.flushPendingClose(symbol, state);
             return;
@@ -290,10 +352,7 @@ export class Trader {
             if (!currentPrice) return;
 
             const rawAmount = config.tradeAmountUsdt / currentPrice;
-            // Floor using stepSize with floating-point error compensation.
-            let amount = Math.floor((rawAmount / info.stepSize) + 1e-9) * info.stepSize;
-            const precision = Math.max(0, Math.round(-Math.log10(info.stepSize)));
-            targetCoins = parseFloat(amount.toFixed(precision));
+            targetCoins = roundDownToStep(rawAmount, info.stepSize);
 
             if (targetCoins < info.minQty || (targetCoins * currentPrice) < info.minNotional) {
                 // Not enough budget to meet exchange lot/notional requirements.
@@ -312,6 +371,10 @@ export class Trader {
         }
 
         if (!state.canOpenNewTrades) {
+            return;
+        }
+
+        if (this.isStopping || this.riskLock.isLocked) {
             return;
         }
 
@@ -363,8 +426,14 @@ export class Trader {
     ) {
         state.busy = true;
         let slotReserved = false;
+        let ordersMayHaveReachedExchange = false;
+        const openIntentId = executionJournal.createIntentId('open', symbol);
 
         try {
+            if (this.isStopping || this.riskLock.isLocked) {
+                return;
+            }
+
             if (config.shadowMode) {
                 await shadowRecorder.recordEntrySignal({
                     symbol,
@@ -391,12 +460,28 @@ export class Trader {
 
             logger.info(this.tag, `🔴 OPENING ${symbol} (${orderType}), amount: ${amount}, spread: ${spread.toFixed(3)}%, expected net edge: ${expectedNetEdge.toFixed(3)}%`);
 
+            await executionJournal.record(openIntentId, 'open', 'open_intent', symbol, {
+                order_type: orderType,
+                amount,
+                spread: d(spread, 4),
+                expected_net_edge: d(expectedNetEdge, 4),
+                funding_cost_percent: d(fundingCostPercent, 4),
+            });
+
             // Determine order sides for each exchange.
             const primarySide = orderType === 'buy' ? 'buy' : 'sell';
             const secondarySide = orderType === 'buy' ? 'sell' : 'buy';
 
+            await this.assertNoUnexpectedPositions(symbol, state);
+
             // Execute both legs concurrently to reduce legging risk. allSettled
             // lets us inspect partial success and flatten any filled leg.
+            ordersMayHaveReachedExchange = true;
+            await executionJournal.record(openIntentId, 'open', 'open_orders_submitting', symbol, {
+                primary_side: primarySide,
+                secondary_side: secondarySide,
+                amount,
+            });
             const [pSettled, sSettled] = await Promise.allSettled([
                 this.primaryClient.createMarketOrder(symbol, primarySide, amount),
                 this.secondaryClient.createMarketOrder(symbol, secondarySide, amount),
@@ -407,6 +492,13 @@ export class Trader {
                 
                 // Roll back the leg that actually opened.
                 if (pSettled.status === 'fulfilled') {
+                    await executionJournal.record(openIntentId, 'open', 'open_leg_filled', symbol, {
+                        leg: 'primary',
+                        order_id: pSettled.value.orderId,
+                        filled_qty: pSettled.value.filledQty,
+                        avg_price: pSettled.value.avgPrice,
+                        commission: pSettled.value.commission,
+                    });
                     const revSide = primarySide === 'buy' ? 'sell' : 'buy';
                     // reduceOnly is critical to avoid opening a new opposite
                     // margin position during rollback.
@@ -414,6 +506,13 @@ export class Trader {
                         .catch((error: any) => logger.error(this.tag, `Primary rollback failed for ${symbol}: ${error.message}`));
                 }
                 if (sSettled.status === 'fulfilled') {
+                    await executionJournal.record(openIntentId, 'open', 'open_leg_filled', symbol, {
+                        leg: 'secondary',
+                        order_id: sSettled.value.orderId,
+                        filled_qty: sSettled.value.filledQty,
+                        avg_price: sSettled.value.avgPrice,
+                        commission: sSettled.value.commission,
+                    });
                     const revSide = secondarySide === 'buy' ? 'sell' : 'buy';
                     await this.secondaryClient.createMarketOrder(symbol, revSide, sSettled.value.filledQty, { reduceOnly: true })
                         .catch((error: any) => logger.error(this.tag, `Secondary rollback failed for ${symbol}: ${error.message}`));
@@ -422,10 +521,12 @@ export class Trader {
                 // Insurance against network timeout: an order may have filled
                 // even if the API call rejected before returning its response.
                 await new Promise(r => setTimeout(r, 1000)); 
-                await this.safeHandleOpenCleanup(symbol, orderType);
+                const cleanupSucceeded = await this.safeHandleOpenCleanupWithRiskLock(symbol, state, orderType, slotReserved, openIntentId);
 
-                if (slotReserved) {
+                if (cleanupSucceeded && slotReserved) {
                     this.tradeCounter.release();
+                    slotReserved = false;
+                } else if (!cleanupSucceeded) {
                     slotReserved = false;
                 }
                 state.cooldownUntil = Date.now() + COOLDOWN_MS;
@@ -434,6 +535,23 @@ export class Trader {
 
             const primaryResult = pSettled.value;
             const secondaryResult = sSettled.value;
+
+            await Promise.all([
+                executionJournal.record(openIntentId, 'open', 'open_leg_filled', symbol, {
+                    leg: 'primary',
+                    order_id: primaryResult.orderId,
+                    filled_qty: primaryResult.filledQty,
+                    avg_price: primaryResult.avgPrice,
+                    commission: primaryResult.commission,
+                }),
+                executionJournal.record(openIntentId, 'open', 'open_leg_filled', symbol, {
+                    leg: 'secondary',
+                    order_id: secondaryResult.orderId,
+                    filled_qty: secondaryResult.filledQty,
+                    avg_price: secondaryResult.avgPrice,
+                    commission: secondaryResult.commission,
+                }),
+            ]);
 
             // Some exchange APIs initially return 0.00 average price for instant
             // market orders. Fall back to pre-order VWAP for persistence.
@@ -474,6 +592,18 @@ export class Trader {
             state.openedAtMs = Date.now();
             slotReserved = false;
 
+            await executionJournal.record(openIntentId, 'open', 'open_django_synced', symbol, {
+                trade_id: tradeRecord.id,
+            }).catch((journalError: any) => {
+                state.canOpenNewTrades = false;
+                this.riskLock.lock(
+                    this.executionJournalRiskKey(symbol),
+                    'execution_journal_failed',
+                    journalError.message,
+                );
+                logger.error(this.tag, `Open trade ${tradeRecord.id} is in Django, but execution journal sync failed for ${symbol}: ${journalError.message}`);
+            });
+
             logger.info(this.tag, `✅ Opened ${symbol} (${orderType}). DB ID: ${tradeRecord.id}, ${this.primaryClient.name}: ${pPriceSafe}, ${this.secondaryClient.name}: ${sPriceSafe}`);
 
         } catch (e: any) {
@@ -482,7 +612,16 @@ export class Trader {
             // Atomic safety: if an order failed, or if Django API failed after
             // orders were placed, close any opened positions to avoid naked
             // exposure.
-            await this.safeHandleOpenCleanup(symbol, orderType);
+            if (ordersMayHaveReachedExchange) {
+                const cleanupSucceeded = await this.safeHandleOpenCleanupWithRiskLock(symbol, state, orderType, slotReserved, openIntentId);
+                if (!cleanupSucceeded) {
+                    slotReserved = false;
+                }
+            } else {
+                await executionJournal.record(openIntentId, 'open', 'open_aborted_before_orders', symbol, {
+                    error: e.message,
+                }).catch((journalError: any) => logger.error(this.tag, `Failed to append execution journal: ${journalError.message}`));
+            }
 
             if (slotReserved) {
                 this.tradeCounter.release();
@@ -500,8 +639,11 @@ export class Trader {
      * Safety cleanup: if open fails for any reason (execution error, Django error),
      * check positions on both exchanges and close them to avoid naked exposure.
      */
-    private async handleOpenCleanup(symbol: string, orderType: 'buy' | 'sell') {
+    private async handleOpenCleanup(symbol: string, orderType: 'buy' | 'sell', intentId?: string) {
         logger.warn(this.tag, `⚠️ Cleanup triggered for ${symbol}. Checking for dangling positions...`);
+        if (intentId) {
+            await executionJournal.record(intentId, 'open', 'cleanup_started', symbol, { order_type: orderType });
+        }
 
         // Query both exchanges rather than trusting local promise results. This
         // covers the case where an API request times out after the exchange filled.
@@ -518,7 +660,16 @@ export class Trader {
                     const size = Math.abs(Number(pos.amount ?? pos.contracts ?? 0));
                     if (size > 0 && size >= minQty) {
                         const side = pos.side === 'long' ? 'sell' : 'buy';
-                        await this.primaryClient.createMarketOrder(symbol, side, size, { reduceOnly: true });
+                        const result = await this.primaryClient.createMarketOrder(symbol, side, size, { reduceOnly: true });
+                        if (intentId) {
+                            await executionJournal.record(intentId, 'open', 'open_leg_filled', symbol, {
+                                leg: 'primary_cleanup',
+                                order_id: result.orderId,
+                                filled_qty: result.filledQty,
+                                avg_price: result.avgPrice,
+                                commission: result.commission,
+                            });
+                        }
                         logger.info(this.tag, `🧹 Cleaned up ${this.primaryClient.name} position for ${symbol}`);
                     }
                 }
@@ -536,7 +687,16 @@ export class Trader {
                     const size = Math.abs(Number(pos.amount ?? pos.contracts ?? 0));
                     if (size > 0 && size >= minQty) {
                         const side = pos.side === 'long' ? 'sell' : 'buy';
-                        await this.secondaryClient.createMarketOrder(symbol, side, size, { reduceOnly: true });
+                        const result = await this.secondaryClient.createMarketOrder(symbol, side, size, { reduceOnly: true });
+                        if (intentId) {
+                            await executionJournal.record(intentId, 'open', 'open_leg_filled', symbol, {
+                                leg: 'secondary_cleanup',
+                                order_id: result.orderId,
+                                filled_qty: result.filledQty,
+                                avg_price: result.avgPrice,
+                                commission: result.commission,
+                            });
+                        }
                         logger.info(this.tag, `🧹 Cleaned up ${this.secondaryClient.name} position for ${symbol}`);
                     }
                 }
@@ -549,18 +709,135 @@ export class Trader {
                 throw new Error(cleanupErrors.join('; '));
             }
 
+            if (intentId) {
+                await executionJournal.record(intentId, 'open', 'cleanup_completed', symbol);
+            }
+
         } catch (cleanupErr: any) {
             logger.error(this.tag, `❌ CRITICAL: Cleanup error for ${symbol}: ${cleanupErr.message}`);
+            if (intentId) {
+                await executionJournal.record(intentId, 'open', 'cleanup_failed', symbol, {
+                    error: cleanupErr.message,
+                }).catch((journalError: any) => logger.error(this.tag, `Failed to append execution journal: ${journalError.message}`));
+            }
             throw cleanupErr;
         }
     }
 
-    private async safeHandleOpenCleanup(symbol: string, orderType: 'buy' | 'sell'): Promise<void> {
+    // ───────────── Private: Risk Lock / Cleanup ─────────────
+
+    private async safeHandleOpenCleanupWithRiskLock(
+        symbol: string,
+        state: PairState,
+        orderType: 'buy' | 'sell',
+        slotReserved: boolean,
+        intentId?: string,
+    ): Promise<boolean> {
         try {
-            await this.handleOpenCleanup(symbol, orderType);
+            await this.handleOpenCleanup(symbol, orderType, intentId);
+            return true;
         } catch (error: any) {
-            logger.error(this.tag, `❌ CRITICAL: Cleanup failed for ${symbol}, internal counters were still released: ${error.message}`);
+            this.markUnmanagedExposure(symbol, state, orderType, slotReserved, error);
+            logger.error(this.tag, `CRITICAL: Cleanup failed for ${symbol}. Runtime is risk-locked and cleanup will be retried: ${error.message}`);
+            return false;
         }
+    }
+
+    private async assertNoUnexpectedPositions(symbol: string, state: PairState): Promise<void> {
+        const info = this.marketInfo.getInfo(symbol);
+        const minQty = info?.minQty || 0;
+        const [primaryPositions, secondaryPositions] = await Promise.all([
+            this.primaryClient.fetchPositions([symbol]),
+            this.secondaryClient.fetchPositions([symbol]),
+        ]);
+
+        const unexpected = [
+            ...primaryPositions.map(position => ({ exchange: this.primaryClient.name, position })),
+            ...secondaryPositions.map(position => ({ exchange: this.secondaryClient.name, position })),
+        ].filter(({ position }) => {
+            const size = Math.abs(Number(position.amount ?? position.contracts ?? 0));
+            return position.symbol === symbol && size > 0 && size >= minQty;
+        });
+
+        if (unexpected.length === 0) {
+            this.riskLock.clear(this.manualExposureRiskKey(symbol));
+            return;
+        }
+
+        state.canOpenNewTrades = false;
+        const details = unexpected
+            .map(({ exchange, position }) => {
+                const size = Math.abs(Number(position.amount ?? position.contracts ?? 0));
+                return `${exchange} ${position.side} ${size}`;
+            })
+            .join('; ');
+        this.riskLock.lock(
+            this.manualExposureRiskKey(symbol),
+            'unexpected_position_before_entry',
+            details,
+        );
+        throw new Error(`Unexpected existing position before entry on ${symbol}: ${details}`);
+    }
+
+    private markUnmanagedExposure(
+        symbol: string,
+        state: PairState,
+        orderType: 'buy' | 'sell',
+        slotReserved: boolean,
+        error: Error,
+    ): void {
+        const now = Date.now();
+        const previous = state.unmanagedExposure;
+        state.canOpenNewTrades = false;
+        state.unmanagedExposure = {
+            orderType,
+            slotReserved: previous?.slotReserved ?? slotReserved,
+            cleanupAttempts: previous ? previous.cleanupAttempts + 1 : 1,
+            lastError: error.message,
+            lockedAtMs: previous?.lockedAtMs ?? now,
+            nextRetryAtMs: now + UNMANAGED_CLEANUP_RETRY_MS,
+        };
+        this.riskLock.lock(
+            this.unmanagedExposureRiskKey(symbol),
+            'unmanaged_exposure_cleanup_failed',
+            error.message,
+        );
+    }
+
+    private async retryUnmanagedExposureCleanup(symbol: string, state: PairState, force: boolean = false): Promise<void> {
+        const exposure = state.unmanagedExposure;
+        if (!exposure || state.busy) {
+            return;
+        }
+
+        if (!force && Date.now() < exposure.nextRetryAtMs) {
+            return;
+        }
+
+        state.busy = true;
+        try {
+            logger.warn(this.tag, `Retrying unmanaged exposure cleanup for ${symbol}. Attempt ${exposure.cleanupAttempts + 1}.`);
+            await this.handleOpenCleanup(symbol, exposure.orderType);
+            if (exposure.slotReserved) {
+                this.tradeCounter.release();
+            }
+            state.unmanagedExposure = null;
+            state.cooldownUntil = Date.now() + COOLDOWN_MS;
+            this.riskLock.clear(this.unmanagedExposureRiskKey(symbol));
+            logger.info(this.tag, `Unmanaged exposure cleanup for ${symbol} completed and risk lock was cleared.`);
+        } catch (error: any) {
+            this.markUnmanagedExposure(symbol, state, exposure.orderType, exposure.slotReserved, error);
+        } finally {
+            state.busy = false;
+        }
+    }
+
+    private unmanagedExposureRiskKey(symbol: string): string {
+        return `${this.tag}:unmanaged:${symbol}`;
+    }
+
+    private manualExposureRiskKey(symbol: string): string {
+        return `${this.tag}:manual-position:${symbol}`;
     }
 
     // ───────────── Private: Close Trade ─────────────
@@ -616,17 +893,23 @@ export class Trader {
 
         const trade = state.activeTrade!;
         const orderType = trade.order_type as 'buy' | 'sell';
+        const closeIntentId = state.closeIntentId ?? executionJournal.createIntentId('close', symbol);
+        state.closeIntentId = closeIntentId;
 
         logger.info(this.tag, `🟢 CLOSING ${symbol} (${orderType}), reason: ${reason}`);
 
         try {
+            await executionJournal.record(closeIntentId, 'close', 'close_started', symbol, {
+                trade_id: trade.id,
+                reason,
+            });
+
             const primaryCloseSide = orderType === 'buy' ? 'sell' : 'buy';
             const secondaryCloseSide = orderType === 'buy' ? 'buy' : 'sell';
             const primaryExpectedSide = orderType === 'buy' ? 'long' : 'short';
             const secondaryExpectedSide = orderType === 'buy' ? 'short' : 'long';
 
             let pPrice = 0, sPrice = 0, pOrder = 'already_closed', sOrder = 'already_closed';
-            let closeCommission = 0;
 
             const info = this.marketInfo.getInfo(symbol);
             const minQty = info?.minQty || 0;
@@ -641,21 +924,36 @@ export class Trader {
 
             const pSize = pPos?.size ?? 0;
             const sSize = sPos?.size ?? 0;
+            const expectedAmount = parseFloat(trade.amount as any);
+            this.lockOnPositionSizeMismatch(symbol, state, trade.id, expectedAmount, pSize, sSize);
 
             // 2. Execute missing closures only. This avoids flipping positions if
             // a previous close attempt partially succeeded.
-            const closePromises = [];
+            const closePromises: Array<Promise<{
+                leg: 'primary' | 'secondary';
+                price: number;
+                orderId: string;
+                commission: number;
+                size: number;
+                closedAt: string;
+            }>> = [];
             const pOpen = parseFloat(trade.primary_open_price as any);
             const sOpen = parseFloat(trade.secondary_open_price as any);
 
             if (pSize > 0 && pSize >= minQty) {
                 closePromises.push(
-                    this.primaryClient.createMarketOrder(symbol, primaryCloseSide, pSize, { reduceOnly: true }).then(r => {
-                        pPrice = r.avgPrice;
-                        pOrder = r.orderId;
-                        closeCommission += r.commission;
-                    })
+                    this.primaryClient.createMarketOrder(symbol, primaryCloseSide, pSize, { reduceOnly: true }).then(r => ({
+                        leg: 'primary' as const,
+                        price: r.avgPrice,
+                        orderId: r.orderId,
+                        commission: r.commission,
+                        size: r.filledQty,
+                        closedAt: new Date().toISOString(),
+                    }))
                 );
+            } else if (state.partialClose.primary) {
+                pPrice = state.partialClose.primary.price;
+                pOrder = state.partialClose.primary.orderId;
             } else {
                 // If no close order is needed, use current book price or open
                 // price for accounting fallback.
@@ -664,35 +962,105 @@ export class Trader {
 
             if (sSize > 0 && sSize >= minQty) {
                 closePromises.push(
-                    this.secondaryClient.createMarketOrder(symbol, secondaryCloseSide, sSize, { reduceOnly: true }).then(r => {
-                        sPrice = r.avgPrice;
-                        sOrder = r.orderId;
-                        closeCommission += r.commission;
-                    })
+                    this.secondaryClient.createMarketOrder(symbol, secondaryCloseSide, sSize, { reduceOnly: true }).then(r => ({
+                        leg: 'secondary' as const,
+                        price: r.avgPrice,
+                        orderId: r.orderId,
+                        commission: r.commission,
+                        size: r.filledQty,
+                        closedAt: new Date().toISOString(),
+                    }))
                 );
+            } else if (state.partialClose.secondary) {
+                sPrice = state.partialClose.secondary.price;
+                sOrder = state.partialClose.secondary.orderId;
             } else {
                 // If no close order is needed, use current book price or open
                 // price for accounting fallback.
                 sPrice = secondaryCloseSide === 'buy' ? (prices?.secondaryAsk ?? sOpen) : (prices?.secondaryBid ?? sOpen);
             }
 
-            await Promise.all(closePromises);
+            const closeResults = await Promise.allSettled(closePromises);
+            const closeErrors: string[] = [];
+            for (const result of closeResults) {
+                if (result.status === 'rejected') {
+                    closeErrors.push(result.reason instanceof Error ? result.reason.message : String(result.reason));
+                    continue;
+                }
+
+                if (result.value.leg === 'primary') {
+                    state.partialClose.primary = {
+                        price: result.value.price,
+                        orderId: result.value.orderId,
+                        commission: result.value.commission,
+                        size: result.value.size,
+                        closedAt: result.value.closedAt,
+                    };
+                    await executionJournal.record(closeIntentId, 'close', 'close_leg_filled', symbol, {
+                        leg: 'primary',
+                        order_id: result.value.orderId,
+                        filled_qty: result.value.size,
+                        avg_price: result.value.price,
+                        commission: result.value.commission,
+                    });
+                    pPrice = result.value.price;
+                    pOrder = result.value.orderId;
+                } else {
+                    state.partialClose.secondary = {
+                        price: result.value.price,
+                        orderId: result.value.orderId,
+                        commission: result.value.commission,
+                        size: result.value.size,
+                        closedAt: result.value.closedAt,
+                    };
+                    await executionJournal.record(closeIntentId, 'close', 'close_leg_filled', symbol, {
+                        leg: 'secondary',
+                        order_id: result.value.orderId,
+                        filled_qty: result.value.size,
+                        avg_price: result.value.price,
+                        commission: result.value.commission,
+                    });
+                    sPrice = result.value.price;
+                    sOrder = result.value.orderId;
+                }
+            }
+
+            if (closeErrors.length > 0) {
+                throw new Error(`Partial close failed; completed leg state was preserved: ${closeErrors.join('; ')}`);
+            }
 
             // Fallback for execution bugs on exit where an exchange returns an
             // order id but no usable average fill price.
-            if (pPrice === 0 && pSize > 0) {
+            if (pPrice === 0) {
                 pPrice = primaryCloseSide === 'buy' ? (prices?.primaryAsk ?? pOpen) : (prices?.primaryBid ?? pOpen);
             }
-            if (sPrice === 0 && sSize > 0) {
+            if (sPrice === 0) {
                 sPrice = secondaryCloseSide === 'buy' ? (prices?.secondaryAsk ?? sOpen) : (prices?.secondaryBid ?? sOpen);
             }
 
             // 3. Calculate results and update Django.
-            const amount = parseFloat(trade.amount as any);
+            const amount = expectedAmount;
             const openCommission = parseFloat(trade.open_commission as any) || 0;
+            const closeCommission = (
+                (state.partialClose.primary?.commission ?? 0)
+                + (state.partialClose.secondary?.commission ?? 0)
+            );
             const totalCommission = openCommission + closeCommission;
-            const { profitUsdt, profitPercentage } = calculateRealPnL(
-                pOpen, sOpen, pPrice, sPrice, amount, orderType, totalCommission,
+            const primaryAccountingSize = state.partialClose.primary?.size ?? amount;
+            const secondaryAccountingSize = state.partialClose.secondary?.size ?? amount;
+            const { profitUsdt, profitPercentage } = (
+                primaryAccountingSize === amount && secondaryAccountingSize === amount
+                    ? calculateRealPnL(pOpen, sOpen, pPrice, sPrice, amount, orderType, totalCommission)
+                    : calculateRealPnLByLegSizes(
+                        pOpen,
+                        sOpen,
+                        pPrice,
+                        sPrice,
+                        primaryAccountingSize,
+                        secondaryAccountingSize,
+                        orderType,
+                        totalCommission,
+                    )
             );
 
             const closeSpread = this.calculateCloseSpread(pPrice, sPrice, orderType);
@@ -715,21 +1083,34 @@ export class Trader {
             const isDbSaved = await this.closeSync.persistCloseTrade(trade.id, closePayload);
             if (!isDbSaved) {
                 state.pendingCloseSync = {
+                    intentId: closeIntentId,
                     payload: closePayload,
                     reason,
                     nextBaselineBuy: currentBuySpread ?? null,
                     nextBaselineSell: currentSellSpread ?? null,
                 };
+                await executionJournal.record(closeIntentId, 'close', 'close_sync_pending', symbol, {
+                    trade_id: trade.id,
+                });
                 logger.error(this.tag, `❌ Close persisted on exchanges for ${symbol}, but Django sync is still pending. Runtime will retry until it succeeds.`);
                 return;
             }
 
-            this.finalizeClosedTrade(state, currentBuySpread ?? null, currentSellSpread ?? null);
+            await executionJournal.record(closeIntentId, 'close', 'close_synced', symbol, {
+                trade_id: trade.id,
+            }).catch((journalError: any) => {
+                logger.error(this.tag, `Close trade ${trade.id} is in Django, but execution journal sync failed for ${symbol}: ${journalError.message}`);
+            });
+            this.finalizeClosedTrade(symbol, state, currentBuySpread ?? null, currentSellSpread ?? null);
 
             logger.info(this.tag, `✅ Closed ${symbol} (${reason}). PnL: ${profitUsdt.toFixed(4)} USDT (${profitPercentage.toFixed(3)}%)`);
 
         } catch (e: any) {
             logger.error(this.tag, `❌ Error closing ${symbol} on exchanges: ${e.message}`);
+            await executionJournal.record(closeIntentId, 'close', 'close_failed', symbol, {
+                trade_id: trade.id,
+                error: e.message,
+            }).catch((journalError: any) => logger.error(this.tag, `Failed to append execution journal: ${journalError.message}`));
             // Do not clear local state; next tick will safely retry remaining positions.
         } finally {
             state.busy = false;
@@ -746,6 +1127,41 @@ export class Trader {
         }
     }
 
+    private lockOnPositionSizeMismatch(
+        symbol: string,
+        state: PairState,
+        tradeId: number,
+        expectedAmount: number,
+        primarySize: number,
+        secondarySize: number,
+    ): boolean {
+        if (!Number.isFinite(expectedAmount) || expectedAmount <= 0) {
+            this.riskLock.lock(
+                this.reconciliationRiskKey(symbol),
+                'position_reconciliation_mismatch',
+                `${symbol} active trade ${tradeId} has invalid expected amount ${expectedAmount}.`,
+            );
+            state.canOpenNewTrades = false;
+            return true;
+        }
+
+        const tolerance = expectedAmount * (config.positionSizeTolerancePercent / 100);
+        const isPrimaryMismatch = primarySize > 0 && Math.abs(primarySize - expectedAmount) > tolerance;
+        const isSecondaryMismatch = secondarySize > 0 && Math.abs(secondarySize - expectedAmount) > tolerance;
+
+        if (!isPrimaryMismatch && !isSecondaryMismatch) {
+            return false;
+        }
+
+        state.canOpenNewTrades = false;
+        this.riskLock.lock(
+            this.reconciliationRiskKey(symbol),
+            'position_size_mismatch',
+            `${symbol} trade ${tradeId} expected amount ${expectedAmount}, primary=${primarySize}, secondary=${secondarySize}.`,
+        );
+        return true;
+    }
+
     // ───────────── Private: Timeout Watchdog ─────────────
 
     private async checkTimeouts() {
@@ -754,6 +1170,11 @@ export class Trader {
         const now = Date.now();
 
         for (const [symbol, state] of this.states) {
+            if (state.unmanagedExposure && !state.busy) {
+                await this.retryUnmanagedExposureCleanup(symbol, state);
+                continue;
+            }
+
             if (state.pendingCloseSync && !state.busy) {
                 await this.flushPendingClose(symbol, state);
                 continue;
@@ -774,9 +1195,87 @@ export class Trader {
 
     // ───────────── Private: Graceful Shutdown ─────────────
 
+    private async reconcileTrackedPositions(): Promise<void> {
+        if (!this.isRunning) {
+            return;
+        }
+
+        for (const [symbol, state] of this.states.entries()) {
+            if (state.busy) {
+                continue;
+            }
+
+            if (state.unmanagedExposure) {
+                await this.retryUnmanagedExposureCleanup(symbol, state);
+                continue;
+            }
+
+            if (!state.activeTrade) {
+                continue;
+            }
+
+            try {
+                const trade = state.activeTrade;
+                const orderType = trade.order_type as 'buy' | 'sell';
+                const primaryExpectedSide = orderType === 'buy' ? 'long' : 'short';
+                const secondaryExpectedSide = orderType === 'buy' ? 'short' : 'long';
+                const info = this.marketInfo.getInfo(symbol);
+                const minQty = info?.minQty || 0;
+
+                const [primaryPosition, secondaryPosition] = await Promise.all([
+                    fetchConfirmedPosition(this.primaryClient, symbol, primaryExpectedSide, minQty, this.tag),
+                    fetchConfirmedPosition(this.secondaryClient, symbol, secondaryExpectedSide, minQty, this.tag),
+                ]);
+
+                if (!primaryPosition || !secondaryPosition) {
+                    this.riskLock.lock(
+                        this.reconciliationRiskKey(symbol),
+                        'position_reconciliation_mismatch',
+                        `${symbol} active trade ${trade.id} is missing an expected exchange position.`,
+                    );
+                    state.canOpenNewTrades = false;
+                } else {
+                    const expectedAmount = parseFloat(trade.amount as any);
+                    const hasSizeMismatch = this.lockOnPositionSizeMismatch(
+                        symbol,
+                        state,
+                        trade.id,
+                        expectedAmount,
+                        primaryPosition.size,
+                        secondaryPosition.size,
+                    );
+
+                    if (!hasSizeMismatch) {
+                        this.riskLock.clear(this.reconciliationRiskKey(symbol));
+                    }
+                }
+            } catch (error: any) {
+                this.riskLock.lock(
+                    this.reconciliationRiskKey(symbol),
+                    'position_reconciliation_failed',
+                    error.message,
+                );
+                state.canOpenNewTrades = false;
+                logger.error(this.tag, `Position reconciliation failed for ${symbol}: ${error.message}`);
+            }
+        }
+    }
+
+    private reconciliationRiskKey(symbol: string): string {
+        return `${this.tag}:reconciliation:${symbol}`;
+    }
+
+    private executionJournalRiskKey(symbol: string): string {
+        return `${this.tag}:journal:${symbol}`;
+    }
+
     private async closeAllPositions(reason: 'shutdown' | 'error') {
         const openTrades = [...this.states.entries()]
-            .filter(([_, state]) => state.activeTrade !== null || state.pendingCloseSync !== null);
+            .filter(([_, state]) => (
+                state.activeTrade !== null
+                || state.pendingCloseSync !== null
+                || state.unmanagedExposure !== null
+            ));
 
         if (openTrades.length === 0) return;
 
@@ -784,6 +1283,11 @@ export class Trader {
 
         for (const [symbol, state] of openTrades) {
             try {
+                if (state.unmanagedExposure) {
+                    await this.retryUnmanagedExposureCleanup(symbol, state, true);
+                    continue;
+                }
+
                 if (state.pendingCloseSync) {
                     await this.flushPendingClose(symbol, state);
                     continue;
@@ -798,9 +1302,15 @@ export class Trader {
                 logger.error(this.tag, `Failed to close ${symbol} during ${reason}: ${e.message}`);
             }
         }
+
+        const remaining = this.getExposureSummary();
+        if (remaining.length > 0) {
+            throw new Error(`Exposure remains after ${reason}: ${remaining.join(', ')}`);
+        }
     }
 
     private finalizeClosedTrade(
+        symbol: string,
         state: PairState,
         nextBaselineBuy: number | null,
         nextBaselineSell: number | null,
@@ -808,7 +1318,11 @@ export class Trader {
         state.activeTrade = null;
         state.openedAtMs = null;
         state.pendingCloseSync = null;
+        state.partialClose = {};
+        state.closeIntentId = null;
         this.tradeCounter.release();
+        this.riskLock.clear(this.reconciliationRiskKey(symbol));
+        this.riskLock.clear(this.executionJournalRiskKey(symbol));
 
         if (nextBaselineBuy !== null && nextBaselineSell !== null) {
             // Reset baselines to the latest spread after a profitable close so
@@ -837,7 +1351,12 @@ export class Trader {
             }
 
             const { reason, nextBaselineBuy, nextBaselineSell } = state.pendingCloseSync;
-            this.finalizeClosedTrade(state, nextBaselineBuy, nextBaselineSell);
+            await executionJournal.record(state.pendingCloseSync.intentId, 'close', 'close_synced', symbol, {
+                trade_id: state.activeTrade.id,
+            }).catch((journalError: any) => {
+                logger.error(this.tag, `Pending close trade ${state.activeTrade!.id} is in Django, but execution journal sync failed for ${symbol}: ${journalError.message}`);
+            });
+            this.finalizeClosedTrade(symbol, state, nextBaselineBuy, nextBaselineSell);
             logger.info(this.tag, `✅ Pending Django close sync completed for ${symbol} (${reason}).`);
         } finally {
             state.busy = false;

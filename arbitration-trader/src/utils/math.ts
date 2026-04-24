@@ -91,10 +91,111 @@ export function calculateRealPnL(
     return { profitUsdt, profitPercentage };
 }
 
+export function calculateRealPnLByLegSizes(
+    openPrimary: number,
+    openSecondary: number,
+    closePrimary: number,
+    closeSecondary: number,
+    primaryAmount: number,
+    secondaryAmount: number,
+    orderType: 'buy' | 'sell',
+    totalCommission: number,
+): { profitUsdt: number; profitPercentage: number } {
+    let primaryPnl: number;
+    let secondaryPnl: number;
+
+    if (orderType === 'sell') {
+        primaryPnl = (openPrimary - closePrimary) * primaryAmount;
+        secondaryPnl = (closeSecondary - openSecondary) * secondaryAmount;
+    } else {
+        primaryPnl = (closePrimary - openPrimary) * primaryAmount;
+        secondaryPnl = (openSecondary - closeSecondary) * secondaryAmount;
+    }
+
+    const profitUsdt = primaryPnl + secondaryPnl - totalCommission;
+    const capital = Math.max(primaryAmount * openPrimary, secondaryAmount * openSecondary);
+    const profitPercentage = capital > 0 ? (profitUsdt / capital) * 100 : 0;
+
+    return { profitUsdt, profitPercentage };
+}
+
 /** Round a number to fit Django DecimalField constraints */
 export function d(value: number, decimals: number = 8): number {
     // Trims binary floating-point tails before sending numeric JSON to Django.
     return parseFloat(value.toFixed(decimals));
+}
+
+export function decimalPlaces(value: number | string): number {
+    const normalized = normalizeDecimalText(value);
+    const decimals = normalized.split('.')[1]?.replace(/0+$/, '');
+    return decimals?.length ?? 0;
+}
+
+export function commonDecimalStep(...steps: number[]): number {
+    const validSteps = steps.filter(step => Number.isFinite(step) && step > 0);
+    if (validSteps.length === 0) {
+        throw new Error('At least one positive step is required.');
+    }
+
+    const maxDecimals = Math.max(...validSteps.map(step => decimalPlaces(step)));
+    const scale = 10n ** BigInt(maxDecimals);
+    const scaledSteps = validSteps.map(step => decimalToScaledInteger(step, maxDecimals));
+    const lcmStep = scaledSteps.reduce((current, next) => lcm(current, next));
+    return Number(lcmStep) / Number(scale);
+}
+
+export function roundDownToStep(value: number, step: number): number {
+    if (!Number.isFinite(value) || !Number.isFinite(step) || step <= 0) {
+        return 0;
+    }
+
+    const precision = decimalPlaces(step);
+    const rounded = Math.floor((value / step) + 1e-12) * step;
+    return Number(rounded.toFixed(precision));
+}
+
+function normalizeDecimalText(value: number | string): string {
+    const raw = String(value).trim().toLowerCase();
+    if (!raw.includes('e')) {
+        return raw;
+    }
+
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed)) {
+        return raw;
+    }
+
+    return parsed.toFixed(20).replace(/0+$/, '').replace(/\.$/, '');
+}
+
+function decimalToScaledInteger(value: number, decimals: number): bigint {
+    const normalized = normalizeDecimalText(value);
+    const sign = normalized.startsWith('-') ? -1n : 1n;
+    const unsigned = normalized.replace(/^-/, '');
+    const [integerPart, fractionPart = ''] = unsigned.split('.');
+    const digits = `${integerPart}${fractionPart.padEnd(decimals, '0')}`.replace(/^0+(?=\d)/, '');
+    return sign * BigInt(digits || '0');
+}
+
+function gcd(left: bigint, right: bigint): bigint {
+    let a = left < 0n ? -left : left;
+    let b = right < 0n ? -right : right;
+
+    while (b !== 0n) {
+        const next = a % b;
+        a = b;
+        b = next;
+    }
+
+    return a;
+}
+
+function lcm(left: bigint, right: bigint): bigint {
+    if (left === 0n || right === 0n) {
+        return 0n;
+    }
+
+    return (left / gcd(left, right)) * right;
 }
 
 /**

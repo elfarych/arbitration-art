@@ -156,7 +156,7 @@ export interface SymbolMarketInfo {
  */
 export interface UnifiedMarketInfo {
     symbol: string;
-    /** Max of both exchanges' step sizes */
+    /** Decimal LCM of both exchanges' quantity steps */
     stepSize: number;
     /** Max of both exchanges' min quantities */
     minQty: number;

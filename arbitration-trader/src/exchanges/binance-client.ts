@@ -5,6 +5,7 @@ import type { ExchangePosition, ExchangeTicker, OrderResult, SymbolMarketInfo } 
 import { binanceToUnified, unifiedToBinance } from './symbols.js';
 import { logger } from '../utils/logger.js';
 import { config } from '../config.js';
+import { decimalPlaces } from '../utils/math.js';
 
 const TAG = 'BinanceClient';
 
@@ -122,6 +123,10 @@ export class BinanceClient implements IExchangeClient {
         }
 
         return positions;
+    }
+
+    async fetchAllOpenPositions(): Promise<ExchangePosition[]> {
+        return this.fetchPositions(this.getUsdtSymbols());
     }
 
     /**
@@ -479,8 +484,8 @@ export class BinanceClient implements IExchangeClient {
             minQty,
             stepSize,
             minNotional,
-            pricePrecision: Math.max(0, Math.round(-Math.log10(tickSize))),
-            quantityPrecision: Math.max(0, Math.round(-Math.log10(stepSize))),
+            pricePrecision: decimalPlaces(tickSize),
+            quantityPrecision: decimalPlaces(stepSize),
         };
     }
 
