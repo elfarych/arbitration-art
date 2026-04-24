@@ -7,9 +7,16 @@ from apps.bots.api.serializers import (
     BotConfigSerializer,
     EmulationTradeSerializer,
     TradeSerializer,
+    TraderRuntimeConfigErrorSerializer,
     TraderRuntimeConfigSerializer,
 )
-from apps.bots.models import BotConfig, EmulationTrade, Trade, TraderRuntimeConfig
+from apps.bots.models import (
+    BotConfig,
+    EmulationTrade,
+    Trade,
+    TraderRuntimeConfig,
+    TraderRuntimeConfigError,
+)
 from apps.bots.permissions import ServiceTokenWriteOrAuthenticatedRead, is_service_request
 from apps.bots.services.lifecycle import LifecycleSyncError, sync_bot_lifecycle
 from apps.bots.services.trader_runtime_info import (
@@ -138,6 +145,36 @@ class TraderRuntimeConfigViewSet(viewsets.ModelViewSet):
             )
 
         return Response(payload)
+
+
+class TraderRuntimeConfigErrorViewSet(viewsets.ModelViewSet):
+    """Read user-owned runtime errors and allow service-token writes."""
+
+    serializer_class = TraderRuntimeConfigErrorSerializer
+    permission_classes = [ServiceTokenWriteOrAuthenticatedRead]
+
+    def get_queryset(self):
+        queryset = TraderRuntimeConfigError.objects.select_related(
+            "runtime_config",
+            "runtime_config__owner",
+        )
+
+        if is_service_request(self.request):
+            pass
+        elif self.request.user.is_authenticated:
+            queryset = queryset.filter(runtime_config__owner=self.request.user)
+        else:
+            queryset = queryset.none()
+
+        runtime_config_id = self.request.query_params.get("runtime_config_id")
+        if runtime_config_id:
+            queryset = queryset.filter(runtime_config_id=runtime_config_id)
+
+        error_type = self.request.query_params.get("error_type")
+        if error_type:
+            queryset = queryset.filter(error_type=error_type)
+
+        return queryset
 
 
 class EmulationTradeViewSet(viewsets.ModelViewSet):

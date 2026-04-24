@@ -14,6 +14,7 @@
 - Хранение пользовательских API-ключей бирж в модели `UserExchangeKeys`, включая MEXC.
 - CRUD настроек ботов `BotConfig` с привязкой к владельцу и per-record `service_url`.
 - CRUD `TraderRuntimeConfig` для управляемого из Django standalone `arbitration-trader`.
+- Хранение ошибок `TraderRuntimeConfigError`, которые standalone `arbitration-trader` отправляет в Django через service-token API.
 - Сигнальную синхронизацию lifecycle-команд с внешними runtime-сервисами через service layer и `transaction.on_commit(...)`.
 - Хранение истории эмуляционных сделок `EmulationTrade`.
 - Хранение истории реальных сделок `Trade` с привязкой к `owner` и источнику запуска (`bot` или `runtime_config`).
@@ -453,9 +454,9 @@ Meta:
 
 ### 8.3. `Trade`
 
-Назначение: цикл исполнения реальной арбитражной сделки на Binance/Bybit Futures.
+Назначение: цикл исполнения реальной арбитражной сделки на выбранных futures/derivatives биржах.
 
-Важно: у `Trade` нет связи с `User` или `BotConfig`. API для real trades сейчас глобальный и открыт через `AllowAny`.
+`Trade` привязывается к `owner` и ровно одному источнику исполнения: `bot` или `runtime_config`. Service-token request может писать реальные сделки, JWT-пользователь читает только свои сделки.
 
 Choices:
 
@@ -517,6 +518,8 @@ Prefix: `/api/bots/`.
 ```python
 router.register("trades", EmulationTradeViewSet, basename="bot-trades")
 router.register("real-trades", TradeViewSet, basename="real-trades")
+router.register("runtime-config-errors", TraderRuntimeConfigErrorViewSet, basename="trader-runtime-config-errors")
+router.register("runtime-configs", TraderRuntimeConfigViewSet, basename="trader-runtime-config")
 router.register("", BotConfigViewSet, basename="bot-config")
 ```
 
@@ -707,7 +710,73 @@ updated_at
 - `active-coins` и `open-trades-pnl` читают только текущий active runtime внутри `arbitration-trader`; если запрошенный `runtime_config_id` не совпадает с активным, сервис возвращает пустой набор и `is_requested_runtime_active=false`.
 - `system-load` возвращает system-wide метрики хоста `arbitration-trader` плюс `active_runtime_config_id` для сопоставления с текущим runtime.
 
-### 9.3. `EmulationTradeViewSet`
+### 9.3. `TraderRuntimeConfigErrorViewSet`
+
+Класс: `apps.bots.api.views.TraderRuntimeConfigErrorViewSet`.
+
+Тип: `ModelViewSet`.
+
+Permissions:
+
+```python
+permission_classes = [ServiceTokenWriteOrAuthenticatedRead]
+```
+
+Назначение: хранит ошибки runtime-конфигов standalone `arbitration-trader`.
+
+Модель: `apps.bots.models.TraderRuntimeConfigError`.
+
+Поля:
+
+| Поле | Тип | Назначение |
+|---|---|---|
+| `runtime_config` | `ForeignKey(TraderRuntimeConfig)` | Runtime-конфиг, к которому относится ошибка. |
+| `error_type` | `CharField(50)` | Тип ошибки: `start`, `sync`, `stop`, `runtime`, `exchange_health`, `diagnostics`, `validation`, `control_plane`. |
+| `error_text` | `TextField` | Текст ошибки от `arbitration-trader`. |
+| `created_at` | `DateTimeField(auto_now_add=True)` | Время создания записи. |
+
+Queryset:
+
+- service-token request видит все записи;
+- authenticated user видит только ошибки своих `TraderRuntimeConfig`;
+- anonymous request получает пустой queryset.
+
+Filtering:
+
+- `?runtime_config_id=<id>`
+- `?error_type=<type>`
+
+Endpoints:
+
+| Method | Path | Назначение |
+|---|---|---|
+| `GET` | `/api/bots/runtime-config-errors/` | Список ошибок runtime-конфигов. |
+| `POST` | `/api/bots/runtime-config-errors/` | Создать ошибку через service-token request от `arbitration-trader`. |
+| `GET` | `/api/bots/runtime-config-errors/{id}/` | Получить ошибку. |
+| `PUT` | `/api/bots/runtime-config-errors/{id}/` | Полное обновление через service-token request. |
+| `PATCH` | `/api/bots/runtime-config-errors/{id}/` | Частичное обновление через service-token request. |
+| `DELETE` | `/api/bots/runtime-config-errors/{id}/` | Удаление через service-token request. |
+
+Serializer fields:
+
+```text
+id
+runtime_config
+error_type
+error_text
+created_at
+```
+
+Read-only:
+
+```text
+id
+created_at
+```
+
+Записи создаются `arbitration-trader` через `POST /api/bots/runtime-config-errors/` с header `X-Service-Token`. JWT-пользователи используют endpoint только для чтения своих ошибок.
+
+### 9.4. `EmulationTradeViewSet`
 
 Класс: `apps.bots.api.views.EmulationTradeViewSet`.
 
@@ -716,7 +785,7 @@ updated_at
 Permissions:
 
 ```python
-permission_classes = [AllowAny]
+permission_classes = [ServiceTokenWriteOrAuthenticatedRead]
 ```
 
 Queryset behavior:
@@ -772,9 +841,9 @@ id
 opened_at
 ```
 
-Риск: так как permission `AllowAny` и это `ModelViewSet`, а не read-only API, анонимный клиент может создавать/обновлять/удалять scanner trades, если не закрыто внешним reverse proxy или другим слоем. Это может быть намеренно для engine/scanner, но должно быть явно защищено на уровне сети или отдельным service token.
+Write methods доступны только request-ам с `X-Service-Token`. JWT-пользователи используют endpoint для чтения своих записей.
 
-### 9.4. `TradeViewSet`
+### 9.5. `TradeViewSet`
 
 Класс: `apps.bots.api.views.TradeViewSet`.
 
@@ -783,14 +852,20 @@ opened_at
 Permissions:
 
 ```python
-permission_classes = [AllowAny]
+permission_classes = [ServiceTokenWriteOrAuthenticatedRead]
 ```
 
 Queryset:
 
 ```python
-Trade.objects.all()
+Trade.objects.select_related("owner", "bot", "runtime_config")
 ```
+
+Queryset behavior:
+
+- service-token request видит все записи;
+- authenticated user видит только сделки, где `owner = request.user`;
+- anonymous request получает пустой queryset.
 
 Filtering:
 
@@ -846,7 +921,7 @@ id
 opened_at
 ```
 
-Риск: endpoint глобальный, без привязки к пользователю и с `AllowAny`. Это может быть правильно для локального trading engine, но опасно при публикации API наружу.
+Write methods доступны только request-ам с `X-Service-Token`. JWT-пользователи используют endpoint для чтения своих реальных сделок.
 
 ## 10. Интеграция с bot-engine
 
@@ -1185,8 +1260,7 @@ Authorization: Bearer <access_token>
 Явные исключения:
 
 - Auth login/refresh от Simple JWT публичные.
-- `EmulationTradeViewSet` открыт через `AllowAny`.
-- `TradeViewSet` открыт через `AllowAny`.
+- `EmulationTradeViewSet`, `TradeViewSet` и `TraderRuntimeConfigErrorViewSet` разрешают write methods только по `X-Service-Token`; JWT-пользователи используют эти endpoints для чтения своих данных.
 
 Права по сущностям:
 
@@ -1194,8 +1268,9 @@ Authorization: Bearer <access_token>
 |---|---|
 | `User` | Только `/me/` для текущего пользователя. |
 | `BotConfig` | Фильтрация по `owner=request.user`. |
-| `EmulationTrade` | Auth user видит свои bot trades + scanner trades; anonymous видит scanner trades. Но write methods открыты. |
-| `Trade` | Глобальный queryset без owner. Write methods открыты. |
+| `EmulationTrade` | Service-token видит и пишет все записи; auth user видит свои bot trades; anonymous получает пустой queryset. |
+| `Trade` | Service-token видит и пишет все записи; auth user видит сделки со своим `owner`; anonymous получает пустой queryset. |
+| `TraderRuntimeConfigError` | Service-token видит и пишет все записи; auth user видит ошибки своих runtime-конфигов; anonymous получает пустой queryset. |
 
 ## 16. Пагинация и формат ответов
 
@@ -1231,21 +1306,21 @@ Development settings добавляет Browsable API renderer. Base/production 
 - запретить вывод secrets в admin/API/logs;
 - audit trail доступа к ключам.
 
-### 17.2. Открытые write endpoints
+### 17.2. Service-token write endpoints
 
-`EmulationTradeViewSet` и `TradeViewSet` используют `AllowAny` на полноценном `ModelViewSet`.
+`EmulationTradeViewSet`, `TradeViewSet` и `TraderRuntimeConfigErrorViewSet` используют общий `X-Service-Token` для write methods.
 
-Если API доступен извне, любой клиент потенциально может:
+Если API доступен извне и общий service token скомпрометирован, клиент потенциально может:
 
-- создать сделку;
-- изменить сделку;
-- удалить сделку;
-- читать real trades.
+- создать сделку или runtime error;
+- изменить сделку или runtime error;
+- удалить сделку или runtime error;
+- читать service-level данные.
 
 Если это нужно для локального engine, лучше:
 
 - вынести engine API под отдельный prefix;
-- добавить service token/HMAC;
+- заменить общий service token на HMAC с подписью payload и timestamp;
 - ограничить на reverse proxy по network allowlist;
 - заменить публичные endpoints на narrow custom actions;
 - сделать public часть read-only, если запись не нужна.

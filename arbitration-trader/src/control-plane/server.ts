@@ -1,11 +1,13 @@
 import { config } from '../config.js';
 import type { RuntimeManager } from '../classes/RuntimeManager.js';
+import { api } from '../services/api.js';
 import {
     parseRuntimeCommandPayload,
     parseRuntimeConfigId,
     parseStopPayload,
     PayloadValidationError,
 } from '../services/runtime-payload-validation.js';
+import type { RuntimeConfigErrorType } from '../types/index.js';
 import { logger } from '../utils/logger.js';
 
 const TAG = 'ControlPlane';
@@ -61,10 +63,20 @@ export async function createControlPlaneServer(runtimeManager: RuntimeManager): 
         }
     });
 
-    app.setErrorHandler((error, _request, reply) => {
+    app.setErrorHandler((error, request, reply) => {
         const statusCode = error instanceof PayloadValidationError ? 400 : 500;
         logger.error(TAG, `Request failed: ${error.message}`);
         logger.error(TAG, error.stack || '');
+
+        const runtimeConfigId = extractRuntimeConfigId(request);
+        if (runtimeConfigId !== null) {
+            void api.createRuntimeConfigError({
+                runtime_config: runtimeConfigId,
+                error_type: resolveErrorType(request, error),
+                error_text: error.message,
+            });
+        }
+
         reply.code(statusCode).send({ success: false, error: error.message });
     });
 
@@ -160,4 +172,57 @@ function hasValidServiceToken(request: FastifyRequestLike): boolean {
     const headerValue = request.headers['x-service-token'];
     const token = Array.isArray(headerValue) ? headerValue[0] : headerValue;
     return token === config.serviceToken;
+}
+
+function extractRuntimeConfigId(request: FastifyRequestLike): number | null {
+    const rawFromBody = extractRuntimeConfigIdValue(request.body);
+    const rawFromQuery = request.query?.runtime_config_id;
+    const raw = rawFromBody ?? rawFromQuery;
+    const parsed = Number(raw);
+
+    return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
+}
+
+function extractRuntimeConfigIdValue(value: unknown): unknown {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+        return null;
+    }
+
+    const record = value as Record<string, unknown>;
+    const config = record.config;
+
+    if (record.runtime_config_id !== undefined && record.runtime_config_id !== null) {
+        return record.runtime_config_id;
+    }
+
+    if (config && typeof config === 'object' && !Array.isArray(config)) {
+        return (config as Record<string, unknown>).id;
+    }
+
+    return null;
+}
+
+function resolveErrorType(request: FastifyRequestLike, error: Error): RuntimeConfigErrorType {
+    if (error instanceof PayloadValidationError) {
+        return 'validation';
+    }
+
+    const path = request.url.split('?')[0];
+    if (path.endsWith('/start')) {
+        return 'start';
+    }
+    if (path.endsWith('/sync')) {
+        return 'sync';
+    }
+    if (path.endsWith('/stop')) {
+        return 'stop';
+    }
+    if (path.endsWith('/exchange-health')) {
+        return 'exchange_health';
+    }
+    if (path.includes('/engine/trader/runtime/')) {
+        return 'diagnostics';
+    }
+
+    return 'control_plane';
 }

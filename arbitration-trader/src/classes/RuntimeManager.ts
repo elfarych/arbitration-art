@@ -206,6 +206,11 @@ export class RuntimeManager {
                 }
 
                 logger.error(TAG, `Runtime ${runtimeConfigId} stopped unexpectedly. Marking runtime as inactive.`);
+                void api.createRuntimeConfigError({
+                    runtime_config: runtimeConfigId,
+                    error_type: 'runtime',
+                    error_text: `Runtime ${runtimeConfigId} stopped unexpectedly.`,
+                });
                 return this.withLock(async () => {
                     if (this.activeRuntime?.payload.runtime_config_id !== runtimeConfigId) {
                         return;
@@ -217,6 +222,11 @@ export class RuntimeManager {
             .catch((error: any) => {
                 logger.error(TAG, `Runtime ${runtimeConfigId} crashed: ${error.message}`);
                 logger.error(TAG, error.stack || '');
+                void api.createRuntimeConfigError({
+                    runtime_config: runtimeConfigId,
+                    error_type: 'runtime',
+                    error_text: error.message,
+                });
 
                 if (this.activeRuntime?.payload.runtime_config_id !== runtimeConfigId) {
                     return;

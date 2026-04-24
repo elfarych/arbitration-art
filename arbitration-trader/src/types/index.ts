@@ -43,6 +43,22 @@ export interface RuntimeCommandPayload {
     keys: RuntimeKeysPayload;
 }
 
+export type RuntimeConfigErrorType =
+    | 'start'
+    | 'sync'
+    | 'stop'
+    | 'runtime'
+    | 'exchange_health'
+    | 'diagnostics'
+    | 'validation'
+    | 'control_plane';
+
+export interface RuntimeConfigErrorPayload {
+    runtime_config: number;
+    error_type: RuntimeConfigErrorType;
+    error_text: string;
+}
+
 export interface ExchangeHealthCheckResult {
     exchange: string;
     available: boolean;

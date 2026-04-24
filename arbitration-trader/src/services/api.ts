@@ -1,6 +1,11 @@
 import axios, { AxiosInstance } from 'axios';
 import { config } from '../config.js';
-import type { TradeClosePayload, TradeOpenPayload, TradeRecord } from '../types/index.js';
+import type {
+    RuntimeConfigErrorPayload,
+    TradeClosePayload,
+    TradeOpenPayload,
+    TradeRecord,
+} from '../types/index.js';
 import { logger } from '../utils/logger.js';
 
 const TAG = 'API';
@@ -60,6 +65,15 @@ export const api = {
         } catch (e: any) {
             logger.error(TAG, `getOpenTrades failed: ${e?.response?.status} ${JSON.stringify(e?.response?.data) || e.message}`);
             throw new Error(`Failed to restore open trades for runtime ${runtimeConfigId}`);
+        }
+    },
+
+    async createRuntimeConfigError(payload: RuntimeConfigErrorPayload): Promise<void> {
+        try {
+            await client.post('/bots/runtime-config-errors/', payload);
+            logger.info(TAG, `Runtime error recorded in Django: runtime=${payload.runtime_config}, type=${payload.error_type}`);
+        } catch (e: any) {
+            logger.warn(TAG, `createRuntimeConfigError failed: ${e?.response?.status} ${JSON.stringify(e?.response?.data) || e.message}`);
         }
     },
 };

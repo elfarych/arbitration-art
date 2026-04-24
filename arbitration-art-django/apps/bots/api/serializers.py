@@ -1,6 +1,12 @@
 from rest_framework import serializers
 
-from apps.bots.models import BotConfig, EmulationTrade, Trade, TraderRuntimeConfig
+from apps.bots.models import (
+    BotConfig,
+    EmulationTrade,
+    Trade,
+    TraderRuntimeConfig,
+    TraderRuntimeConfigError,
+)
 
 
 class BotConfigSerializer(serializers.ModelSerializer):
@@ -107,6 +113,21 @@ class TraderRuntimeConfigSerializer(serializers.ModelSerializer):
             )
 
         return attrs
+
+
+class TraderRuntimeConfigErrorSerializer(serializers.ModelSerializer):
+    """Serializer for runtime errors reported by the standalone trader."""
+
+    class Meta:
+        model = TraderRuntimeConfigError
+        fields = (
+            "id",
+            "runtime_config",
+            "error_type",
+            "error_text",
+            "created_at",
+        )
+        read_only_fields = ("id", "created_at")
 
 
 class EmulationTradeSerializer(serializers.ModelSerializer):

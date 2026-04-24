@@ -278,6 +278,42 @@ class TraderRuntimeConfig(models.Model):
         self.updated_at = updated_at
 
 
+class TraderRuntimeConfigError(models.Model):
+    """Error reported by the standalone trader for a runtime configuration."""
+
+    class ErrorType(models.TextChoices):
+        START = "start", "Start"
+        SYNC = "sync", "Sync"
+        STOP = "stop", "Stop"
+        RUNTIME = "runtime", "Runtime"
+        EXCHANGE_HEALTH = "exchange_health", "Exchange health"
+        DIAGNOSTICS = "diagnostics", "Diagnostics"
+        VALIDATION = "validation", "Validation"
+        CONTROL_PLANE = "control_plane", "Control plane"
+
+    runtime_config = models.ForeignKey(
+        TraderRuntimeConfig,
+        on_delete=models.CASCADE,
+        related_name="errors",
+        verbose_name="runtime configuration",
+    )
+    error_type = models.CharField(
+        "error type",
+        max_length=50,
+        choices=ErrorType.choices,
+    )
+    error_text = models.TextField("error text")
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name = "trader runtime configuration error"
+        verbose_name_plural = "trader runtime configuration errors"
+        ordering = ["-created_at"]
+
+    def __str__(self) -> str:
+        return f"{self.runtime_config_id} | {self.error_type} | {self.created_at}"
+
+
 class EmulationTrade(models.Model):
     """Stores the execution cycle of an emulated arbitrage trade."""
 

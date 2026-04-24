@@ -1,6 +1,12 @@
 from django.contrib import admin
 
-from apps.bots.models import BotConfig, EmulationTrade, Trade, TraderRuntimeConfig
+from apps.bots.models import (
+    BotConfig,
+    EmulationTrade,
+    Trade,
+    TraderRuntimeConfig,
+    TraderRuntimeConfigError,
+)
 
 
 @admin.register(BotConfig)
@@ -54,6 +60,21 @@ class TraderRuntimeConfigAdmin(admin.ModelAdmin):
         "created_at",
         "updated_at",
     )
+
+
+@admin.register(TraderRuntimeConfigError)
+class TraderRuntimeConfigErrorAdmin(admin.ModelAdmin):
+    """Admin interface for TraderRuntimeConfigError model."""
+
+    list_display = (
+        "id",
+        "runtime_config",
+        "error_type",
+        "created_at",
+    )
+    list_filter = ("error_type", "created_at")
+    search_fields = ("runtime_config__name", "runtime_config__owner__email", "error_text")
+    readonly_fields = ("created_at",)
 
 
 @admin.register(EmulationTrade)

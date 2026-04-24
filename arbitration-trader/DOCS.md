@@ -1044,10 +1044,13 @@ Endpoints:
 | `POST` | `/bots/real-trades/` | Create open real trade. |
 | `PATCH` | `/bots/real-trades/{id}/` | Close/update real trade. |
 | `GET` | `/bots/real-trades/?status=open` | Recover open trades. |
+| `POST` | `/bots/runtime-config-errors/` | Record runtime/control-plane errors for a `TraderRuntimeConfig`. |
 
-No JWT/service token is sent.
+All Django API requests include `X-Service-Token`.
 
-This relies on Django real-trades endpoint being open to this process. If Django API is publicly reachable, this is unsafe.
+Runtime errors are written through `api.createRuntimeConfigError(...)` with `runtime_config`, `error_type` and `error_text`. The control plane records failed `start`, `sync`, `stop`, diagnostics and validation requests when a `runtime_config_id` can be extracted from the body or query string. `RuntimeManager` also records unexpected worker crash/stop events as `runtime` errors.
+
+This relies on Django service-token endpoints being reachable from this process. If Django API is publicly reachable, protect it with private networking/reverse-proxy allowlists and rotate `SERVICE_SHARED_TOKEN`.
 
 ## 12. Exchange interface
 
@@ -1685,6 +1688,8 @@ Command behavior:
    - return an error while exchange exposure, pending close sync or unmanaged cleanup remains.
 
 `GET /health` without `X-Service-Token` exposes only public-safe `{ success: true, status: "ok" }` while `PUBLIC_HEALTH_DETAILS=false`. Detailed health exposes runtime risk state through `runtime_state`, `risk_locked`, `risk_incidents` and `open_exposure` only with `X-Service-Token` or `PUBLIC_HEALTH_DETAILS=true`.
+
+Failed control-plane requests are logged locally and, when a `runtime_config_id` can be extracted from the request body or query string, persisted to Django through `POST /bots/runtime-config-errors/`. Payload validation failures use `error_type=validation`; lifecycle routes use `start`, `sync` or `stop`; diagnostic routes use `exchange_health` or `diagnostics`.
 
 Diagnostic behavior:
 
