@@ -12,6 +12,7 @@ const SETTLE_COIN = 'USDT';
 const RECV_WINDOW = '5000';
 const ORDER_POLL_ATTEMPTS = 6;
 const ORDER_POLL_DELAY_MS = 700;
+const SERVER_TIME_OFFSET_TTL_MS = 60_000;
 
 type HttpMethod = 'GET' | 'POST';
 
@@ -125,6 +126,8 @@ export class BybitClient implements IExchangeClient {
     private readonly apiKey: string;
     private readonly secret: string;
     private readonly markets: Map<string, BybitInstrument> = new Map();
+    private serverTimeOffsetMs = 0;
+    private serverTimeOffsetSyncedAt = 0;
 
     constructor(options: ExchangeClientOptions = {}) {
         const useTestnet = options.useTestnet ?? config.useTestnet;
@@ -380,6 +383,7 @@ export class BybitClient implements IExchangeClient {
         endpoint: string,
         params: Record<string, unknown> = {},
         auth: boolean = false,
+        retryOnTimeSyncError: boolean = true,
     ): Promise<T> {
         const compactParams = this.compactParams(params);
         const queryString = this.toQueryString(compactParams);
@@ -398,7 +402,8 @@ export class BybitClient implements IExchangeClient {
                 throw new Error('Bybit API credentials are required for private endpoints');
             }
 
-            const timestamp = Date.now().toString();
+            await this.syncServerTimeOffset(false);
+            const timestamp = this.createSignedTimestamp();
             const payloadToSign = method === 'GET' ? queryString : body;
             const signature = crypto
                 .createHmac('sha256', this.secret)
@@ -420,6 +425,10 @@ export class BybitClient implements IExchangeClient {
             });
 
             if (response.data.retCode !== 0) {
+                if (auth && retryOnTimeSyncError && response.data.retCode === 10002) {
+                    return this.retryAfterServerTimeSync<T>(method, endpoint, params);
+                }
+
                 throw new BybitApiError(
                     response.data.retCode,
                     `Bybit API Error ${response.data.retCode}: ${response.data.retMsg}`,
@@ -435,6 +444,10 @@ export class BybitClient implements IExchangeClient {
 
             const responseData = error.response?.data as Partial<BybitResponse<unknown>> | undefined;
             if (responseData?.retCode !== undefined) {
+                if (auth && retryOnTimeSyncError && Number(responseData.retCode) === 10002) {
+                    return this.retryAfterServerTimeSync<T>(method, endpoint, params);
+                }
+
                 throw new BybitApiError(
                     Number(responseData.retCode),
                     `Bybit API Error ${responseData.retCode}: ${responseData.retMsg || error.message}`,
@@ -444,6 +457,30 @@ export class BybitClient implements IExchangeClient {
 
             throw new Error(`Bybit HTTP Error: ${error.message}`);
         }
+    }
+
+    private async retryAfterServerTimeSync<T>(
+        method: HttpMethod,
+        endpoint: string,
+        params: Record<string, unknown>,
+    ): Promise<T> {
+        await this.syncServerTimeOffset(true);
+        return this.request<T>(method, endpoint, params, true, false);
+    }
+
+    private async syncServerTimeOffset(force: boolean): Promise<void> {
+        const now = Date.now();
+        if (!force && now - this.serverTimeOffsetSyncedAt < SERVER_TIME_OFFSET_TTL_MS) {
+            return;
+        }
+
+        const serverTime = await this.fetchTime();
+        this.serverTimeOffsetMs = serverTime - Date.now();
+        this.serverTimeOffsetSyncedAt = Date.now();
+    }
+
+    private createSignedTimestamp(): string {
+        return Math.floor(Date.now() + this.serverTimeOffsetMs).toString();
     }
 
     private async fetchPositionList(params: Record<string, unknown>): Promise<BybitPosition[]> {

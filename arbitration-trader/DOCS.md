@@ -1154,6 +1154,7 @@ Key behavior:
 
 - direct HMAC-SHA256 signing with `X-BAPI-*` headers;
 - direct `fetchTime()` via `/v5/market/time`;
+- signed private requests use a cached Bybit server-time offset for request timestamps and force-refresh that offset once when Bybit returns `retCode=10002`;
 - direct `fetchTickers()` via `/v5/market/tickers?category=linear`;
 - direct `fetchPositions()` via `/v5/position/list`;
 - load tradable USDT linear perpetual markets from `/v5/market/instruments-info`;
@@ -1365,7 +1366,7 @@ Key points from it:
 Critical deploy warning:
 
 - Exchange APIs reject signed requests if server time drifts.
-- Time sync must be monitored.
+- Time sync must be monitored; Bybit signed requests compensate small process-local clock drift through `/v5/market/time`, but host NTP remains required for stable trading and for exchanges without client-side offset compensation.
 - Do not run multiple PM2 instances against one exchange account because distributed account lock is not implemented.
 
 ## 19. Commands
