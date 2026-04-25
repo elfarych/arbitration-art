@@ -2,17 +2,23 @@
 
 Дата анализа: 2026-04-23.
 
-Документ описывает фактическое состояние проекта `arbitration-trader`: архитектуру, конфигурацию, торговый цикл, интеграцию с Django, exchange-клиенты, команды запуска, деплой, проверки и текущие риски. Документация на русском; комментарии в коде добавлены на английском языке.
+Документ описывает фактическое состояние проекта `arbitration-trader`: архитектуру, конфигурацию, торговый цикл,
+интеграцию с Django, exchange-клиенты, команды запуска, деплой, проверки и текущие риски. Документация на русском;
+комментарии в коде добавлены на английском языке.
 
 ## 1. Краткое резюме
 
-`arbitration-trader` - standalone TypeScript/Node.js процесс для реальной арбитражной торговли между двумя выбранными futures/derivatives биржами.
+`arbitration-trader` - standalone TypeScript/Node.js процесс для реальной арбитражной торговли между двумя выбранными
+futures/derivatives биржами.
 
-Сервис поднимает HTTP control plane, принимает lifecycle-команды `POST /engine/trader/{start|sync|stop}` от Django, отдает diagnostic routes для exchange health, active coins, live PnL и system load, держит в одном процессе только один активный `TraderRuntimeConfig` и получает биржевые ключи/торговые параметры в payload.
+Сервис поднимает HTTP control plane, принимает lifecycle-команды `POST /engine/trader/{start|sync|stop}` от Django,
+отдает diagnostic routes для exchange health, active coins, live PnL и system load, держит в одном процессе только один
+активный `TraderRuntimeConfig` и получает биржевые ключи/торговые параметры в payload.
 
 Сервис:
 
-- читает из `.env` инфраструктурные/операционные переменные, process guards, execution journal path и production safety caps;
+- читает из `.env` инфраструктурные/операционные переменные, process guards, execution journal path и production safety
+  caps;
 - получает runtime-конфиг и ключи пользователя из Django;
 - загружает markets;
 - находит пересечение USDT perpetual symbols;
@@ -36,7 +42,8 @@
 - Восстановление открытых сделок из Django после рестарта.
 - Восстановление только тех открытых сделок, которые относятся к текущему `runtime_config_id`.
 
-Это real-trading сервис. Ошибки конфигурации, ключей, времени сервера, закрытия позиций или синхронизации с Django могут приводить к реальным финансовым потерям.
+Это real-trading сервис. Ошибки конфигурации, ключей, времени сервера, закрытия позиций или синхронизации с Django могут
+приводить к реальным финансовым потерям.
 
 ## 2. Технологический стек
 
@@ -88,6 +95,7 @@ arbitration-trader/
 ├── .env.example
 ├── DEPLOY_LINUX.md
 ├── DOCS.md
+├── WORKFLOW.md
 ├── test_binance.ts
 ├── test_gate.ts
 ├── binance_api_docs.html
@@ -191,7 +199,7 @@ RuntimeManager
 - Один процесс управляет всеми symbols.
 - Primary/secondary exchanges выбираются через runtime payload от Django.
 - Все chunks используют одни и те же REST clients и orderbook providers.
-- `main.ts` только связывает `RuntimeManager`, Fastify control plane и process shutdown handlers.
+- `main.ts` связывает `RuntimeManager`, Fastify control plane, process shutdown handlers и startup-запрос активного runtime payload из Django по `TRADER_INSTANCE_ID`.
 - `TradeCounter` общий для всех chunks и ограничивает число одновременных открытых сделок.
 - Django используется как persistence layer для real trades, но не управляет lifecycle этого trader-процесса.
 
@@ -213,65 +221,71 @@ dotenv.config();
 
 - `DJANGO_API_URL`
 - `PORT`
+- `TRADER_INSTANCE_ID`
 - `SHADOW_SIGNAL_LOG_PATH`
 - `EXECUTION_JOURNAL_PATH`
 - `TRADER_PROCESS_LOCK_PATH`
 - `PUBLIC_HEALTH_DETAILS`
 - `FAIL_ON_UNRESOLVED_EXECUTION_JOURNAL`
 - `POSITION_SIZE_TOLERANCE_PERCENT`
+- `ORDERBOOK_PAIR_MAX_AGE_MS`
+- `ORDERBOOK_PAIR_MAX_SKEW_MS`
 - `ALLOW_PRODUCTION_TRADING`
 - `TRADER_ENVIRONMENT`
 - `PRODUCTION_TRADING_ENVIRONMENT`
-- `PRODUCTION_ACCOUNT_FINGERPRINTS`
 - `MAX_PRODUCTION_TRADE_AMOUNT_USDT`
 - `MAX_PRODUCTION_CONCURRENT_TRADES`
 - `MAX_PRODUCTION_LEVERAGE`
 
-Биржевые ключи и торговые параметры приходят в runtime payload от Django. `runtime-payload-validation.ts` проверяет payload до `setActiveRuntime(payload)`: id, owner, допустимые exchange names, положительные числовые лимиты, `primary_exchange != secondary_exchange` и наличие ключей для выбранных бирж.
+Биржевые ключи и торговые параметры приходят в runtime payload от Django. `runtime-payload-validation.ts` проверяет
+payload до `setActiveRuntime(payload)`: id, owner, допустимые exchange names, положительные числовые лимиты,
+`primary_exchange != secondary_exchange` и наличие ключей для выбранных бирж.
 
 ### 5.1. Таблица переменных
 
-| Переменная | Default | Назначение |
-|---|---:|---|
-| `DJANGO_API_URL` | `http://127.0.0.1:8000/api` | Base URL Django API. |
-| `SERVICE_SHARED_TOKEN` | required | Shared token for Django -> trader control plane and Django trade API calls. |
-| `PORT` | `3002` | HTTP control plane port. |
-| `SHADOW_SIGNAL_LOG_PATH` | `logs/shadow-signals.jsonl` | JSONL file for shadow-mode entry signals. |
-| `EXECUTION_JOURNAL_PATH` | `logs/execution-journal.jsonl` | Durable local JSONL journal for open/cleanup/close execution intents and results. |
-| `TRADER_PROCESS_LOCK_PATH` | `locks/trader-runtime.lock` | Host-local lock file held while a runtime is active. |
-| `PUBLIC_HEALTH_DETAILS` | `false` | If `false`, unauthenticated `/health` returns only a public-safe `status=ok`; detailed health requires `X-Service-Token`. |
-| `FAIL_ON_UNRESOLVED_EXECUTION_JOURNAL` | `true` | Startup fails when the execution journal contains unresolved intents for the runtime. |
-| `POSITION_SIZE_TOLERANCE_PERCENT` | `0.1` | Allowed expected-vs-actual position size drift before reconciliation locks the runtime. |
-| `ALLOW_PRODUCTION_TRADING` | `false` | Process-level guard for payloads with `use_testnet=false`; production runtime also requires environment, account allowlist and caps below. |
-| `TRADER_ENVIRONMENT` | `development` | Current process environment id. Production payloads require it to match `PRODUCTION_TRADING_ENVIRONMENT`. |
-| `PRODUCTION_TRADING_ENVIRONMENT` | `production` | Required environment id for production payloads. |
-| `PRODUCTION_ACCOUNT_FINGERPRINTS` | empty | Comma-separated SHA-256 prefixes of selected exchange API keys for allowed live account routes. Empty value rejects production payloads. |
-| `MAX_PRODUCTION_TRADE_AMOUNT_USDT` | empty | Required live cap for `trade_amount_usdt`. Empty value rejects production payloads. |
-| `MAX_PRODUCTION_CONCURRENT_TRADES` | empty | Required live cap for `max_concurrent_trades`. Empty value rejects production payloads. |
-| `MAX_PRODUCTION_LEVERAGE` | empty | Required live cap for `leverage`. Empty value rejects production payloads. |
+| Переменная                             |                        Default | Назначение                                                                                                                       |
+|----------------------------------------|-------------------------------:|----------------------------------------------------------------------------------------------------------------------------------|
+| `DJANGO_API_URL`                       |    `http://127.0.0.1:8000/api` | Base URL Django API.                                                                                                             |
+| `SERVICE_SHARED_TOKEN`                 |                       required | Shared token for Django -> trader control plane and Django trade API calls.                                                      |
+| `PORT`                                 |                         `3002` | HTTP control plane port.                                                                                                         |
+| `TRADER_INSTANCE_ID`                   |                          empty | Optional Django `TraderRuntimeConfig.id`. When set, trader fetches this active config from Django during process startup.        |
+| `SHADOW_SIGNAL_LOG_PATH`               |    `logs/shadow-signals.jsonl` | JSONL file for shadow-mode entry signals.                                                                                        |
+| `EXECUTION_JOURNAL_PATH`               | `logs/execution-journal.jsonl` | Durable local JSONL journal for open/cleanup/close execution intents and results.                                                |
+| `TRADER_PROCESS_LOCK_PATH`             |    `locks/trader-runtime.lock` | Host-local lock file held while a runtime is active.                                                                             |
+| `PUBLIC_HEALTH_DETAILS`                |                        `false` | If `false`, unauthenticated `/health` returns only a public-safe `status=ok`; detailed health requires `X-Service-Token`.        |
+| `FAIL_ON_UNRESOLVED_EXECUTION_JOURNAL` |                         `true` | Startup fails when the execution journal contains unresolved intents for the runtime.                                            |
+| `POSITION_SIZE_TOLERANCE_PERCENT`      |                          `0.1` | Allowed expected-vs-actual position size drift before reconciliation locks the runtime.                                          |
+| `ORDERBOOK_PAIR_MAX_AGE_MS`            |                         `2000` | Maximum local age for each orderbook snapshot used by entry/profit/liquidation signal checks.                                    |
+| `ORDERBOOK_PAIR_MAX_SKEW_MS`           |                         `1000` | Maximum local timestamp skew between primary and secondary snapshots used by signal checks.                                      |
+| `ALLOW_PRODUCTION_TRADING`             |                        `false` | Process-level guard for payloads with `use_testnet=false`; production runtime also requires matching environment and caps below. |
+| `TRADER_ENVIRONMENT`                   |                  `development` | Current process environment id. Production payloads require it to match `PRODUCTION_TRADING_ENVIRONMENT`.                        |
+| `PRODUCTION_TRADING_ENVIRONMENT`       |                   `production` | Required environment id for production payloads.                                                                                 |
+| `MAX_PRODUCTION_TRADE_AMOUNT_USDT`     |                          empty | Required live cap for `trade_amount_usdt`. Empty value rejects production payloads.                                              |
+| `MAX_PRODUCTION_CONCURRENT_TRADES`     |                          empty | Required live cap for `max_concurrent_trades`. Empty value rejects production payloads.                                          |
+| `MAX_PRODUCTION_LEVERAGE`              |                          empty | Required live cap for `leverage`. Empty value rejects production payloads.                                                       |
 
 Runtime payload fields in `config`:
 
-| Field | Назначение |
-|---|---|
-| `primary_exchange`, `secondary_exchange` | Exchange route. |
-| `use_testnet` | Testnet/sandbox mode where supported. |
-| `trade_amount_usdt` | Position notional before leverage. |
-| `leverage` | Leverage on both exchanges. |
-| `max_concurrent_trades` | Global concurrent open trade limit. |
-| `top_liquid_pairs_count` | Max number of liquid pairs to scan. |
-| `max_trade_duration_minutes` | Timeout before force close. |
-| `max_leg_drawdown_percent` | Per-leg leveraged drawdown limit. |
-| `open_threshold` | Spread expansion over EMA baseline to open. |
-| `close_threshold` | True PnL threshold to close. |
-| `orderbook_limit` | Orderbook depth subscription limit. |
-| `chunk_size` | Symbols per `Trader` instance. |
-| `min_open_net_edge_percent` | Minimum hard economic entry edge after buffers. Default `0`. |
-| `entry_fee_buffer_percent` | Entry/exit fee buffer for entry signal. Default `0.20`. |
-| `entry_slippage_buffer_percent` | Slippage buffer for entry signal. Default `0.05`. |
-| `funding_buffer_percent` | Extra funding risk buffer. Default `0`. |
-| `latency_buffer_percent` | Latency/staleness buffer. Default `0.02`. |
-| `shadow_mode` | If `true`, entry signals are recorded without placing orders. Default `false`. |
+| Field                                    | Назначение                                                                     |
+|------------------------------------------|--------------------------------------------------------------------------------|
+| `primary_exchange`, `secondary_exchange` | Exchange route.                                                                |
+| `use_testnet`                            | Testnet/sandbox mode where supported.                                          |
+| `trade_amount_usdt`                      | Position notional before leverage.                                             |
+| `leverage`                               | Leverage on both exchanges.                                                    |
+| `max_concurrent_trades`                  | Global concurrent open trade limit.                                            |
+| `top_liquid_pairs_count`                 | Max number of liquid pairs to scan.                                            |
+| `max_trade_duration_minutes`             | Timeout before force close.                                                    |
+| `max_leg_drawdown_percent`               | Per-leg leveraged drawdown limit.                                              |
+| `open_threshold`                         | Spread expansion over EMA baseline to open.                                    |
+| `close_threshold`                        | True PnL threshold to close.                                                   |
+| `orderbook_limit`                        | Orderbook depth subscription limit.                                            |
+| `chunk_size`                             | Symbols per `Trader` instance.                                                 |
+| `min_open_net_edge_percent`              | Minimum hard economic entry edge after buffers. Default `0`.                   |
+| `entry_fee_buffer_percent`               | Entry/exit fee buffer for entry signal. Default `0.20`.                        |
+| `entry_slippage_buffer_percent`          | Slippage buffer for entry signal. Default `0.05`.                              |
+| `funding_buffer_percent`                 | Extra funding risk buffer. Default `0`.                                        |
+| `latency_buffer_percent`                 | Latency/staleness buffer. Default `0.02`.                                      |
+| `shadow_mode`                            | If `true`, entry signals are recorded without placing orders. Default `false`. |
 
 Supported route names:
 
@@ -288,13 +302,15 @@ Important:
 
 ## 6. Entry Point: `main.ts`
 
-`main.ts` contains only process wiring:
+`main.ts` contains process wiring:
 
 - create `RuntimeManager`;
 - register process shutdown handlers from `control-plane/shutdown.ts`;
 - create and start Fastify control plane from `control-plane/server.ts`.
+- if `TRADER_INSTANCE_ID` is configured, fetch `GET /api/bots/runtime-configs/{id}/active-payload/` from Django with `X-Service-Token` and call `RuntimeManager.start(payload)` when Django returns an active payload.
 
-HTTP routing, token checks, payload parsing and error mapping live in `src/control-plane/server.ts`. Runtime command payload validation lives in `src/services/runtime-payload-validation.ts`.
+HTTP routing, token checks, payload parsing and error mapping live in `src/control-plane/server.ts`. Runtime command
+payload validation lives in `src/services/runtime-payload-validation.ts`.
 
 ### 6.1. Control plane
 
@@ -312,9 +328,17 @@ Fastify routes:
 
 All routes except `/health` require `X-Service-Token`.
 
-Unauthenticated `GET /health` returns only public-safe `{ success: true, status: "ok" }` while `PUBLIC_HEALTH_DETAILS=false`. Detailed health with `active_runtime_config_id`, `runtime_state`, `risk_locked`, `risk_incidents` and `open_exposure` is returned when the request has a valid `X-Service-Token` or `PUBLIC_HEALTH_DETAILS=true`. `runtime_state` is one of `idle`, `running`, `risk_locked`, `stopping_with_open_exposure`.
+Unauthenticated `GET /health` returns only public-safe `{ success: true, status: "ok" }` while
+`PUBLIC_HEALTH_DETAILS=false`. Detailed health with `active_runtime_config_id`, `runtime_state`, `risk_locked`,
+`risk_incidents` and `open_exposure` is returned when the request has a valid `X-Service-Token` or
+`PUBLIC_HEALTH_DETAILS=true`. `runtime_state` is one of `idle`, `running`, `risk_locked`, `stopping_with_open_exposure`.
 
 Invalid runtime payloads return HTTP 400. Runtime errors return HTTP 500.
+
+When `POST /engine/trader/start` or `POST /engine/trader/sync` arrives for the already running runtime with the same
+payload, `RuntimeManager` treats it as an idempotent no-op and keeps the current runtime running. A changed payload
+still triggers a graceful restart. This absorbs Django retry/timeout duplicates without stopping a freshly bootstrapped
+runtime.
 
 ### 6.2. Startup banner
 
@@ -332,12 +356,12 @@ Invalid runtime payloads return HTTP 400. Runtime errors return HTTP 500.
 
 `createClient(name)` returns:
 
-| Config name | Client |
-|---|---|
-| `binance` | `BinanceClient` |
-| `bybit` | `BybitClient` |
-| `mexc` | `MexcClient` |
-| `gate` | `GateClient` |
+| Config name | Client          |
+|-------------|-----------------|
+| `binance`   | `BinanceClient` |
+| `bybit`     | `BybitClient`   |
+| `mexc`      | `MexcClient`    |
+| `gate`      | `GateClient`    |
 
 Unknown exchange names are rejected during runtime payload validation and by `RuntimeManager.createClient()`.
 
@@ -393,7 +417,7 @@ BTC/USDT:USDT
 
 The trader fetches tickers from both selected exchanges and filters:
 
-- require `min(primaryVolume, secondaryVolume) >= 2_000_000`;
+- require `min(primaryVolume, secondaryVolume) >= 1_000_000`;
 - sort by cross-exchange minimum quote volume descending;
 - keep first `TOP_LIQUID_PAIRS_COUNT`.
 
@@ -402,7 +426,8 @@ Reason:
 - illiquid symbols can show fake/unexecutable spreads;
 - lower depth increases slippage and partial-fill risk.
 
-If ticker fetch fails and there are no open Django trades to restore, runtime startup fails closed. If open trades exist, the runtime starts only for recovery symbols and blocks new entries for those symbols after they are closed.
+If ticker fetch fails and there are no open Django trades to restore, runtime startup fails closed. If open trades
+exist, the runtime starts only for recovery symbols and blocks new entries for those symbols after they are closed.
 
 ### 6.8. Market info validation
 
@@ -454,24 +479,29 @@ Additional guarantees:
 - startup aborts if any open Django trade cannot be included in the runtime universe;
 - Gate/MEXC setup warnings are not treated as successful setup;
 - a symbol is allowed into scanning only after both exchanges confirmed the requested margin/leverage state.
-- confirmed leverage/margin setup is cached in-process by account fingerprint, testnet/production mode, exchange route, symbol and leverage, so repeated syncs skip already confirmed symbols only inside the same environment/account route.
+- confirmed leverage/margin setup is cached in-process by account fingerprint, testnet/production mode, exchange route,
+  symbol and leverage, so repeated syncs skip already confirmed symbols only inside the same environment/account route.
 
 ### 6.10. Orderbook providers
 
 `createOrderBookProvider(name)` returns an `OrderBookProvider`:
 
-| Config name | Provider |
-|---|---|
-| `binance` | Native Binance USD-M Futures depth stream provider. |
-| `bybit` | Native Bybit V5 public linear orderbook provider. |
-| `mexc` | Native MEXC Contract `push.depth` provider. |
-| `gate` | Native Gate USDT Futures `futures.order_book_update` provider. |
+| Config name | Provider                                                       |
+|-------------|----------------------------------------------------------------|
+| `binance`   | Native Binance USD-M Futures depth stream provider.            |
+| `bybit`     | Native Bybit V5 public linear orderbook provider.              |
+| `mexc`      | Native MEXC Contract `push.depth` provider.                    |
+| `gate`      | Native Gate USDT Futures `futures.order_book_update` provider. |
 
 Providers are shared by all `Trader` chunks and expose only normalized orderbook snapshots through:
 
 ```ts
-getOrderBook(symbol): OrderBookSnapshot | null
-onUpdate(listener): () => void
+getOrderBook(symbol)
+:
+OrderBookSnapshot | null
+onUpdate(listener)
+:
+() => void
 ```
 
 Important:
@@ -479,9 +509,14 @@ Important:
 - Providers are created without API credentials.
 - They are used for public orderbook streaming.
 - Binance native provider blocks trading for a symbol while the local book is unsynced or older than 10 seconds.
-- Bybit native provider uses V5 `orderbook.{depth}.{symbol}` snapshots/deltas, heartbeat ping every 20 seconds, reconnect/resubscribe, and stale-book blocking.
-- Gate native provider subscribes to `futures.order_book_update`, fetches REST snapshots with `with_id=true`, validates `U`/`u` continuity, converts contract sizes to base coin amounts through `quanto_multiplier`, sends `X-Gate-Size-Decimal: 1`, and blocks trading while the book is unsynced or stale.
-- MEXC native provider subscribes to `sub.depth` with `compress: false`, fetches REST depth snapshots, validates contiguous `version` increments, converts contract volumes to base coin amounts through `contractSize`, and blocks trading while the book is unsynced or stale.
+- Bybit native provider uses V5 `orderbook.{depth}.{symbol}` snapshots/deltas, heartbeat ping every 20 seconds,
+  reconnect/resubscribe, and stale-book blocking.
+- Gate native provider subscribes to `futures.order_book_update`, fetches REST snapshots with `with_id=true`, validates
+  `U`/`u` continuity, converts contract sizes to base coin amounts through `quanto_multiplier`, sends
+  `X-Gate-Size-Decimal: 1`, and blocks trading while the book is unsynced or stale.
+- MEXC native provider subscribes to `sub.depth` with `compress: false`, fetches REST depth snapshots, validates
+  contiguous `version` increments, converts contract volumes to base coin amounts through `contractSize`, and blocks
+  trading while the book is unsynced or stale.
 
 ### 6.11. TradeCounter
 
@@ -501,14 +536,14 @@ Each chunk becomes one `Trader`:
 
 ```ts
 new Trader(
-  id,
-  chunk,
-  wsPrimary,
-  wsSecondary,
-  primaryClient,
-  secondaryClient,
-  marketInfo,
-  tradeCounter
+    id,
+    chunk,
+    wsPrimary,
+    wsSecondary,
+    primaryClient,
+    secondaryClient,
+    marketInfo,
+    tradeCounter
 )
 ```
 
@@ -520,13 +555,16 @@ Before liquidity filtering finishes, runtime loads open trades:
 const openTrades = await api.getOpenTrades(config.runtimeConfigId);
 ```
 
-Open trade symbols are added to the runtime universe even if they are not part of the current liquid scanning set. If a recovery symbol is not scannable, its `PairState.canOpenNewTrades` is `false`, so the runtime can monitor/close the restored exposure without opening a new trade on that symbol.
+Open trade symbols are added to the runtime universe even if they are not part of the current liquid scanning set. If a
+recovery symbol is not scannable, its `PairState.canOpenNewTrades` is `false`, so the runtime can monitor/close the
+restored exposure without opening a new trade on that symbol.
 
 Then each open trade is assigned to the `Trader` whose `symbols` include `trade.coin`.
 
 If no matching trader chunk exists, runtime startup fails. Open trades are not ignored.
 
-If `getOpenTrades()` fails, runtime startup is aborted. The trader does not continue with an empty in-memory state while exchange exposure may still exist.
+If `getOpenTrades()` fails, runtime startup is aborted. The trader does not continue with an empty in-memory state while
+exchange exposure may still exist.
 
 ### 6.14. Shutdown
 
@@ -546,7 +584,8 @@ Graceful shutdown:
 
 `stop(true)` means active positions should be closed before exit.
 
-`unhandledRejection` is treated as fatal: the process starts controlled shutdown and exits with non-zero status so a supervisor can restart it.
+`unhandledRejection` is treated as fatal: the process starts controlled shutdown and exits with non-zero status so a
+supervisor can restart it.
 
 ## 7. `TradeCounter`
 
@@ -599,19 +638,19 @@ Constructor dependencies:
 
 Each symbol has:
 
-| Field | Meaning |
-|---|---|
-| `baselineBuy` | EMA baseline for buy spread. |
-| `baselineSell` | EMA baseline for sell spread. |
-| `activeTrade` | Current Django trade record. |
-| `openedAtMs` | Open timestamp for timeout checks. |
-| `busy` | Mutex preventing duplicate open/close. |
-| `cooldownUntil` | Re-entry block after failure. |
-| `pendingCloseSync` | Exchange close payload that still must be persisted to Django. |
-| `unmanagedExposure` | Failed-open cleanup state; new entries are blocked and cleanup is retried until flat. |
-| `partialClose` | In-process per-leg close execution state with fill price, order id, commission and size, used when one close leg succeeds and the other fails. |
-| `closeIntentId` | Execution-journal intent id reused across close retries for the same active trade. |
-| `canOpenNewTrades` | Blocks new entries for recovery-only symbols. |
+| Field               | Meaning                                                                                                                                        |
+|---------------------|------------------------------------------------------------------------------------------------------------------------------------------------|
+| `baselineBuy`       | EMA baseline for buy spread.                                                                                                                   |
+| `baselineSell`      | EMA baseline for sell spread.                                                                                                                  |
+| `activeTrade`       | Current Django trade record.                                                                                                                   |
+| `openedAtMs`        | Open timestamp for timeout checks.                                                                                                             |
+| `busy`              | Mutex preventing duplicate open/close.                                                                                                         |
+| `cooldownUntil`     | Re-entry block after failure.                                                                                                                  |
+| `pendingCloseSync`  | Exchange close payload that still must be persisted to Django.                                                                                 |
+| `unmanagedExposure` | Failed-open cleanup state; new entries are blocked and cleanup is retried until flat.                                                          |
+| `partialClose`      | In-process per-leg close execution state with fill price, order id, commission and size, used when one close leg succeeds and the other fails. |
+| `closeIntentId`     | Execution-journal intent id reused across close retries for the same active trade.                                                             |
+| `canOpenNewTrades`  | Blocks new entries for recovery-only symbols.                                                                                                  |
 
 Constants:
 
@@ -626,16 +665,17 @@ For every trade:
 
 - find matching symbol state;
 - if no active trade there:
-  - set `activeTrade`;
-  - set `openedAtMs` from Django `opened_at`;
-  - call `tradeCounter.forceReserve()`.
+    - set `activeTrade`;
+    - set `openedAtMs` from Django `opened_at`;
+    - call `tradeCounter.forceReserve()`.
 
 This lets the bot continue monitoring exits after restart.
 
 Risk:
 
 - Recovery matches by symbol, not by exchange route/account/process id.
-- If multiple standalone trader processes or exchange routes share Django, recovery can attach a trade to the wrong runtime.
+- If multiple standalone trader processes or exchange routes share Django, recovery can attach a trade to the wrong
+  runtime.
 
 ### 8.3. `start()`
 
@@ -644,7 +684,8 @@ Starts:
 - timeout watchdog interval;
 - update listeners on primary and secondary `OrderBookProvider`.
 
-`start()` schedules one spread check per symbol when provider updates arrive. Per-symbol scheduling prevents overlapping spread checks for the same symbol.
+`start()` schedules one spread check per symbol when provider updates arrive. Per-symbol scheduling prevents overlapping
+spread checks for the same symbol.
 
 `start()` normally never resolves until `stop()` is called.
 
@@ -654,7 +695,8 @@ Behavior:
 
 - if `closePositions=true`, set `isStopping=true` so new entries are blocked;
 - call `closeAllPositions('shutdown')`;
-- keep timers and provider listeners alive if exposure, pending close sync, unmanaged cleanup or runtime risk lock remains;
+- keep timers and provider listeners alive if exposure, pending close sync, unmanaged cleanup or runtime risk lock
+  remains;
 - clear timers/listeners and resolve only when the trader is flat/reconciled, or when `closePositions=false`.
 
 Used by graceful shutdown.
@@ -744,7 +786,9 @@ expected_net_edge >= min_open_net_edge_percent
 11. Check cooldown.
 12. Open the selected direction if both signal and economic thresholds pass.
 
-Funding cost uses cached funding rates from `MarketInfoService` when next funding time is inside `max_trade_duration_minutes`. Unknown funding rates contribute `0`, while `funding_buffer_percent` remains a static conservative buffer.
+Funding cost uses cached funding rates from `MarketInfoService` when next funding time is inside
+`max_trade_duration_minutes`. Unknown funding rates contribute `0`, while `funding_buffer_percent` remains a static
+conservative buffer.
 
 Direction semantics:
 
@@ -763,20 +807,21 @@ Direction semantics:
 Flow:
 
 1. Set `state.busy=true`.
-2. If `shadow_mode=true`, write the entry signal into `SHADOW_SIGNAL_LOG_PATH`, set cooldown and return without placing orders.
+2. If `shadow_mode=true`, write the entry signal into `SHADOW_SIGNAL_LOG_PATH`, set cooldown and return without placing
+   orders.
 3. Reserve global trade slot.
 4. Determine order sides.
 5. Verify there is no unexpected existing position on the target symbol.
 6. Place both market orders concurrently via `Promise.allSettled`.
 7. If any leg rejects:
-   - log atomic failure;
-   - close any fulfilled leg with reduce-only opposite order;
-   - wait 1 second;
-   - run safe cleanup;
-   - release trade slot only when cleanup is confirmed;
-   - keep the slot reserved and set `unmanagedExposure` when cleanup fails;
-   - set cooldown;
-   - return.
+    - log atomic failure;
+    - close any fulfilled leg with reduce-only opposite order;
+    - wait 1 second;
+    - run safe cleanup;
+    - release trade slot only when cleanup is confirmed;
+    - keep the slot reserved and set `unmanagedExposure` when cleanup fails;
+    - set cooldown;
+    - return.
 8. Use exchange fill prices or fallback VWAP prices.
 9. Sum commissions.
 10. Recalculate real open spread from fill prices.
@@ -785,12 +830,12 @@ Flow:
 13. Store `openedAtMs`.
 14. Slot remains reserved until close.
 15. On catch after orders may have reached exchanges:
-   - log;
-   - run safe cleanup;
-   - release slot only when cleanup is confirmed;
-   - set runtime risk lock and `unmanagedExposure` when cleanup fails;
-   - reset baselines;
-   - set cooldown.
+- log;
+- run safe cleanup;
+- release slot only when cleanup is confirmed;
+- set runtime risk lock and `unmanagedExposure` when cleanup fails;
+- reset baselines;
+- set cooldown.
 16. Finally clear busy flag.
 
 Important:
@@ -798,7 +843,8 @@ Important:
 - There is no true atomic open across exchanges.
 - The code compensates by flattening any successfully opened leg.
 - `reduceOnly` is used for rollback where supported.
-- Runtime-level risk lock blocks new entries across all trader chunks while unmanaged exposure or reconciliation incidents exist.
+- Runtime-level risk lock blocks new entries across all trader chunks while unmanaged exposure or reconciliation
+  incidents exist.
 
 ### 8.9. Cleanup: `handleOpenCleanup(symbol, orderType)`
 
@@ -811,9 +857,11 @@ Flow:
 - fetch positions on secondary;
 - close matching symbol position if size >= minQty.
 
-It does not rely on local promise results, because an API call can time out after the exchange accepted/fillled the order.
+It does not rely on local promise results, because an API call can time out after the exchange accepted/fillled the
+order.
 
-If cleanup fails, `unmanagedExposure` is stored in `PairState`, the runtime risk lock is enabled, and cleanup retries run from the normal watchdog/update flow until positions are confirmed flat.
+If cleanup fails, `unmanagedExposure` is stored in `PairState`, the runtime risk lock is enabled, and cleanup retries
+run from the normal watchdog/update flow until positions are confirmed flat.
 
 ### 8.10. Exit logic: `checkExit(...)`
 
@@ -825,13 +873,13 @@ Inputs:
 Order:
 
 1. Liquidation/drawdown protection:
-   - use emergency prices;
-   - compute max leveraged leg drawdown;
-   - if >= `MAX_LEG_DRAWDOWN_PERCENT`, close with reason `liquidation`.
+    - use emergency prices;
+    - compute max leveraged leg drawdown;
+    - if >= `MAX_LEG_DRAWDOWN_PERCENT`, close with reason `liquidation`.
 2. Profit check:
-   - use strict prices;
-   - compute `calculateTruePnL`;
-   - if >= `CLOSE_THRESHOLD`, close with reason `profit`.
+    - use strict prices;
+    - compute `calculateTruePnL`;
+    - if >= `CLOSE_THRESHOLD`, close with reason `profit`.
 
 ### 8.11. Closing trade: `executeClose(...)`
 
@@ -849,24 +897,24 @@ Flow:
 10. Store successful close-leg execution in `partialClose` before handling failed legs.
 11. Fallback to current book/open price if no close order is needed or price is missing.
 12. Calculate:
-   - close commission;
-   - total commission;
-   - real PnL;
-   - close spread;
-   - status.
+- close commission;
+- total commission;
+- real PnL;
+- close spread;
+- status.
 13. Update Django through `CloseSyncService` with retries:
-   - up to 10 attempts;
-   - 5s delay between attempts.
+- up to 10 attempts;
+- 5s delay between attempts.
 14. If Django still does not accept the close payload:
-   - keep `activeTrade` in local state;
-   - keep the trade slot reserved;
-   - store the exact close payload in pending sync state;
-   - retry Django close sync until it succeeds.
+- keep `activeTrade` in local state;
+- keep the trade slot reserved;
+- store the exact close payload in pending sync state;
+- retry Django close sync until it succeeds.
 15. Only after successful close persistence:
-   - clear active trade and opened timestamp;
-   - clear `partialClose`;
-   - release trade slot;
-   - reset or update baselines.
+- clear active trade and opened timestamp;
+- clear `partialClose`;
+- release trade slot;
+- reset or update baselines.
 16. On exchange close error, do not clear local state; next tick will retry and reuse stored per-leg close state.
 
 Close status:
@@ -993,8 +1041,8 @@ Behavior:
 - target <= 0 -> first level price;
 - enough depth -> full VWAP;
 - insufficient depth:
-  - strict mode -> `NaN`;
-  - emergency mode -> VWAP of available depth.
+    - strict mode -> `NaN`;
+    - emergency mode -> VWAP of available depth.
 
 ## 10. MarketInfoService
 
@@ -1011,20 +1059,21 @@ Flow:
 
 1. Fetch primary/secondary tickers.
 2. For each common symbol:
-   - get primary market info;
-   - get secondary market info;
-   - skip if missing;
-   - set `stepSize = max(primary.stepSize, secondary.stepSize)`;
-   - set `minQty = max(primary.minQty, secondary.minQty)`;
-   - set `minNotional = max(primary.minNotional, secondary.minNotional)`;
-   - compare prices;
-   - skip if deviation > 40%;
-   - compute `trade_amount_usdt / currentPrice`;
-   - round down to step size;
-   - reject if below min constraints;
-   - cache `UnifiedMarketInfo`.
+    - get primary market info;
+    - get secondary market info;
+    - skip if missing;
+    - set `stepSize = max(primary.stepSize, secondary.stepSize)`;
+    - set `minQty = max(primary.minQty, secondary.minQty)`;
+    - set `minNotional = max(primary.minNotional, secondary.minNotional)`;
+    - compare prices;
+    - skip if deviation > 40%;
+    - compute `trade_amount_usdt / currentPrice`;
+    - round down to step size;
+    - reject if below min constraints;
+    - cache `UnifiedMarketInfo`.
 
-The 40% deviation check is a homonym/ticker collision guard. It protects against different assets with the same ticker on different exchanges.
+The 40% deviation check is a homonym/ticker collision guard. It protects against different assets with the same ticker
+on different exchanges.
 
 ## 11. Django API integration
 
@@ -1035,23 +1084,35 @@ Axios client:
 ```ts
 baseURL: config.djangoApiUrl
 timeout: 15000
-Content-Type: application/json
+Content - Type
+:
+application / json
 ```
 
 Endpoints:
 
-| Method | Path | Purpose |
-|---|---|---|
-| `POST` | `/bots/real-trades/` | Create open real trade. |
-| `PATCH` | `/bots/real-trades/{id}/` | Close/update real trade. |
-| `GET` | `/bots/real-trades/?status=open` | Recover open trades. |
-| `POST` | `/bots/runtime-config-errors/` | Record runtime/control-plane errors for a `TraderRuntimeConfig`. |
+| Method  | Path                             | Purpose                                                          |
+|---------|----------------------------------|------------------------------------------------------------------|
+| `POST`  | `/bots/real-trades/`             | Create open real trade.                                          |
+| `PATCH` | `/bots/real-trades/{id}/`        | Close/update real trade.                                         |
+| `GET`   | `/bots/real-trades/?status=open` | Recover open trades.                                             |
+| `GET`   | `/bots/runtime-configs/{id}/active-payload/` | Fetch active startup payload for `TRADER_INSTANCE_ID`.                          |
+| `POST`  | `/bots/runtime-config-errors/`   | Record runtime/control-plane errors for a `TraderRuntimeConfig`. |
 
 All Django API requests include `X-Service-Token`.
 
-Runtime errors are written through `api.createRuntimeConfigError(...)` with `runtime_config`, `error_type` and `error_text`. The control plane records failed `start`, `sync`, `stop`, diagnostics and validation requests when a `runtime_config_id` can be extracted from the body or query string. `RuntimeManager` also records unexpected worker crash/stop events as `runtime` errors.
+Runtime errors are written through `api.createRuntimeConfigError(...)` with `runtime_config`, `error_type` and
+`error_text`. The control plane records failed `start`, `sync`, `stop`, diagnostics and validation requests when a
+`runtime_config_id` can be extracted from the body or query string. `RuntimeManager` also records unexpected worker
+crash/stop events as `runtime` errors.
 
-This relies on Django service-token endpoints being reachable from this process. If Django API is publicly reachable, protect it with private networking/reverse-proxy allowlists and rotate `SERVICE_SHARED_TOKEN`.
+On process startup, `api.getActiveRuntimePayload(TRADER_INSTANCE_ID)` calls Django
+`GET /bots/runtime-configs/{id}/active-payload/` with `X-Service-Token`. Django returns the full runtime command payload
+only when that `TraderRuntimeConfig` is active and not deleted; otherwise trader stays idle and continues serving the
+control plane.
+
+This relies on Django service-token endpoints being reachable from this process. If Django API is publicly reachable,
+protect it with private networking/reverse-proxy allowlists and rotate `SERVICE_SHARED_TOKEN`.
 
 ## 12. Exchange interface
 
@@ -1061,16 +1122,25 @@ Every exchange client implements:
 
 ```ts
 interface IExchangeClient {
-  readonly name: string;
-  fetchTime(): Promise<number>;
-  fetchTickers(symbols?): Promise<Record<string, ExchangeTicker>>;
-  fetchPositions(symbols): Promise<ExchangePosition[]>;
-  loadMarkets(): Promise<void>;
-  setLeverage(symbol, leverage): Promise<void>;
-  setIsolatedMargin(symbol): Promise<void>;
-  createMarketOrder(symbol, side, amount, params?): Promise<OrderResult>;
-  getMarketInfo(symbol): SymbolMarketInfo | null;
-  getUsdtSymbols(): string[];
+    readonly name: string;
+
+    fetchTime(): Promise<number>;
+
+    fetchTickers(symbols?): Promise<Record<string, ExchangeTicker>>;
+
+    fetchPositions(symbols): Promise<ExchangePosition[]>;
+
+    loadMarkets(): Promise<void>;
+
+    setLeverage(symbol, leverage): Promise<void>;
+
+    setIsolatedMargin(symbol): Promise<void>;
+
+    createMarketOrder(symbol, side, amount, params?): Promise<OrderResult>;
+
+    getMarketInfo(symbol): SymbolMarketInfo | null;
+
+    getUsdtSymbols(): string[];
 }
 ```
 
@@ -1132,7 +1202,8 @@ Behavior:
 8. Return `null` from `getOrderBook(symbol)` while a symbol is unsynced.
 9. Reconnect with exponential backoff and resubscribe all symbols after WS disconnect.
 
-Depth snapshots use the nearest Binance-supported depth limit from `5, 10, 20, 50, 100, 500, 1000` based on `ORDERBOOK_LIMIT`.
+Depth snapshots use the nearest Binance-supported depth limit from `5, 10, 20, 50, 100, 500, 1000` based on
+`ORDERBOOK_LIMIT`.
 
 ## 14. BybitClient
 
@@ -1154,11 +1225,14 @@ Key behavior:
 
 - direct HMAC-SHA256 signing with `X-BAPI-*` headers;
 - direct `fetchTime()` via `/v5/market/time`;
-- signed private requests use a cached Bybit server-time offset for request timestamps and force-refresh that offset once when Bybit returns `retCode=10002`;
+- signed private requests use a cached Bybit server-time offset for request timestamps and force-refresh that offset
+  once when Bybit returns `retCode=10002`;
 - direct `fetchTickers()` via `/v5/market/tickers?category=linear`;
 - direct `fetchPositions()` via `/v5/position/list`;
 - load tradable USDT linear perpetual markets from `/v5/market/instruments-info`;
 - set isolated margin through `/v5/position/switch-isolated`;
+- treat Bybit `retCode=100028` on isolated margin switch as non-fatal for Unified Account routes, log a warning and
+  continue with the account's current margin mode;
 - set leverage through `/v5/position/set-leverage`;
 - create market orders through `/v5/order/create`;
 - send `positionIdx: 0`, so the account route is expected to use one-way position mode;
@@ -1166,7 +1240,8 @@ Key behavior:
 - do not blindly retry order placement after transport failures; reconcile by `orderLinkId` before surfacing the error;
 - poll `/v5/order/realtime` and `/v5/order/history` for final order state;
 - read `/v5/execution/list` to compute average fill price and USDT/USDC commission;
-- reject non-filled or partially filled market orders so `Trader` cleanup can flatten real positions through `fetchPositions()`.
+- reject non-filled or partially filled market orders so `Trader` cleanup can flatten real positions through
+  `fetchPositions()`.
 
 ### 14.1. Bybit native orderbook provider
 
@@ -1211,24 +1286,30 @@ Key behavior:
 - load USDT perpetual contracts from `/api/v1/contract/detail`;
 - fetch 24h tickers from `/api/v1/contract/ticker`;
 - fetch open positions from `/api/v1/private/position/open_positions`;
-- ошибки private positions endpoint пробрасываются вызывающему коду, чтобы close/cleanup logic не трактовала неизвестное состояние позиции MEXC как flat;
+- ошибки private positions endpoint пробрасываются вызывающему коду, чтобы close/cleanup logic не трактовала неизвестное
+  состояние позиции MEXC как flat;
 - set isolated leverage through `/api/v1/private/position/change_leverage` for long and short sides;
-- treat `setIsolatedMargin()` as a MEXC-specific precondition because isolated mode is sent as `openType: 1` on leverage and order requests;
+- treat `setIsolatedMargin()` as a MEXC-specific precondition because isolated mode is sent as `openType: 1` on leverage
+  and order requests;
 - convert base coin amount to MEXC contract `vol` through `contractSize` and `volUnit`;
 - use side `1` for open long, `3` for open short, `2` for close short and `4` for close long;
 - submit market orders with `type: 5`, `openType: 1` and `externalOid`;
-- reconcile transport/order-submit failures by querying `/api/v1/private/order/external/{symbol}/{externalOid}` before surfacing the error;
+- reconcile transport/order-submit failures by querying `/api/v1/private/order/external/{symbol}/{externalOid}` before
+  surfacing the error;
 - poll final order details and deal details;
 - count only USDT/USDC fees as quote-equivalent commission;
 - convert filled contracts back to base quantity;
-- reject zero-fill and partial-fill market orders so `Trader` cleanup can flatten real positions through `fetchPositions()`.
+- reject zero-fill and partial-fill market orders so `Trader` cleanup can flatten real positions through
+  `fetchPositions()`.
 
 Important:
 
 - `MEXC_API_KEY`/`MEXC_SECRET` are optional in config.
 - If route uses `mexc` without credentials, real order operations will fail.
-- MEXC futures testnet is not configured in this project. If `use_testnet=true`, MEXC private operations and the native MEXC provider fail closed instead of touching production endpoints as a testnet substitute.
-- `Trader` closes positions through normalized `ExchangePosition.amount`. MEXC `contracts` stores native contract count, while `amount` stores base coin quantity.
+- MEXC futures testnet is not configured in this project. If `use_testnet=true`, MEXC private operations and the native
+  MEXC provider fail closed instead of touching production endpoints as a testnet substitute.
+- `Trader` closes positions through normalized `ExchangePosition.amount`. MEXC `contracts` stores native contract count,
+  while `amount` stores base coin quantity.
 
 ### 15.1. MEXC native orderbook provider
 
@@ -1242,7 +1323,8 @@ Behavior:
 
 1. Load MEXC contract metadata from `/api/v1/contract/detail` and require `contractSize` for subscribed symbols.
 2. Subscribe to `sub.depth` with `compress: false` for incremental depth updates.
-3. Fetch REST snapshots from `/api/v1/contract/depth/{symbol}` and support the current `{ success, code, data }` response wrapper.
+3. Fetch REST snapshots from `/api/v1/contract/depth/{symbol}` and support the current `{ success, code, data }`
+   response wrapper.
 4. Cache WebSocket updates while the REST snapshot is fetched.
 5. Apply only updates that continue the local `version` by exactly `+1`.
 6. Mark a symbol unsynced and resync it when a version gap or snapshot failure is detected.
@@ -1271,10 +1353,12 @@ Key behavior:
 - direct Gate v4 HMAC-SHA512 signing;
 - fetch tickers;
 - fetch positions;
-- ошибки private position endpoint пробрасываются вызывающему коду, чтобы close/cleanup logic не трактовала неизвестное состояние позиции Gate как flat;
+- ошибки private position endpoint пробрасываются вызывающему коду, чтобы close/cleanup logic не трактовала неизвестное
+  состояние позиции Gate как flat;
 - load contracts;
 - set isolated leverage through positive `leverage` on `POST /futures/usdt/positions/{contract}/leverage`;
-- treat `setIsolatedMargin()` as a Gate-specific precondition check because Gate's isolated mode is confirmed by positive leverage;
+- treat `setIsolatedMargin()` as a Gate-specific precondition check because Gate's isolated mode is confirmed by
+  positive leverage;
 - convert base coin amount to Gate contract count via `quanto_multiplier`;
 - use positive size for buy, negative for sell;
 - submit IOC market-style orders with `price: "0"`;
@@ -1283,7 +1367,8 @@ Key behavior:
 - poll final order details;
 - extract commission from `my_trades`;
 - convert filled contracts back to base quantity.
-- reject zero-fill and partial-fill market orders so `Trader` cleanup can flatten real positions through `fetchPositions()`.
+- reject zero-fill and partial-fill market orders so `Trader` cleanup can flatten real positions through
+  `fetchPositions()`.
 
 ### 16.1. Gate native orderbook provider
 
@@ -1297,8 +1382,10 @@ Base URLs:
 Behavior:
 
 1. Load Gate contract metadata from `/futures/usdt/contracts` and require `quanto_multiplier` for subscribed symbols.
-2. Connect with `X-Gate-Size-Decimal: 1` so pushed contract sizes are not rounded down by the legacy integer payload mode.
-3. Subscribe to `futures.order_book_update` with `[contract, "100ms", level]`, where level is normalized to `20`, `50` or `100`.
+2. Connect with `X-Gate-Size-Decimal: 1` so pushed contract sizes are not rounded down by the legacy integer payload
+   mode.
+3. Subscribe to `futures.order_book_update` with `[contract, "100ms", level]`, where level is normalized to `20`, `50`
+   or `100`.
 4. Cache WebSocket updates while `/futures/usdt/order_book?with_id=true` snapshot is fetched.
 5. Apply only updates that bridge the snapshot id and then require contiguous `U`/`u` sequence ranges.
 6. Mark a symbol unsynced and resync it when a sequence gap or snapshot failure is detected.
@@ -1366,7 +1453,9 @@ Key points from it:
 Critical deploy warning:
 
 - Exchange APIs reject signed requests if server time drifts.
-- Time sync must be monitored; Bybit signed requests compensate small process-local clock drift through `/v5/market/time`, but host NTP remains required for stable trading and for exchanges without client-side offset compensation.
+- Time sync must be monitored; Bybit signed requests compensate small process-local clock drift through
+  `/v5/market/time`, but host NTP remains required for stable trading and for exchanges without client-side offset
+  compensation.
 - Do not run multiple PM2 instances against one exchange account because distributed account lock is not implemented.
 
 ## 19. Commands
@@ -1434,23 +1523,36 @@ Results:
 
 - TypeScript build completed successfully through the local `tsc` binary.
 - Unit tests passed through local `tsx --test tests/*.test.ts`: 16 tests, 16 passed.
-- Unit tests for math utilities, runtime payload validation, `TradeCounter`, `SignalEngine` and `OrderBookStore` passed when compiled to `dist/test-run` and executed with `node`.
+- Unit tests for math utilities, runtime payload validation, `TradeCounter`, `SignalEngine` and `OrderBookStore` passed
+  when compiled to `dist/test-run` and executed with `node`.
 - Bybit REST and Bybit WebSocket files have no `ccxt`, `ccxtInstance` or `watchOrderBook` usage.
 - Gate REST and Gate WebSocket files have no `ccxt`, `ccxtInstance` or `watchOrderBook` usage.
-- Runtime source, `package.json` and `pnpm-lock.yaml` have no `ccxt`, `ccxtInstance`, `watchOrderBook` or legacy lowercase `orderbooks` usage.
-- Gate production public REST snapshot `GET https://fx-api.gateio.ws/api/v4/futures/usdt/order_book?contract=BTC_USDT&interval=0&limit=20&with_id=true` returned an orderbook id with 20 bids and 20 asks.
-- Gate testnet public WebSocket `wss://ws-testnet.gate.com/v4/ws/futures/usdt` accepted `futures.order_book_update` subscription for `BTC_USDT` and returned updates with `U`/`u` sequences.
-- Gate testnet public REST endpoints `https://fx-api-testnet.gateio.ws/api/v4/futures/usdt/contracts` and `/tickers` returned HTTP 502 from this environment.
-- MEXC production public REST endpoints returned HTTP 200 for `/api/v1/contract/ping`, `/api/v1/contract/detail?symbol=BTC_USDT`, `/api/v1/contract/ticker?symbol=BTC_USDT` and `/api/v1/contract/depth/BTC_USDT?limit=20`.
-- MEXC REST `detail` loaded 754 USDT perpetual symbols in this environment; `BTC/USDT:USDT` market info normalized to `minQty=0.0001`, `stepSize=0.0001`, `pricePrecision=1`, `quantityPrecision=4`.
-- MEXC production public WebSocket `wss://contract.mexc.com/edge` accepted `sub.depth` for `BTC_USDT` with `compress: false` and returned contiguous `push.depth` versions.
-- Compiled `MexcOrderBookProvider` returned a normalized `BTC/USDT:USDT` book with 20 bids and 20 asks; the top BTC depth was exposed in base coin amount, not native contract volume.
+- Runtime source, `package.json` and `pnpm-lock.yaml` have no `ccxt`, `ccxtInstance`, `watchOrderBook` or legacy
+  lowercase `orderbooks` usage.
+- Gate production public REST snapshot
+  `GET https://fx-api.gateio.ws/api/v4/futures/usdt/order_book?contract=BTC_USDT&interval=0&limit=20&with_id=true`
+  returned an orderbook id with 20 bids and 20 asks.
+- Gate testnet public WebSocket `wss://ws-testnet.gate.com/v4/ws/futures/usdt` accepted `futures.order_book_update`
+  subscription for `BTC_USDT` and returned updates with `U`/`u` sequences.
+- Gate testnet public REST endpoints `https://fx-api-testnet.gateio.ws/api/v4/futures/usdt/contracts` and `/tickers`
+  returned HTTP 502 from this environment.
+- MEXC production public REST endpoints returned HTTP 200 for `/api/v1/contract/ping`,
+  `/api/v1/contract/detail?symbol=BTC_USDT`, `/api/v1/contract/ticker?symbol=BTC_USDT` and
+  `/api/v1/contract/depth/BTC_USDT?limit=20`.
+- MEXC REST `detail` loaded 754 USDT perpetual symbols in this environment; `BTC/USDT:USDT` market info normalized to
+  `minQty=0.0001`, `stepSize=0.0001`, `pricePrecision=1`, `quantityPrecision=4`.
+- MEXC production public WebSocket `wss://contract.mexc.com/edge` accepted `sub.depth` for `BTC_USDT` with
+  `compress: false` and returned contiguous `push.depth` versions.
+- Compiled `MexcOrderBookProvider` returned a normalized `BTC/USDT:USDT` book with 20 bids and 20 asks; the top BTC
+  depth was exposed in base coin amount, not native contract volume.
 
 Note:
 
 - Global `pnpm` is not available in the current shell; use `pnpm build` in an environment where `pnpm` is installed.
-- `tsx --test tests/*.test.ts` is blocked inside the default sandbox with `spawn EPERM`; the same command passed when allowed to run outside the sandbox.
-- `fastify` is declared in `package.json`; local `node_modules` in the current shell does not include a package manager to install the new dependency.
+- `tsx --test tests/*.test.ts` is blocked inside the default sandbox with `spawn EPERM`; the same command passed when
+  allowed to run outside the sandbox.
+- `fastify` is declared in `package.json`; local `node_modules` in the current shell does not include a package manager
+  to install the new dependency.
 - Bybit testnet/private smoke checks were not executed in this environment.
 - Gate private and order smoke checks were not executed in this environment.
 - MEXC private and order smoke checks were not executed in this environment.
@@ -1513,13 +1615,17 @@ Project documentation:
 
 ### 22.1. Runtime can enable real trading
 
-`use_testnet` is controlled by the Django runtime payload. Production mode is possible when Django sends `use_testnet=false`.
+`use_testnet` is controlled by the Django runtime payload. Production mode is possible when Django sends
+`use_testnet=false`.
 
-The trader process also requires `ALLOW_PRODUCTION_TRADING=true`, matching `TRADER_ENVIRONMENT`, an allowlisted selected-account fingerprint and configured live caps before accepting a production payload. Keep these variables disabled or empty for development/testnet processes and enable them only for an explicitly prepared production runtime.
+The trader process also requires `ALLOW_PRODUCTION_TRADING=true`, matching `TRADER_ENVIRONMENT` and configured live caps
+before accepting a production payload. Keep these variables disabled or empty for development/testnet processes and
+enable them only for an explicitly prepared production runtime.
 
 ### 22.2. Runtime payload contract alignment
 
-Trader requires credentials only for exchanges selected in the runtime payload. Django must keep sending the selected exchange keys and optional risk-buffer fields with compatible names.
+Trader requires credentials only for exchanges selected in the runtime payload. Django must keep sending the selected
+exchange keys and optional risk-buffer fields with compatible names.
 
 Recommended:
 
@@ -1528,13 +1634,18 @@ Recommended:
 
 ### 22.2.1. Execution journal is local
 
-`EXECUTION_JOURNAL_PATH` records open, cleanup and close intents/results before and after exchange calls. Startup fails when the journal has unresolved intents for the runtime, which reduces silent crash windows on the same host.
+`EXECUTION_JOURNAL_PATH` records open, cleanup and close intents/results before and after exchange calls. Startup fails
+when the journal has unresolved intents for the runtime, which reduces silent crash windows on the same host.
 
-This journal is not a Django/DB execution ledger. It does not provide cross-host recovery, operator UI, durable close fill persistence in Django schema, or distributed state-machine transitions. Real production still needs a database-backed execution ledger if more than one host/process can affect the account.
+This journal is not a Django/DB execution ledger. It does not provide cross-host recovery, operator UI, durable close
+fill persistence in Django schema, or distributed state-machine transitions. Real production still needs a
+database-backed execution ledger if more than one host/process can affect the account.
 
 ### 22.3. Locking scope is host-local
 
-`TRADER_PROCESS_LOCK_PATH` prevents two trader runtimes in the same host/deployment directory from running concurrently. It is not a distributed lock. Two servers, two deployment directories, manual bots or another runtime can still open trades on the same account and bypass the local `TradeCounter`.
+`TRADER_PROCESS_LOCK_PATH` prevents two trader runtimes in the same host/deployment directory from running concurrently.
+It is not a distributed lock. Two servers, two deployment directories, manual bots or another runtime can still open
+trades on the same account and bypass the local `TradeCounter`.
 
 Mitigation:
 
@@ -1545,11 +1656,14 @@ Mitigation:
 
 ### 22.4. Django service-token trust boundary
 
-Trader sends `X-Service-Token` to Django real-trades endpoints and requires the same header on its control plane. The shared token must be rotated and kept out of logs.
+Trader sends `X-Service-Token` to Django real-trades endpoints and requires the same header on its control plane. The
+shared token must be rotated and kept out of logs.
 
 ### 22.5. Recovery identity remains incomplete
 
-Recovered trades are validated by runtime id, selected exchange route, unique symbol and account-wide position side/amount. Distribution to `Trader` instances still uses `trade.coin`. If multiple strategies/accounts/routes use the same symbol in the same Django real Trade table without stronger identifiers, recovery can be wrong.
+Recovered trades are validated by runtime id, selected exchange route, unique symbol and account-wide position
+side/amount. Distribution to `Trader` instances still uses `trade.coin`. If multiple strategies/accounts/routes use the
+same symbol in the same Django real Trade table without stronger identifiers, recovery can be wrong.
 
 Better:
 
@@ -1560,7 +1674,8 @@ Better:
 
 ### 22.6. Automated test coverage remains partial
 
-The repository includes unit tests for math utilities, runtime payload validation, `TradeCounter`, `SignalEngine` and `OrderBookStore`. Exchange execution and full `Trader` state-machine flows still need mocked integration tests.
+The repository includes unit tests for math utilities, runtime payload validation, `TradeCounter`, `SignalEngine` and
+`OrderBookStore`. Exchange execution and full `Trader` state-machine flows still need mocked integration tests.
 
 Recommended minimum:
 
@@ -1571,11 +1686,15 @@ Recommended minimum:
 
 ### 22.7. Exchange-specific reduceOnly support
 
-The strategy assumes close and rollback orders cannot flip exposure. Binance, Bybit and Gate native clients send exchange-specific reduce-only fields directly. MEXC native close orders use side `2`/`4` for close-short/close-long and send `reduceOnly` only when the account reports one-way position mode, because MEXC hedge mode rejects that flag. Confirm close-side behavior with a small account-level smoke test before relying on MEXC in production.
+The strategy assumes close and rollback orders cannot flip exposure. Binance, Bybit and Gate native clients send
+exchange-specific reduce-only fields directly. MEXC native close orders use side `2`/`4` for close-short/close-long and
+send `reduceOnly` only when the account reports one-way position mode, because MEXC hedge mode rejects that flag.
+Confirm close-side behavior with a small account-level smoke test before relying on MEXC in production.
 
 ### 22.8. Market-order slippage
 
-VWAP reduces false signals but cannot guarantee final fill. The code recalculates spread from actual fills, but entry decision can still be stale under fast markets.
+VWAP reduces false signals but cannot guarantee final fill. The code recalculates spread from actual fills, but entry
+decision can still be stale under fast markets.
 
 ### 22.9. Fee approximations
 
@@ -1583,7 +1702,8 @@ BNB fee conversion is approximate. Non-USDT fees on some exchanges are ignored o
 
 ### 22.10. Production process guard
 
-`ALLOW_PRODUCTION_TRADING` is process-local and is backed by environment id, account fingerprint allowlist and hard caps. If a deployment accidentally configures all live variables on a development host, Django can start a production runtime with `use_testnet=false`.
+`ALLOW_PRODUCTION_TRADING` is process-local and is backed by environment id and hard caps. If a deployment accidentally
+configures all live variables on a development host, Django can start a production runtime with `use_testnet=false`.
 
 Recommended:
 
@@ -1598,15 +1718,24 @@ The native Bybit client uses the standard mainnet REST and WebSocket domains:
 - `https://api.bybit.com`
 - `wss://stream.bybit.com/v5/public/linear`
 
-Bybit can reject API traffic from restricted regions or require regional domains for some account registrations. If health checks return HTTP 403 or regional access errors, configure and validate the correct Bybit domain before production trading.
+Bybit can reject API traffic from restricted regions or require regional domains for some account registrations. If
+health checks return HTTP 403 or regional access errors, configure and validate the correct Bybit domain before
+production trading.
 
 ### 22.12. Gate testnet REST availability
 
-Gate public testnet WebSocket responds on `wss://ws-testnet.gate.com/v4/ws/futures/usdt`, but public testnet REST endpoints on `https://fx-api-testnet.gateio.ws/api/v4` returned HTTP 502 in the current environment. Gate testnet runtime startup depends on REST contracts/tickers/orderbook snapshots, so validate Gate testnet REST availability before using Gate with `use_testnet=true`.
+Gate public testnet WebSocket responds on `wss://ws-testnet.gate.com/v4/ws/futures/usdt`, but public testnet REST
+endpoints on `https://fx-api-testnet.gateio.ws/api/v4` returned HTTP 502 in the current environment. Gate testnet
+runtime startup depends on REST contracts/tickers/orderbook snapshots, so validate Gate testnet REST availability before
+using Gate with `use_testnet=true`.
 
 ### 22.13. MEXC futures testnet guard
 
-MEXC Contract production public REST and WebSocket endpoints are available from this environment, but a separate futures testnet endpoint is not configured in the project. When `use_testnet=true`, MEXC private REST operations and the MEXC orderbook provider fail closed so the runtime does not accidentally treat production MEXC as a sandbox. Validate MEXC private permissions and order behavior with an explicit low-risk account-level smoke before enabling MEXC production routes.
+MEXC Contract production public REST and WebSocket endpoints are available from this environment, but a separate futures
+testnet endpoint is not configured in the project. When `use_testnet=true`, MEXC private REST operations and the MEXC
+orderbook provider fail closed so the runtime does not accidentally treat production MEXC as a sandbox. Validate MEXC
+private permissions and order behavior with an explicit low-risk account-level smoke before enabling MEXC production
+routes.
 
 ## 23. Suggested stabilization plan
 
@@ -1621,7 +1750,8 @@ MEXC Contract production public REST and WebSocket endpoints are available from 
 
 ## 24. Workflow summary
 
-This section consolidates the operational flow that was previously kept in `WORKFLOW.md`.
+This section consolidates the operational flow in the detailed documentation. A shorter operator-facing summary is
+available in `WORKFLOW.md`.
 
 ### 24.1. Service purpose
 
@@ -1649,10 +1779,11 @@ The service reads only infrastructure/operational variables from `.env`:
 - `PUBLIC_HEALTH_DETAILS`
 - `FAIL_ON_UNRESOLVED_EXECUTION_JOURNAL`
 - `POSITION_SIZE_TOLERANCE_PERCENT`
+- `ORDERBOOK_PAIR_MAX_AGE_MS`
+- `ORDERBOOK_PAIR_MAX_SKEW_MS`
 - `ALLOW_PRODUCTION_TRADING`
 - `TRADER_ENVIRONMENT`
 - `PRODUCTION_TRADING_ENVIRONMENT`
-- `PRODUCTION_ACCOUNT_FINGERPRINTS`
 - `MAX_PRODUCTION_TRADE_AMOUNT_USDT`
 - `MAX_PRODUCTION_CONCURRENT_TRADES`
 - `MAX_PRODUCTION_LEVERAGE`
@@ -1681,45 +1812,55 @@ All endpoints except `/health` require `X-Service-Token`.
 Command behavior:
 
 1. `start`
-   - stop current runtime if one is active;
-   - start a new runtime from payload.
+    - stop current runtime if one is active;
+    - start a new runtime from payload.
 2. `sync`
-   - perform a controlled restart with a fresh payload.
+    - perform a controlled restart with a fresh payload.
 3. `stop`
-   - stop the active runtime;
-   - if `runtime_config_id` is provided, it must match the active runtime;
-   - return an error while exchange exposure, pending close sync or unmanaged cleanup remains.
+    - stop the active runtime;
+    - if `runtime_config_id` is provided, it must match the active runtime;
+    - return an error while exchange exposure, pending close sync or unmanaged cleanup remains.
 
-`GET /health` without `X-Service-Token` exposes only public-safe `{ success: true, status: "ok" }` while `PUBLIC_HEALTH_DETAILS=false`. Detailed health exposes runtime risk state through `runtime_state`, `risk_locked`, `risk_incidents` and `open_exposure` only with `X-Service-Token` or `PUBLIC_HEALTH_DETAILS=true`.
+`GET /health` without `X-Service-Token` exposes only public-safe `{ success: true, status: "ok" }` while
+`PUBLIC_HEALTH_DETAILS=false`. Detailed health exposes runtime risk state through `runtime_state`, `risk_locked`,
+`risk_incidents` and `open_exposure` only with `X-Service-Token` or `PUBLIC_HEALTH_DETAILS=true`.
 
-Failed control-plane requests are logged locally and, when a `runtime_config_id` can be extracted from the request body or query string, persisted to Django through `POST /bots/runtime-config-errors/`. Payload validation failures use `error_type=validation`; lifecycle routes use `start`, `sync` or `stop`; diagnostic routes use `exchange_health` or `diagnostics`.
+Failed control-plane requests are logged locally and, when a `runtime_config_id` can be extracted from the request body
+or query string, persisted to Django through `POST /bots/runtime-config-errors/`. Payload validation failures use
+`error_type=validation`; lifecycle routes use `start`, `sync` or `stop`; diagnostic routes use `exchange_health` or
+`diagnostics`.
 
 Diagnostic behavior:
 
 1. `POST /engine/trader/runtime/exchange-health`
-   - receives a full Django runtime payload with exchange keys;
-   - creates short-lived REST clients for primary/secondary exchanges without mutating the currently active runtime;
-   - runs authenticated private API checks and returns per-exchange availability/error.
+    - receives a full Django runtime payload with exchange keys;
+    - creates short-lived REST clients for primary/secondary exchanges without mutating the currently active runtime;
+    - runs authenticated private API checks and returns per-exchange availability/error.
 2. `GET /engine/trader/runtime/active-coins`
-   - reads in-memory trader state for the requested `runtime_config_id`;
-   - returns `active_coins`, `trade_count` and `is_requested_runtime_active`.
+    - reads in-memory trader state for the requested `runtime_config_id`;
+    - returns `active_coins`, `trade_count` and `is_requested_runtime_active`.
 3. `GET /engine/trader/runtime/open-trades-pnl`
-   - reads in-memory open trades;
-   - calculates live mark-to-market values from the current orderbook snapshot;
-   - returns both signal-style `current_pnl_percent` and estimated USDT / percentage PnL using recorded open commission.
+    - reads in-memory open trades;
+    - calculates live mark-to-market values from the current orderbook snapshot;
+    - returns both signal-style `current_pnl_percent` and estimated USDT / percentage PnL using recorded open
+      commission.
 4. `GET /engine/trader/runtime/system-load`
-   - samples system-wide CPU utilization over a short interval;
-   - returns total/used/free RAM in bytes and percent usage for the host running the trader process.
+    - samples system-wide CPU utilization over a short interval;
+    - returns total/used/free RAM in bytes and percent usage for the host running the trader process.
 5. `GET /engine/trader/runtime/server-info`
-   - reads host network interfaces from the trader process;
-   - returns `hostname`, primary non-internal IPv4 as `server_ip`, all non-internal IPv4 values in `ip_addresses` and the requested runtime config id.
+    - reads host network interfaces from the trader process;
+    - returns `hostname`, primary non-internal IPv4 as `server_ip`, all non-internal IPv4 values in `ip_addresses` and
+      the requested runtime config id.
 
 ### 24.4. Runtime bootstrap sequence
 
-Fastify validates the runtime payload before `RuntimeManager.startRuntime()` stores it. `RuntimeManager.startRuntime()` performs the following steps:
+Fastify validates the runtime payload before `RuntimeManager.startRuntime()` stores it. Duplicate `start`/`sync`
+requests for the same running runtime payload are no-ops; changed payloads restart the runtime gracefully.
+`RuntimeManager.startRuntime()` performs the following steps:
 
 1. Store runtime payload in `config.ts`.
-2. Reject production payloads with `use_testnet=false` unless `ALLOW_PRODUCTION_TRADING=true`, `TRADER_ENVIRONMENT` matches `PRODUCTION_TRADING_ENVIRONMENT`, selected account fingerprint is allowlisted and live caps are configured.
+2. Reject production payloads with `use_testnet=false` unless `ALLOW_PRODUCTION_TRADING=true`, `TRADER_ENVIRONMENT`
+   matches `PRODUCTION_TRADING_ENVIRONMENT` and live caps are configured.
 3. Acquire host-local `TRADER_PROCESS_LOCK_PATH`.
 4. Reject startup if `EXECUTION_JOURNAL_PATH` contains unresolved execution intents for the runtime.
 5. Create primary and secondary REST clients.
@@ -1741,7 +1882,9 @@ Fastify validates the runtime payload before `RuntimeManager.startRuntime()` sto
 21. Restore open trades into matching traders.
 22. Start all `Trader` workers.
 
-If recovery of open trades from Django fails, any open trade cannot be assigned to a trader chunk, account-wide reconciliation sees unknown/missing/mismatched positions, or execution journal has unresolved intents, runtime startup is aborted.
+If recovery of open trades from Django fails, any open trade cannot be assigned to a trader chunk, account-wide
+reconciliation sees unknown/missing/mismatched positions, or execution journal has unresolved intents, runtime startup
+is aborted.
 
 ### 24.5. Symbol selection logic
 
@@ -1751,16 +1894,17 @@ The runtime trades only symbols that pass all of the following:
 2. Have `min(primaryQuoteVolume, secondaryQuoteVolume) >= 2_000_000`.
 3. Fit within `top_liquid_pairs_count`.
 4. Pass `MarketInfoService` validation:
-   - merged `stepSize`
-   - merged `minQty`
-   - merged `minNotional`
+    - merged `stepSize`
+    - merged `minQty`
+    - merged `minNotional`
 5. Are not filtered by homonym detection:
-   - if cross-exchange price deviation exceeds 40%, symbol is skipped.
+    - if cross-exchange price deviation exceeds 40%, symbol is skipped.
 6. Successfully confirm isolated margin and leverage setup on both exchanges.
 
 Warnings from exchange setup are not treated as successful configuration.
 
-Open trades from Django bypass liquidity selection for recovery, but symbols that are not in the scannable liquidity set have `canOpenNewTrades=false`.
+Open trades from Django bypass liquidity selection for recovery, but symbols that are not in the scannable liquidity set
+have `canOpenNewTrades=false`.
 
 ### 24.6. Trader runtime state
 
@@ -1778,7 +1922,8 @@ Each `Trader` owns a chunk of symbols and keeps per-symbol mutable state:
 - `closeIntentId`
 - `canOpenNewTrades`
 
-Provider update callbacks schedule spread checks per symbol. `busy` acts as a local mutex to prevent duplicate open/close handling from concurrent book updates.
+Provider update callbacks schedule spread checks per symbol. `busy` acts as a local mutex to prevent duplicate
+open/close handling from concurrent book updates.
 
 ### 24.7. Price and size calculation
 
@@ -1786,13 +1931,13 @@ The strategy uses VWAP instead of top-of-book:
 
 1. Read both orderbooks from normalized `OrderBookProvider` snapshots.
 2. Determine target size:
-   - entry uses current configured trade size;
-   - close uses exact stored Django trade amount.
+    - entry uses current configured trade size;
+    - close uses exact stored Django trade amount.
 3. Build four prices:
-   - `primaryBid`
-   - `primaryAsk`
-   - `secondaryBid`
-   - `secondaryAsk`
+    - `primaryBid`
+    - `primaryAsk`
+    - `secondaryBid`
+    - `secondaryAsk`
 
 If depth is insufficient:
 
@@ -1817,20 +1962,20 @@ When a symbol has no active trade:
 5. Skip entry if `canOpenNewTrades=false`, runtime is stopping, or runtime risk lock is active.
 6. Before sending orders, verify that the symbol has no unexpected existing positions on either exchange.
 7. Open when:
-   - `currentBuySpread >= baselineBuy + openThreshold`, or
-   - `currentSellSpread >= baselineSell + openThreshold`.
+    - `currentBuySpread >= baselineBuy + openThreshold`, or
+    - `currentSellSpread >= baselineSell + openThreshold`.
 8. Require hard economic edge:
-   - subtract fee, slippage, funding and latency buffers;
-   - require `expected_net_edge >= min_open_net_edge_percent`.
+    - subtract fee, slippage, funding and latency buffers;
+    - require `expected_net_edge >= min_open_net_edge_percent`.
 
 Direction semantics:
 
 - `buy`
-  - long primary
-  - short secondary
+    - long primary
+    - short secondary
 - `sell`
-  - short primary
-  - long secondary
+    - short primary
+    - long secondary
 
 `executeOpen()`:
 
@@ -1840,31 +1985,38 @@ Direction semantics:
 4. Appends `open_intent` and `open_orders_submitting` events to `EXECUTION_JOURNAL_PATH`.
 5. Sends both market orders concurrently.
 6. On partial failure:
-   - attempt reverse reduce-only rollback;
-   - run full position cleanup;
-   - release slot only when cleanup is confirmed;
-   - apply cooldown.
+    - attempt reverse reduce-only rollback;
+    - run full position cleanup;
+    - release slot only when cleanup is confirmed;
+    - apply cooldown.
 7. On cleanup failure:
-   - log the cleanup error as critical;
-   - store `unmanagedExposure`;
-   - keep any reserved trade slot reserved;
-   - set runtime risk lock and block new entries globally;
-   - retry cleanup until flat.
+    - log the cleanup error as critical;
+    - store `unmanagedExposure`;
+    - keep any reserved trade slot reserved;
+    - set runtime risk lock and block new entries globally;
+    - retry cleanup until flat.
 8. On success:
-   - use actual fill prices or VWAP fallback;
-   - sum fees;
-   - recompute real open spread;
-   - create Django trade;
-   - append `open_django_synced` to the execution journal;
-   - store `activeTrade` and `openedAtMs`.
+    - use actual fill prices or VWAP fallback;
+    - sum fees;
+    - recompute real open spread;
+    - create Django trade;
+    - append `open_django_synced` to the execution journal;
+    - store `activeTrade` and `openedAtMs`.
 
 ### 24.9. Recovery behavior
 
-At startup, open trades are loaded from Django for the current runtime before scanner chunks are finalized. Recovery symbols are included in the runtime universe even when they fail liquidity selection. If a recovery symbol is not part of the scannable set, `canOpenNewTrades=false` prevents new entries after that exposure is closed.
+At startup, open trades are loaded from Django for the current runtime before scanner chunks are finalized. Recovery
+symbols are included in the runtime universe even when they fail liquidity selection. If a recovery symbol is not part
+of the scannable set, `canOpenNewTrades=false` prevents new entries after that exposure is closed.
 
-Open trades are validated before distribution: `runtime_config` must match the requested runtime, primary/secondary exchange route must match the payload, each symbol may have only one open trade, `amount` must be positive, and `opened_at` must parse to a finite timestamp. Open trades are distributed by `trade.coin` to the matching `Trader`. Startup fails if any open trade has no matching chunk.
+Open trades are validated before distribution: `runtime_config` must match the requested runtime, primary/secondary
+exchange route must match the payload, each symbol may have only one open trade, `amount` must be positive, and
+`opened_at` must parse to a finite timestamp. Open trades are distributed by `trade.coin` to the matching `Trader`.
+Startup fails if any open trade has no matching chunk.
 
-Before scanner startup, both exchange clients fetch all open futures positions visible to the selected API keys. The runtime compares those positions with Django open trades by symbol, side and amount using `POSITION_SIZE_TOLERANCE_PERCENT`. Unknown, missing, side-mismatched or size-mismatched positions abort startup.
+Before scanner startup, both exchange clients fetch all open futures positions visible to the selected API keys. The
+runtime compares those positions with Django open trades by symbol, side and amount using
+`POSITION_SIZE_TOLERANCE_PERCENT`. Unknown, missing, side-mismatched or size-mismatched positions abort startup.
 
 `restoreOpenTrades()`:
 
@@ -1891,19 +2043,21 @@ When a symbol has `activeTrade`, no new entry is evaluated. Exit checks run in t
 1. Lock symbol with `busy`.
 2. Append `close_started` to `EXECUTION_JOURNAL_PATH`.
 3. Determine close side per exchange.
-4. Получить реальные позиции с обеих бирж. Если любая биржа не может подтвердить позиции, close attempt завершается ошибкой и повторяется позже вместо записи flat-состояния в Django.
+4. Получить реальные позиции с обеих бирж. Если любая биржа не может подтвердить позиции, close attempt завершается
+   ошибкой и повторяется позже вместо записи flat-состояния в Django.
 5. Risk-lock the runtime if actual position size differs from Django amount beyond `POSITION_SIZE_TOLERANCE_PERCENT`.
 6. Close only legs that are still open.
 7. Use reduce-only market orders.
-8. Preserve successful per-leg close execution, fill size and commission in `partialClose` before retrying a failed opposite leg.
+8. Preserve successful per-leg close execution, fill size and commission in `partialClose` before retrying a failed
+   opposite leg.
 9. Append per-leg `close_leg_filled` events to the execution journal.
 10. Use fallback prices if a leg is already flat or execution price is missing.
 11. Compute:
-   - close commission
-   - total commission
-   - real PnL, using actual per-leg close sizes when they differ from the Django trade amount
-   - close spread
-   - final status
+- close commission
+- total commission
+- real PnL, using actual per-leg close sizes when they differ from the Django trade amount
+- close spread
+- final status
 12. Persist close into Django with retry loop.
 
 If exchange close succeeded but Django close sync still failed after retries:
@@ -1965,3 +2119,23 @@ If a `Trader` worker rejects unexpectedly:
 10. Host-local process lock prevents duplicate runtime in the same deployment directory, but not across hosts.
 11. Dust positions below `minQty` may be ignored by close logic.
 12. `profitPercentage` is calculated against notional capital, not isolated margin after leverage.
+
+### 24.13. Realtime signal execution
+
+Entry, profit-close and liquidation/drawdown-close are evaluated from shared orderbook provider `onUpdate` callbacks.
+Each symbol has at most one active decision path. If a new orderbook update arrives while the symbol is already being
+checked or executing open/close logic, the runtime stores a single rerun request and evaluates the symbol again after
+the active path finishes. This keeps the latest update from being dropped without creating an unbounded per-symbol
+backlog.
+
+Before VWAP, spread, PnL or drawdown calculations use a snapshot pair, `Trader` validates both local snapshot ages
+against `ORDERBOOK_PAIR_MAX_AGE_MS` and validates primary/secondary local timestamp skew against
+`ORDERBOOK_PAIR_MAX_SKEW_MS`. Entry, profit-close and liquidation-close signals are skipped when the pair is stale or
+skewed.
+
+The timeout watchdog remains interval-based and runs separately every 10 seconds. Cleanup, pending close sync and
+reconciliation retries remain protective background flows.
+
+Signal execution logs structured `latency_metrics` records for `open_signal`, `close_signal` and `close_sync`. The
+records expose socket update to check start, check start to signal detection, signal detection to order submit, exchange
+ack latency and full close sync duration where applicable.

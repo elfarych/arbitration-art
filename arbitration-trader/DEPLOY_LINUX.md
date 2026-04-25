@@ -50,6 +50,7 @@ nano .env
 DJANGO_API_URL=http://127.0.0.1:8000/api
 SERVICE_SHARED_TOKEN=replace-with-strong-shared-token
 PORT=3002
+TRADER_INSTANCE_ID=1
 SHADOW_SIGNAL_LOG_PATH=logs/shadow-signals.jsonl
 EXECUTION_JOURNAL_PATH=logs/execution-journal.jsonl
 TRADER_PROCESS_LOCK_PATH=locks/trader-runtime.lock
@@ -59,15 +60,16 @@ POSITION_SIZE_TOLERANCE_PERCENT=0.1
 ALLOW_PRODUCTION_TRADING=false
 TRADER_ENVIRONMENT=development
 PRODUCTION_TRADING_ENVIRONMENT=production
-PRODUCTION_ACCOUNT_FINGERPRINTS=
 MAX_PRODUCTION_TRADE_AMOUNT_USDT=
 MAX_PRODUCTION_CONCURRENT_TRADES=
 MAX_PRODUCTION_LEVERAGE=
 ```
 
+`TRADER_INSTANCE_ID` - это `TraderRuntimeConfig.id` в базе Django. При запуске процесс запрашивает у Django активный payload для этого id и стартует runtime, если конфиг активен и не архивирован.
+
 В `.env` не должны находиться `BINANCE_API_KEY`, `BINANCE_SECRET_KEY`, `BYBIT_API_KEY`, `BYBIT_SECRET_KEY`, `GATE_*` или `MEXC_*`. Эти значения приходят из Django payload для конкретного `TraderRuntimeConfig`.
 
-`ALLOW_PRODUCTION_TRADING=false` блокирует runtime payload с `use_testnet=false`. Для production процесса live payload принимается только когда дополнительно настроены `TRADER_ENVIRONMENT=production`, allowlist `PRODUCTION_ACCOUNT_FINGERPRINTS` для выбранной пары API keys и hard caps `MAX_PRODUCTION_TRADE_AMOUNT_USDT`, `MAX_PRODUCTION_CONCURRENT_TRADES`, `MAX_PRODUCTION_LEVERAGE`. Переключать live guards можно только после отдельной операционной подготовки: выделенный аккаунт, ограниченный баланс, private network/firewall, проверенный `SERVICE_SHARED_TOKEN`, monitoring/alerts и runbook для stuck positions.
+`ALLOW_PRODUCTION_TRADING=false` блокирует runtime payload с `use_testnet=false`. Для production процесса live payload принимается только когда дополнительно настроены `TRADER_ENVIRONMENT=production` и hard caps `MAX_PRODUCTION_TRADE_AMOUNT_USDT`, `MAX_PRODUCTION_CONCURRENT_TRADES`, `MAX_PRODUCTION_LEVERAGE`. Переключать live guards можно только после отдельной операционной подготовки: выделенный аккаунт, ограниченный баланс, private network/firewall, проверенный `SERVICE_SHARED_TOKEN`, monitoring/alerts и runbook для stuck positions.
 
 ## 4. Запуск через PM2
 
@@ -111,7 +113,7 @@ pm2 restart arbitration-trader
 3. Запустить testnet/shadow mode.
 4. Проверить exchange health для выбранного runtime config.
 5. Проверить, что `EXECUTION_JOURNAL_PATH` и `TRADER_PROCESS_LOCK_PATH` находятся на persistent disk и доступны пользователю PM2.
-6. Настроить production account fingerprint allowlist и hard caps.
+6. Настроить production hard caps.
 7. Сделать private smoke с минимальным размером и заранее ограниченным балансом.
 8. Настроить firewall/private network/reverse proxy так, чтобы control plane не был публичным.
 9. Настроить alerts на `risk_locked=true`, `runtime_state=stopping_with_open_exposure`, pending close sync и частые stale orderbooks.

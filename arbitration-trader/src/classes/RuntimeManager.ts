@@ -1,20 +1,20 @@
 import * as crypto from 'node:crypto';
-import { clearActiveRuntime, config, setActiveRuntime } from '../config.js';
-import { RuntimeRiskLock } from './risk-lock.js';
-import { Trader } from './Trader.js';
-import { TradeCounter } from './TradeCounter.js';
-import { BinanceClient } from '../exchanges/binance-client.js';
-import { BybitClient } from '../exchanges/bybit-client.js';
-import { GateClient } from '../exchanges/gate-client.js';
-import { MexcClient } from '../exchanges/mexc-client.js';
-import type { ExchangeClientOptions, IExchangeClient } from '../exchanges/exchange-client.js';
-import { createOrderBookProvider } from '../exchanges/ws/orderbook-provider-factory.js';
-import { assertAccountPositionsReconciled } from '../services/account-reconciliation.js';
-import { api } from '../services/api.js';
-import { getSystemLoadSnapshot } from '../services/diagnostics.js';
-import { executionJournal } from '../services/execution-journal.js';
-import { MarketInfoService } from '../services/market-info.js';
-import { RuntimeProcessLock } from '../services/runtime-process-lock.js';
+import {clearActiveRuntime, config, setActiveRuntime} from '../config.js';
+import {RuntimeRiskLock} from './risk-lock.js';
+import {Trader} from './Trader.js';
+import {TradeCounter} from './TradeCounter.js';
+import {BinanceClient} from '../exchanges/binance-client.js';
+import {BybitClient} from '../exchanges/bybit-client.js';
+import {GateClient} from '../exchanges/gate-client.js';
+import {MexcClient} from '../exchanges/mexc-client.js';
+import type {ExchangeClientOptions, IExchangeClient} from '../exchanges/exchange-client.js';
+import {createOrderBookProvider} from '../exchanges/ws/orderbook-provider-factory.js';
+import {assertAccountPositionsReconciled} from '../services/account-reconciliation.js';
+import {api} from '../services/api.js';
+import {getSystemLoadSnapshot} from '../services/diagnostics.js';
+import {executionJournal} from '../services/execution-journal.js';
+import {MarketInfoService} from '../services/market-info.js';
+import {RuntimeProcessLock} from '../services/runtime-process-lock.js';
 import type {
     ExchangeHealthCheckResult,
     OrderBookProvider,
@@ -22,7 +22,7 @@ import type {
     RuntimeTradesDiagnostics,
     SystemLoadSnapshot,
 } from '../types/index.js';
-import { logger } from '../utils/logger.js';
+import {logger} from '../utils/logger.js';
 
 const TAG = 'RuntimeManager';
 
@@ -55,6 +55,11 @@ export class RuntimeManager {
     public start(payload: RuntimeCommandPayload): Promise<void> {
         return this.withLock(async () => {
             if (this.activeRuntime) {
+                if (this.isSameActiveRuntimePayload(payload)) {
+                    logger.info(TAG, `Start requested for runtime ${payload.runtime_config_id}, but the same payload is already running. Skipping restart.`);
+                    return;
+                }
+
                 logger.warn(TAG, `Start requested while runtime ${this.activeRuntime.payload.runtime_config_id} is active. Restarting gracefully.`);
                 await this.stopActiveRuntime();
             }
@@ -66,12 +71,26 @@ export class RuntimeManager {
     public sync(payload: RuntimeCommandPayload): Promise<void> {
         return this.withLock(async () => {
             if (this.activeRuntime) {
+                if (this.isSameActiveRuntimePayload(payload)) {
+                    logger.info(TAG, `Sync requested for runtime ${payload.runtime_config_id}, but the same payload is already running. Skipping restart.`);
+                    return;
+                }
+
                 logger.info(TAG, `Sync requested for runtime ${payload.runtime_config_id}. Stopping current runtime first.`);
                 await this.stopActiveRuntime();
             }
 
             await this.startRuntime(payload);
         });
+    }
+
+    private isSameActiveRuntimePayload(payload: RuntimeCommandPayload): boolean {
+        return Boolean(
+            this.activeRuntime
+            && this.activeRuntime.state === 'running'
+            && this.activeRuntime.payload.runtime_config_id === payload.runtime_config_id
+            && this.payloadSignature(this.activeRuntime.payload) === this.payloadSignature(payload),
+        );
     }
 
     public stop(runtimeConfigId?: number): Promise<void> {
@@ -109,7 +128,7 @@ export class RuntimeManager {
         riskIncidents: ReturnType<RuntimeRiskLock['getStatus']>['incidents'];
         openExposure: boolean;
     } {
-        const riskStatus = this.activeRuntime?.riskLock.getStatus() ?? { isLocked: false, incidents: [] };
+        const riskStatus = this.activeRuntime?.riskLock.getStatus() ?? {isLocked: false, incidents: []};
         const openExposure = this.activeRuntime?.traders.some(trader => trader.hasOpenExposure()) ?? false;
         const runtimeState = !this.activeRuntime
             ? 'idle'
@@ -266,7 +285,7 @@ export class RuntimeManager {
             }
 
             const accountFingerprint = this.buildRouteAccountFingerprint(payload);
-            this.validateProductionSafety(payload, accountFingerprint);
+            this.validateProductionSafety(payload);
 
             await this.processLock.acquire({
                 runtime_config_id: payload.runtime_config_id,
@@ -292,8 +311,10 @@ export class RuntimeManager {
             try {
                 logger.info(TAG, 'Measuring latency to exchange matching engines...');
                 await Promise.all([
-                    primaryClient.fetchTime().catch(() => {}),
-                    secondaryClient.fetchTime().catch(() => {}),
+                    primaryClient.fetchTime().catch(() => {
+                    }),
+                    secondaryClient.fetchTime().catch(() => {
+                    }),
                 ]);
 
                 const [primaryStart, secondaryStart] = [Date.now(), Date.now()];
@@ -360,7 +381,7 @@ export class RuntimeManager {
                     .filter(symbol => {
                         const primaryVolume = primaryTickers[symbol]?.quoteVolume || 0;
                         const secondaryVolume = secondaryTickers[symbol]?.quoteVolume || 0;
-                        return Math.min(primaryVolume, secondaryVolume) >= 2_000_000;
+                        return Math.min(primaryVolume, secondaryVolume) >= 1_000_000;
                     })
                     .sort((left, right) => {
                         const leftVolume = Math.min(
@@ -602,7 +623,7 @@ export class RuntimeManager {
     }
 
     private buildClientOptions(name: string, payload: RuntimeCommandPayload): ExchangeClientOptions {
-        const commonOptions = { useTestnet: payload.config.use_testnet };
+        const commonOptions = {useTestnet: payload.config.use_testnet};
 
         switch (name.toLowerCase()) {
             case 'binance':
@@ -662,7 +683,14 @@ export class RuntimeManager {
         ].join(':');
     }
 
-    private validateProductionSafety(payload: RuntimeCommandPayload, accountFingerprint: string): void {
+    private payloadSignature(payload: RuntimeCommandPayload): string {
+        return crypto
+            .createHash('sha256')
+            .update(stableStringify(payload))
+            .digest('hex');
+    }
+
+    private validateProductionSafety(payload: RuntimeCommandPayload): void {
         if (payload.config.use_testnet) {
             return;
         }
@@ -671,19 +699,6 @@ export class RuntimeManager {
             throw new Error(
                 `Production runtime rejected: TRADER_ENVIRONMENT=${config.traderEnvironment} `
                 + `does not match PRODUCTION_TRADING_ENVIRONMENT=${config.productionTradingEnvironment}.`,
-            );
-        }
-
-        if (config.productionAccountFingerprintAllowlist.size === 0) {
-            throw new Error(
-                `Production runtime rejected: PRODUCTION_ACCOUNT_FINGERPRINTS is empty. `
-                + `Current route fingerprint is ${accountFingerprint}.`,
-            );
-        }
-
-        if (!config.productionAccountFingerprintAllowlist.has(accountFingerprint)) {
-            throw new Error(
-                `Production runtime rejected: account fingerprint ${accountFingerprint} is not in PRODUCTION_ACCOUNT_FINGERPRINTS.`,
             );
         }
 
@@ -754,4 +769,19 @@ export class RuntimeManager {
 
 function unique(values: string[]): string[] {
     return [...new Set(values)];
+}
+
+function stableStringify(value: unknown): string {
+    if (Array.isArray(value)) {
+        return `[${value.map(item => stableStringify(item)).join(',')}]`;
+    }
+
+    if (value && typeof value === 'object') {
+        return `{${Object.keys(value as Record<string, unknown>)
+            .sort()
+            .map(key => `${JSON.stringify(key)}:${stableStringify((value as Record<string, unknown>)[key])}`)
+            .join(',')}}`;
+    }
+
+    return JSON.stringify(value);
 }

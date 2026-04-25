@@ -14,6 +14,7 @@ import type { TradeCounter } from './TradeCounter.js';
 import { createPairState, type CloseTriggerReason, type PairState } from './trade-state.js';
 import type {
     OrderBookProvider,
+    OrderBookSnapshot,
     OrderbookPrices,
     RuntimeTradePnlSnapshot,
     TradeClosePayload,
@@ -24,6 +25,17 @@ const COOLDOWN_MS = 30_000; // 30s cooldown after failed order
 const TIMEOUT_CHECK_INTERVAL_MS = 10_000; // Check timeouts every 10s
 const UNMANAGED_CLEANUP_RETRY_MS = 10_000;
 const RECONCILIATION_INTERVAL_MS = 60_000;
+
+interface SignalCheckContext {
+    marketEventAtMs: number | null;
+    checkStartedAtMs: number;
+}
+
+interface SignalExecutionContext extends SignalCheckContext {
+    signalDetectedAtMs: number;
+}
+
+type LatencyMetrics = Record<string, number | string | boolean | null>;
 
 /**
  * Watches a chunk of symbols and executes arbitrage trades for that chunk.
@@ -41,6 +53,8 @@ export class Trader {
     private unsubscribeCallbacks: Array<() => void> = [];
     private scheduledChecks = new Set<string>();
     private runningChecks = new Set<string>();
+    private rerunRequested = new Set<string>();
+    private latestMarketEventAt = new Map<string, number>();
     private stopResolve: (() => void) | null = null;
     private isStopping = false;
     private readonly signalEngine = new SignalEngine();
@@ -174,7 +188,7 @@ export class Trader {
 
         const handleUpdate = (symbol: string) => {
             if (this.states.has(symbol)) {
-                this.scheduleCheck(symbol);
+                this.scheduleCheck(symbol, Date.now());
             }
         };
         this.unsubscribeCallbacks = [
@@ -253,12 +267,21 @@ export class Trader {
         logger.info(this.tag, 'Stopped.');
     }
 
-    private scheduleCheck(symbol: string): void {
-        if (
-            !this.isRunning ||
-            this.scheduledChecks.has(symbol) ||
-            this.runningChecks.has(symbol)
-        ) {
+    private scheduleCheck(symbol: string, marketEventAtMs: number | null = null): void {
+        if (marketEventAtMs !== null) {
+            this.latestMarketEventAt.set(symbol, marketEventAtMs);
+        }
+
+        if (!this.isRunning) {
+            return;
+        }
+
+        if (this.runningChecks.has(symbol)) {
+            this.rerunRequested.add(symbol);
+            return;
+        }
+
+        if (this.scheduledChecks.has(symbol)) {
             return;
         }
 
@@ -270,14 +293,30 @@ export class Trader {
             }
 
             this.runningChecks.add(symbol);
-            void this.checkSpreads(symbol)
+            const checkStartedAtMs = Date.now();
+            const context: SignalCheckContext = {
+                marketEventAtMs: this.latestMarketEventAt.get(symbol) ?? null,
+                checkStartedAtMs,
+            };
+
+            void this.checkSpreads(symbol, context)
                 .catch((error: any) => {
                     logger.error(this.tag, `Spread check failed for ${symbol}: ${error.message}`);
                 })
                 .finally(() => {
                     this.runningChecks.delete(symbol);
+                    this.scheduleDeferredCheckIfNeeded(symbol);
                 });
         });
+    }
+
+    private scheduleDeferredCheckIfNeeded(symbol: string): void {
+        const state = this.states.get(symbol);
+        if (!state || state.busy || !this.rerunRequested.delete(symbol)) {
+            return;
+        }
+
+        this.scheduleCheck(symbol);
     }
 
     private getPrices(symbol: string, targetCoinsFallback?: number, isEmergency: boolean = false): OrderbookPrices | null {
@@ -288,6 +327,10 @@ export class Trader {
             !bOb?.bids?.length || !bOb?.asks?.length ||
             !yOb?.bids?.length || !yOb?.asks?.length
         ) {
+            return null;
+        }
+
+        if (!this.isFreshOrderBookPair(symbol, bOb, yOb)) {
             return null;
         }
 
@@ -317,13 +360,42 @@ export class Trader {
         };
     }
 
+    private isFreshOrderBookPair(
+        symbol: string,
+        primarySnapshot: OrderBookSnapshot,
+        secondarySnapshot: OrderBookSnapshot,
+    ): boolean {
+        const now = Date.now();
+        const primaryAgeMs = now - primarySnapshot.localTimestamp;
+        const secondaryAgeMs = now - secondarySnapshot.localTimestamp;
+        const skewMs = Math.abs(primarySnapshot.localTimestamp - secondarySnapshot.localTimestamp);
+
+        if (
+            primaryAgeMs > config.orderbookPairMaxAgeMs ||
+            secondaryAgeMs > config.orderbookPairMaxAgeMs ||
+            skewMs > config.orderbookPairMaxSkewMs
+        ) {
+            logger.debug(
+                this.tag,
+                `Skipping ${symbol}: stale/skewed orderbook pair `
+                + `(primaryAgeMs=${primaryAgeMs}, secondaryAgeMs=${secondaryAgeMs}, skewMs=${skewMs})`,
+            );
+            return false;
+        }
+
+        return true;
+    }
+
     // ───────────── Private: Spread Logic ─────────────
 
-    private async checkSpreads(symbol: string) {
+    private async checkSpreads(symbol: string, context: SignalCheckContext) {
         const state = this.states.get(symbol)!;
         // Both websocket loops can call checkSpreads for the same symbol. The
         // busy flag prevents duplicate open/close operations.
-        if (state.busy) return;
+        if (state.busy) {
+            this.rerunRequested.add(symbol);
+            return;
+        }
 
         if (state.unmanagedExposure) {
             await this.retryUnmanagedExposureCleanup(symbol, state);
@@ -366,7 +438,7 @@ export class Trader {
             // risk exits.
             const strictPrices = this.getPrices(symbol, targetCoins, false);
             const emergencyPrices = this.getPrices(symbol, targetCoins, true);
-            await this.checkExit(symbol, state, strictPrices, emergencyPrices);
+            await this.checkExit(symbol, state, strictPrices, emergencyPrices, context);
             return;
         }
 
@@ -398,6 +470,10 @@ export class Trader {
         if (Date.now() < state.cooldownUntil) return;
 
         if (evaluation.decision) {
+            const signalContext: SignalExecutionContext = {
+                ...context,
+                signalDetectedAtMs: Date.now(),
+            };
             await this.executeOpen(
                 symbol,
                 state,
@@ -407,6 +483,7 @@ export class Trader {
                 targetCoins,
                 evaluation.decision.expectedNetEdge,
                 evaluation.decision.fundingCostPercent,
+                signalContext,
             );
             return;
         }
@@ -423,6 +500,7 @@ export class Trader {
         targetCoins: number,
         expectedNetEdge: number,
         fundingCostPercent: number,
+        signalContext?: SignalExecutionContext,
     ) {
         state.busy = true;
         let slotReserved = false;
@@ -482,10 +560,18 @@ export class Trader {
                 secondary_side: secondarySide,
                 amount,
             });
+            const orderSubmitStartedAtMs = Date.now();
             const [pSettled, sSettled] = await Promise.allSettled([
                 this.primaryClient.createMarketOrder(symbol, primarySide, amount),
                 this.secondaryClient.createMarketOrder(symbol, secondarySide, amount),
             ]);
+            const exchangeAckAtMs = Date.now();
+            this.logLatencyMetrics('open_signal', symbol, {
+                ...this.buildSignalLatencyMetrics(signalContext, orderSubmitStartedAtMs),
+                order_submit_start_to_exchange_ack_ms: exchangeAckAtMs - orderSubmitStartedAtMs,
+                primary_fulfilled: pSettled.status === 'fulfilled',
+                secondary_fulfilled: sSettled.status === 'fulfilled',
+            });
 
             if (pSettled.status === 'rejected' || sSettled.status === 'rejected') {
                 logger.error(this.tag, `❌ Atomic execution failed for ${symbol}! Reverting successful legs...`);
@@ -632,6 +718,7 @@ export class Trader {
             state.cooldownUntil = Date.now() + COOLDOWN_MS;
         } finally {
             state.busy = false;
+            this.scheduleDeferredCheckIfNeeded(symbol);
         }
     }
 
@@ -829,6 +916,7 @@ export class Trader {
             this.markUnmanagedExposure(symbol, state, exposure.orderType, exposure.slotReserved, error);
         } finally {
             state.busy = false;
+            this.scheduleDeferredCheckIfNeeded(symbol);
         }
     }
 
@@ -847,6 +935,7 @@ export class Trader {
         state: PairState,
         strictPrices: OrderbookPrices | null,
         emergencyPrices: OrderbookPrices | null,
+        context: SignalCheckContext,
     ) {
         const trade = state.activeTrade!;
         const pOpen = parseFloat(trade.primary_open_price as any);
@@ -861,7 +950,15 @@ export class Trader {
                 logger.error(this.tag, `🚨 LIQUIDATION TRIGGERED on ${symbol}`);
                 const bSpr = calculateOpenSpread(emergencyPrices, 'buy');
                 const sSpr = calculateOpenSpread(emergencyPrices, 'sell');
-                await this.executeClose(symbol, state, 'liquidation', emergencyPrices, bSpr, sSpr);
+                await this.executeClose(
+                    symbol,
+                    state,
+                    'liquidation',
+                    emergencyPrices,
+                    bSpr,
+                    sSpr,
+                    { ...context, signalDetectedAtMs: Date.now() },
+                );
                 return;
             }
         }
@@ -873,7 +970,15 @@ export class Trader {
             if (currentPnL >= config.closeThreshold) {
                 const bSpr = calculateOpenSpread(strictPrices, 'buy');
                 const sSpr = calculateOpenSpread(strictPrices, 'sell');
-                await this.executeClose(symbol, state, 'profit', strictPrices, bSpr, sSpr);
+                await this.executeClose(
+                    symbol,
+                    state,
+                    'profit',
+                    strictPrices,
+                    bSpr,
+                    sSpr,
+                    { ...context, signalDetectedAtMs: Date.now() },
+                );
             }
         }
     }
@@ -885,11 +990,13 @@ export class Trader {
         prices: OrderbookPrices | null,
         currentBuySpread?: number,
         currentSellSpread?: number,
+        signalContext?: SignalExecutionContext,
     ) {
         // Close can be triggered by profit target, timeout, shutdown or drawdown.
         // Keep local state until exchange close and Django update both complete.
         if (state.busy) return;
         state.busy = true;
+        const closeStartedAtMs = Date.now();
 
         const trade = state.activeTrade!;
         const orderType = trade.order_type as 'buy' | 'sell';
@@ -939,8 +1046,11 @@ export class Trader {
             }>> = [];
             const pOpen = parseFloat(trade.primary_open_price as any);
             const sOpen = parseFloat(trade.secondary_open_price as any);
+            const shouldClosePrimary = pSize > 0 && pSize >= minQty;
+            const shouldCloseSecondary = sSize > 0 && sSize >= minQty;
+            const closeOrderSubmitStartedAtMs = shouldClosePrimary || shouldCloseSecondary ? Date.now() : null;
 
-            if (pSize > 0 && pSize >= minQty) {
+            if (shouldClosePrimary) {
                 closePromises.push(
                     this.primaryClient.createMarketOrder(symbol, primaryCloseSide, pSize, { reduceOnly: true }).then(r => ({
                         leg: 'primary' as const,
@@ -960,7 +1070,7 @@ export class Trader {
                 pPrice = primaryCloseSide === 'buy' ? (prices?.primaryAsk ?? pOpen) : (prices?.primaryBid ?? pOpen);
             }
 
-            if (sSize > 0 && sSize >= minQty) {
+            if (shouldCloseSecondary) {
                 closePromises.push(
                     this.secondaryClient.createMarketOrder(symbol, secondaryCloseSide, sSize, { reduceOnly: true }).then(r => ({
                         leg: 'secondary' as const,
@@ -981,6 +1091,23 @@ export class Trader {
             }
 
             const closeResults = await Promise.allSettled(closePromises);
+            const closeOrdersSettledAtMs = closeOrderSubmitStartedAtMs !== null ? Date.now() : null;
+            if (reason === 'profit' || reason === 'liquidation') {
+                this.logLatencyMetrics('close_signal', symbol, {
+                    ...this.buildSignalLatencyMetrics(
+                        signalContext,
+                        closeOrderSubmitStartedAtMs ?? closeStartedAtMs,
+                        'close_signal_detected_to_close_submit_start_ms',
+                    ),
+                    order_submit_start_to_exchange_ack_ms: (
+                        closeOrderSubmitStartedAtMs !== null && closeOrdersSettledAtMs !== null
+                            ? closeOrdersSettledAtMs - closeOrderSubmitStartedAtMs
+                            : null
+                    ),
+                    primary_order_submitted: shouldClosePrimary,
+                    secondary_order_submitted: shouldCloseSecondary,
+                });
+            }
             const closeErrors: string[] = [];
             for (const result of closeResults) {
                 if (result.status === 'rejected') {
@@ -1092,6 +1219,11 @@ export class Trader {
                 await executionJournal.record(closeIntentId, 'close', 'close_sync_pending', symbol, {
                     trade_id: trade.id,
                 });
+                this.logLatencyMetrics('close_sync', symbol, {
+                    full_close_sync_duration_ms: Date.now() - closeStartedAtMs,
+                    django_synced: false,
+                    trade_id: trade.id,
+                });
                 logger.error(this.tag, `❌ Close persisted on exchanges for ${symbol}, but Django sync is still pending. Runtime will retry until it succeeds.`);
                 return;
             }
@@ -1100,6 +1232,11 @@ export class Trader {
                 trade_id: trade.id,
             }).catch((journalError: any) => {
                 logger.error(this.tag, `Close trade ${trade.id} is in Django, but execution journal sync failed for ${symbol}: ${journalError.message}`);
+            });
+            this.logLatencyMetrics('close_sync', symbol, {
+                full_close_sync_duration_ms: Date.now() - closeStartedAtMs,
+                django_synced: true,
+                trade_id: trade.id,
             });
             this.finalizeClosedTrade(symbol, state, currentBuySpread ?? null, currentSellSpread ?? null);
 
@@ -1114,6 +1251,7 @@ export class Trader {
             // Do not clear local state; next tick will safely retry remaining positions.
         } finally {
             state.busy = false;
+            this.scheduleDeferredCheckIfNeeded(symbol);
         }
     }
 
@@ -1125,6 +1263,36 @@ export class Trader {
             // Close: buy primary, sell secondary.
             return ((secondaryPrice - primaryPrice) / primaryPrice) * 100;
         }
+    }
+
+    private buildSignalLatencyMetrics(
+        context: SignalExecutionContext | undefined,
+        submitStartedAtMs: number,
+        submitMetricName: string = 'signal_detected_to_order_submit_start_ms',
+    ): LatencyMetrics {
+        if (!context) {
+            return {
+                socket_update_to_check_start_ms: null,
+                check_start_to_signal_detected_ms: null,
+                [submitMetricName]: null,
+            };
+        }
+
+        return {
+            socket_update_to_check_start_ms: context.marketEventAtMs === null
+                ? null
+                : Math.max(0, context.checkStartedAtMs - context.marketEventAtMs),
+            check_start_to_signal_detected_ms: Math.max(0, context.signalDetectedAtMs - context.checkStartedAtMs),
+            [submitMetricName]: Math.max(0, submitStartedAtMs - context.signalDetectedAtMs),
+        };
+    }
+
+    private logLatencyMetrics(phase: string, symbol: string, metrics: LatencyMetrics): void {
+        logger.info(this.tag, `latency_metrics ${JSON.stringify({
+            phase,
+            symbol,
+            ...metrics,
+        })}`);
     }
 
     private lockOnPositionSizeMismatch(
@@ -1360,6 +1528,7 @@ export class Trader {
             logger.info(this.tag, `✅ Pending Django close sync completed for ${symbol} (${reason}).`);
         } finally {
             state.busy = false;
+            this.scheduleDeferredCheckIfNeeded(symbol);
         }
     }
 }

@@ -218,6 +218,10 @@ TIME_ZONE=Asia/Almaty
 | `TIME_ZONE` | base | нет | Дефолт env-схемы: `Asia/Almaty`. |
 | `CORS_ALLOWED_ORIGINS` | production | нет | Список origin-ов frontend в prod. |
 | `SECURE_SSL_REDIRECT` | production | нет | Дефолт `True`. |
+| `SERVICE_SHARED_TOKEN` | Django -> trader/bot-engine | да для service calls | Shared token для запросов между Django и runtime-сервисами. |
+| `SERVICE_REQUEST_TIMEOUT_SECONDS` | Django -> trader/bot-engine | нет | Дефолт `90`; timeout должен покрывать bootstrap `arbitration-trader`, который может занимать десятки секунд. |
+| `SERVICE_REQUEST_RETRIES` | Django -> trader/bot-engine | нет | Количество retry для service-request. |
+| `SERVICE_REQUEST_RETRY_DELAY_SECONDS` | Django -> trader/bot-engine | нет | Пауза между retry service-request. |
 
 Не копировать реальные значения `.env` в документацию, логи, issues или PR.
 
@@ -658,6 +662,7 @@ Endpoints:
 | `PUT` | `/api/bots/runtime-configs/{id}/` | Полностью обновить runtime-конфиг. |
 | `PATCH` | `/api/bots/runtime-configs/{id}/` | Частично обновить runtime-конфиг. |
 | `DELETE` | `/api/bots/runtime-configs/{id}/` | Архивировать runtime-конфиг и отправить `stop`, если runtime считался активным. |
+| `GET` | `/api/bots/runtime-configs/{id}/active-payload/` | Service-token endpoint для startup-запроса `arbitration-trader`; возвращает полный runtime payload только если конфиг активен и не архивирован. |
 | `GET` | `/api/bots/runtime-configs/{id}/exchange-health/` | Проверить доступность primary/secondary бирж по API-ключам через `arbitration-trader`. |
 | `GET` | `/api/bots/runtime-configs/{id}/active-coins/` | Получить набор монет, по которым активный runtime держит открытые сделки. |
 | `GET` | `/api/bots/runtime-configs/{id}/open-trades-pnl/` | Получить live PnL по текущим открытым сделкам активного runtime. |
@@ -717,7 +722,8 @@ updated_at
 - При создании с `is_active=false` post-save сигнал не отправляет lifecycle-команду в `arbitration-trader`.
 - Первый lifecycle-запрос появляется только после явного включения runtime-конфига через update.
 - Diagnostic actions реализованы в `apps.bots.api.views.TraderRuntimeConfigViewSet`, HTTP proxy-логика вынесена в `apps.bots.services.trader_runtime_info`.
-- Django ходит в `arbitration-trader` с тем же `X-Service-Token`, что и lifecycle-команды; retry/timeout управляются `SERVICE_REQUEST_RETRIES`, `SERVICE_REQUEST_TIMEOUT_SECONDS`, `SERVICE_REQUEST_RETRY_DELAY_SECONDS`.
+- `active-payload` доступен только по `X-Service-Token`, использует `TraderRuntimeConfig.id` из URL и нужен для autostart `arbitration-trader` после перезапуска процесса. Если конфиг неактивен или архивирован, endpoint возвращает `204`.
+- Django ходит в `arbitration-trader` с тем же `X-Service-Token`, что и lifecycle-команды; retry/timeout управляются `SERVICE_REQUEST_RETRIES`, `SERVICE_REQUEST_TIMEOUT_SECONDS`, `SERVICE_REQUEST_RETRY_DELAY_SECONDS`. Timeout по умолчанию `90` секунд, чтобы запуск `arbitration-trader` с загрузкой рынков, сверкой позиций и websocket bootstrap не считался зависшим.
 - `exchange-health` отправляет полный runtime payload вместе с ключами пользователя и не зависит от того, активен ли сейчас runtime в процессе `arbitration-trader`.
 - `active-coins` и `open-trades-pnl` читают только текущий active runtime внутри `arbitration-trader`; если запрошенный `runtime_config_id` не совпадает с активным, сервис возвращает пустой набор и `is_requested_runtime_active=false`.
 - `system-load` возвращает system-wide метрики хоста `arbitration-trader` плюс `active_runtime_config_id` для сопоставления с текущим runtime.

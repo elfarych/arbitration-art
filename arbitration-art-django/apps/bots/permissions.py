@@ -25,3 +25,10 @@ class ServiceTokenWriteOrAuthenticatedRead(BasePermission):
         return request.method in SAFE_METHODS and bool(
             request.user and request.user.is_authenticated
         )
+
+
+class ServiceTokenOnly(BasePermission):
+    """Allow only internal service-token requests."""
+
+    def has_permission(self, request, view) -> bool:
+        return is_service_request(request)

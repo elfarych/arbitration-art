@@ -78,6 +78,7 @@ export function getActiveRuntime(): TraderRuntimePayload | null {
 export const config = {
     djangoApiUrl: process.env.DJANGO_API_URL || 'http://127.0.0.1:8000/api',
     port: Number(process.env.PORT || '3002'),
+    traderInstanceId: parseOptionalPositiveInteger(process.env.TRADER_INSTANCE_ID),
     serviceToken: requireEnv('SERVICE_SHARED_TOKEN'),
     allowProductionTrading: process.env.ALLOW_PRODUCTION_TRADING === 'true',
     traderEnvironment: process.env.TRADER_ENVIRONMENT || 'development',
@@ -86,11 +87,12 @@ export const config = {
     processLockPath: process.env.TRADER_PROCESS_LOCK_PATH || 'locks/trader-runtime.lock',
     executionJournalPath: process.env.EXECUTION_JOURNAL_PATH || 'logs/execution-journal.jsonl',
     failOnUnresolvedExecutionJournal: process.env.FAIL_ON_UNRESOLVED_EXECUTION_JOURNAL !== 'false',
-    productionAccountFingerprintAllowlist: parseCsvSet(process.env.PRODUCTION_ACCOUNT_FINGERPRINTS),
     maxProductionTradeAmountUsdt: parseOptionalPositiveNumber(process.env.MAX_PRODUCTION_TRADE_AMOUNT_USDT),
     maxProductionConcurrentTrades: parseOptionalPositiveInteger(process.env.MAX_PRODUCTION_CONCURRENT_TRADES),
     maxProductionLeverage: parseOptionalPositiveInteger(process.env.MAX_PRODUCTION_LEVERAGE),
     positionSizeTolerancePercent: parseOptionalPositiveNumber(process.env.POSITION_SIZE_TOLERANCE_PERCENT) ?? 0.1,
+    orderbookPairMaxAgeMs: parseOptionalPositiveInteger(process.env.ORDERBOOK_PAIR_MAX_AGE_MS) ?? 10_000,
+    orderbookPairMaxSkewMs: parseOptionalPositiveInteger(process.env.ORDERBOOK_PAIR_MAX_SKEW_MS) ?? 10_000,
 
     get runtimeConfigId(): number {
         return requireActiveRuntime().runtime_config_id;
@@ -105,7 +107,7 @@ export const config = {
     },
 
     get binance() {
-        const { keys } = requireActiveRuntime();
+        const {keys} = requireActiveRuntime();
         return {
             apiKey: keys.binance_api_key || '',
             secret: keys.binance_secret || '',
@@ -113,7 +115,7 @@ export const config = {
     },
 
     get bybit() {
-        const { keys } = requireActiveRuntime();
+        const {keys} = requireActiveRuntime();
         return {
             apiKey: keys.bybit_api_key || '',
             secret: keys.bybit_secret || '',
@@ -121,7 +123,7 @@ export const config = {
     },
 
     get gate() {
-        const { keys } = requireActiveRuntime();
+        const {keys} = requireActiveRuntime();
         return {
             apiKey: keys.gate_api_key || '',
             secret: keys.gate_secret || '',
@@ -129,7 +131,7 @@ export const config = {
     },
 
     get mexc() {
-        const { keys } = requireActiveRuntime();
+        const {keys} = requireActiveRuntime();
         return {
             apiKey: keys.mexc_api_key || '',
             secret: keys.mexc_secret || '',
@@ -216,15 +218,6 @@ export const config = {
         return process.env.SHADOW_SIGNAL_LOG_PATH || 'logs/shadow-signals.jsonl';
     },
 } as const;
-
-function parseCsvSet(value: string | undefined): Set<string> {
-    return new Set(
-        (value || '')
-            .split(',')
-            .map(item => item.trim())
-            .filter(Boolean),
-    );
-}
 
 function parseOptionalPositiveNumber(value: string | undefined): number | null {
     if (value === undefined || value.trim() === '') {

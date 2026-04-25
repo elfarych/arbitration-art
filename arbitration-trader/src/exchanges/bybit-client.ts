@@ -278,6 +278,15 @@ export class BybitClient implements IExchangeClient {
                 return;
             }
 
+            if (this.isBybitApiErrorCode(error, [100028])) {
+                logger.warn(
+                    TAG,
+                    `Bybit unified account does not allow per-symbol isolated margin switch for ${symbol}; `
+                    + `continuing with the account's current margin mode.`,
+                );
+                return;
+            }
+
             throw new Error(`Failed to set isolated margin on Bybit: ${this.formatError(error)}`);
         }
     }
@@ -812,12 +821,21 @@ export class BybitClient implements IExchangeClient {
     }
 
     private isIdempotentSetupError(error: unknown, codes: number[]): boolean {
-        if (error instanceof BybitApiError && error.code !== null && codes.includes(error.code)) {
+        if (this.isBybitApiErrorCode(error, codes)) {
             return true;
         }
 
         const message = error instanceof Error ? error.message.toLowerCase() : '';
         return message.includes('not modified') || message.includes('same');
+    }
+
+    private isBybitApiErrorCode(error: unknown, codes: number[]): boolean {
+        if (error instanceof BybitApiError && error.code !== null) {
+            return codes.includes(error.code);
+        }
+
+        const message = error instanceof Error ? error.message : String(error);
+        return codes.some(code => message.includes(`Bybit API Error ${code}:`));
     }
 
     private formatDecimal(value: number, maxDecimals: number = 12): string {

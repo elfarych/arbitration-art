@@ -1,6 +1,7 @@
 import axios, { AxiosInstance } from 'axios';
 import { config } from '../config.js';
 import type {
+    RuntimeCommandPayload,
     RuntimeConfigErrorPayload,
     TradeClosePayload,
     TradeOpenPayload,
@@ -28,6 +29,24 @@ const client: AxiosInstance = axios.create({
  * persistence details and DRF pagination handling.
  */
 export const api = {
+    async getActiveRuntimePayload(runtimeConfigId: number): Promise<RuntimeCommandPayload | null> {
+        try {
+            const { data, status } = await client.get(`/bots/runtime-configs/${runtimeConfigId}/active-payload/`, {
+                validateStatus: value => (value >= 200 && value < 300) || value === 404,
+            });
+            if (status === 204 || status === 404 || !data) {
+                logger.info(TAG, `No active runtime payload in Django for trader instance ${runtimeConfigId}`);
+                return null;
+            }
+
+            logger.info(TAG, `Fetched active runtime payload from Django for trader instance ${runtimeConfigId}`);
+            return data as RuntimeCommandPayload;
+        } catch (e: any) {
+            logger.error(TAG, `getActiveRuntimePayload failed for ${runtimeConfigId}: ${e?.response?.status} ${JSON.stringify(e?.response?.data) || e.message}`);
+            throw e;
+        }
+    },
+
     async openTrade(payload: TradeOpenPayload): Promise<TradeRecord> {
         try {
             const { data } = await client.post('/bots/real-trades/', payload);

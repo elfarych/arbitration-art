@@ -17,8 +17,9 @@ from apps.bots.models import (
     TraderRuntimeConfig,
     TraderRuntimeConfigError,
 )
-from apps.bots.permissions import ServiceTokenWriteOrAuthenticatedRead, is_service_request
+from apps.bots.permissions import ServiceTokenOnly, ServiceTokenWriteOrAuthenticatedRead, is_service_request
 from apps.bots.services.lifecycle import LifecycleSyncError, sync_bot_lifecycle
+from apps.bots.services.trader_runtime_shared import build_trader_runtime_payload
 from apps.bots.services.trader_runtime_info import (
     TraderRuntimeInfoError,
     fetch_trader_runtime_active_coins,
@@ -159,6 +160,23 @@ class TraderRuntimeConfigViewSet(viewsets.ModelViewSet):
             )
 
         return Response(payload)
+
+    @action(
+        detail=True,
+        methods=["get"],
+        url_path="active-payload",
+        permission_classes=[ServiceTokenOnly],
+    )
+    def active_payload(self, request, pk=None):
+        runtime_config = (
+            TraderRuntimeConfig.objects.select_related("owner", "owner__exchange_keys")
+            .filter(pk=pk, is_active=True, is_deleted=False)
+            .first()
+        )
+        if runtime_config is None:
+            return Response(status=status.HTTP_204_NO_CONTENT)
+
+        return Response(build_trader_runtime_payload(runtime_config))
 
 
 class TraderRuntimeConfigErrorViewSet(viewsets.ModelViewSet):
