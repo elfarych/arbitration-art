@@ -40,6 +40,7 @@
 | Django backend | `arbitration-art-django/DOCS.md` | Модели, API, auth, settings, Django admin, bot-engine sync |
 | Bot engine | `arbitration-bot-engine/DOCS.md` | Fastify engine, runtime bot lifecycle, exchange execution, integration with Django |
 | Standalone trader | `arbitration-trader/DOCS.md` | Standalone real-trading scanner/trader, exchange clients, deployment |
+| WS futures trader | `arbitration-ws-futures-trader/DOCS.md` | Low-latency Fastify trader, Binance USD-M/Bybit WS execution, async Django sync |
 | Quasar frontend | `quasar/arbitration-art-q/DOCS.md` | Quasar/Vue UI, Pinia stores, frontend API, exchange WebSockets |
 
 Если создается новое приложение, добавь в него `DOCS.md` и обнови эту таблицу.
@@ -83,6 +84,7 @@ arbitration-art/
 ├── arbitration-art-django/       # Django REST backend
 ├── arbitration-bot-engine/       # Fastify runtime engine for bot configs
 ├── arbitration-trader/           # Standalone real arbitrage trader/scanner
+├── arbitration-ws-futures-trader/ # Low-latency WS trader for Binance USD-M and Bybit Futures
 ├── quasar/arbitration-art-q/     # Quasar/Vue frontend
 └── arbitration-scanner/          # Отдельный scanner-проект, документировать при работе с ним
 ```
@@ -169,6 +171,7 @@ pnpm build
 
 - `arbitration-bot-engine`
 - `arbitration-trader`
+- `arbitration-ws-futures-trader`
 
 Перед работой читать соответствующий `DOCS.md`.
 

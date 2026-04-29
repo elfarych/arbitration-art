@@ -17,6 +17,7 @@ export interface TraderRuntimeConfig {
   service_url: string;
   primary_exchange: TraderExchange;
   secondary_exchange: TraderExchange;
+  use_testnet: boolean;
   trade_amount_usdt: string;
   leverage: number;
   max_concurrent_trades: number;
@@ -45,6 +46,7 @@ export type TraderRuntimeConfigPayload = Pick<
   | 'service_url'
   | 'primary_exchange'
   | 'secondary_exchange'
+  | 'use_testnet'
   | 'leverage'
   | 'max_concurrent_trades'
   | 'top_liquid_pairs_count'
@@ -112,6 +114,52 @@ export interface ServerInfoResponse {
   hostname: string;
   server_ip: string | null;
   ip_addresses: string[];
+}
+
+export interface TestTradePhaseMetrics {
+  send_at: number | null;
+  ack_at: number | null;
+  fill_seen_at: number | null;
+  submit_to_ack_ms: number | null;
+  submit_to_fill_seen_ms: number | null;
+  order_id: string | null;
+  client_order_id: string | null;
+  error: string | null;
+}
+
+export interface TestTradeExchangeMetrics {
+  exchange: 'binance' | 'bybit';
+  open: TestTradePhaseMetrics;
+  close: TestTradePhaseMetrics;
+  exchange_total_ms: number | null;
+}
+
+export interface TestTradeMetrics {
+  detected_at: number;
+  detected_iso: string;
+  open_submit_started_at: number | null;
+  open_finished_at: number | null;
+  close_submit_started_at: number | null;
+  close_finished_at: number | null;
+  detection_to_open_finished_ms: number | null;
+  open_finished_to_close_submit_ms: number | null;
+  close_submit_to_close_finished_ms: number | null;
+  total_ms: number | null;
+  binance: TestTradeExchangeMetrics;
+  bybit: TestTradeExchangeMetrics;
+}
+
+export interface TestTradeResponse {
+  success: boolean;
+  runtime_config_id: number;
+  symbol: string;
+  exchange_symbol: string;
+  direction: 'buy' | 'sell';
+  amount_usdt: number;
+  quantity: number;
+  use_testnet: boolean;
+  error: string | null;
+  metrics: TestTradeMetrics;
 }
 
 export type RuntimeConfigErrorType =
@@ -212,6 +260,12 @@ export const traderRuntimeConfigApi = {
 
   async serverInfo(id: number): Promise<ServerInfoResponse> {
     const { data } = await api.get<ServerInfoResponse>(`/bots/runtime-configs/${id}/server-info/`);
+    return data;
+  },
+
+  async testTrade(id: number, amountUsdt?: number | string): Promise<TestTradeResponse> {
+    const payload = amountUsdt === undefined || amountUsdt === '' ? {} : { amount_usdt: amountUsdt };
+    const { data } = await api.post<TestTradeResponse>(`/bots/runtime-configs/${id}/test-trade/`, payload);
     return data;
   },
 };

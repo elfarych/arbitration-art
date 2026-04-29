@@ -1,7 +1,7 @@
 import axios, { AxiosInstance } from 'axios';
 import * as crypto from 'crypto';
 import type { ExchangeClientOptions, IExchangeClient } from './exchange-client.js';
-import type { ExchangePosition, ExchangeTicker, OrderResult, SymbolMarketInfo } from '../types/index.js';
+import type { ExchangePosition, ExchangeTicker, MarketOrderSubmission, OrderResult, SymbolMarketInfo } from '../types/index.js';
 import { gateToUnified, unifiedToGate } from './symbols.js';
 import { logger } from '../utils/logger.js';
 import { config } from '../config.js';
@@ -207,13 +207,26 @@ export class GateClient implements IExchangeClient {
         amount: number,
         params: { reduceOnly?: boolean; clientOrderId?: string } = {},
     ): Promise<OrderResult> {
+        const submission = await this.submitMarketOrder(symbol, side, amount, params);
+        const result = await this.confirmOrderResult(submission);
+        this.assertFilledMarketOrder(result, submission.orderId || submission.clientOrderId, submission.amount);
+        logger.info(TAG, `Order filled: ${symbol} ${side} @ ${result.avgPrice}, qty: ${result.filledQty}, commission: ${result.commission} USDT`);
+        return result;
+    }
+
+    async submitMarketOrder(
+        symbol: string,
+        side: 'buy' | 'sell',
+        amount: number,
+        params: { reduceOnly?: boolean; clientOrderId?: string } = {},
+    ): Promise<MarketOrderSubmission> {
         const gateSymbol = unifiedToGate(symbol);
         const multiplier = this.getMultiplierOrThrow(gateSymbol, symbol);
         const sizeInContracts = this.baseAmountToContracts(gateSymbol, amount, multiplier);
         const signedSize = side === 'sell' ? -sizeInContracts : sizeInContracts;
         const clientText = this.createOrderText(params.clientOrderId);
 
-        logger.info(TAG, `Creating ${side} order for ${symbol}, amount (base): ${amount}, size (contracts): ${signedSize}`);
+        logger.info(TAG, `Submitting ${side} order for ${symbol}, amount (base): ${amount}, size (contracts): ${signedSize}`);
 
         const payload: Record<string, unknown> = {
             contract: gateSymbol,
@@ -228,13 +241,20 @@ export class GateClient implements IExchangeClient {
         }
 
         let orderData: GateOrder;
+        const submittedAtMs = Date.now();
         try {
             orderData = await this.request<GateOrder>('POST', `/futures/${SETTLE}/orders`, {}, payload);
         } catch (error: any) {
-            const reconciled = await this.reconcileSubmittedOrder(gateSymbol, clientText, amount, multiplier);
+            const reconciled = await this.reconcileSubmittedOrderAck(
+                gateSymbol,
+                symbol,
+                clientText,
+                side,
+                amount,
+                Boolean(params.reduceOnly),
+                submittedAtMs,
+            );
             if (reconciled) {
-                this.assertFilledMarketOrder(reconciled, clientText, amount);
-                logger.info(TAG, `Order filled after reconciliation: ${symbol} ${side} @ ${reconciled.avgPrice}, qty: ${reconciled.filledQty}, commission: ${reconciled.commission} USDT`);
                 return reconciled;
             }
 
@@ -242,10 +262,35 @@ export class GateClient implements IExchangeClient {
         }
 
         const orderId = orderData.id ? String(orderData.id) : undefined;
-        const result = await this.waitForOrderResult(gateSymbol, orderId, clientText, amount, multiplier, orderData);
+        return {
+            symbol,
+            side,
+            amount,
+            reduceOnly: Boolean(params.reduceOnly),
+            orderId,
+            clientOrderId: clientText,
+            submittedAtMs,
+            acknowledgedAtMs: Date.now(),
+            raw: orderData,
+        };
+    }
 
-        this.assertFilledMarketOrder(result, orderId || clientText, amount);
-        logger.info(TAG, `Order filled: ${symbol} ${side} @ ${result.avgPrice}, qty: ${result.filledQty}, commission: ${result.commission} USDT`);
+    async confirmOrderResult(submission: MarketOrderSubmission): Promise<OrderResult> {
+        const gateSymbol = unifiedToGate(submission.symbol);
+        const multiplier = this.getMultiplierOrThrow(gateSymbol, submission.symbol);
+        const initialOrder = isGateOrder(submission.raw) ? submission.raw : undefined;
+        const result = await this.waitForOrderResult(
+            gateSymbol,
+            submission.orderId,
+            submission.clientOrderId,
+            submission.amount,
+            multiplier,
+            initialOrder,
+        );
+        logger.info(
+            TAG,
+            `Order confirmed: ${submission.symbol} ${submission.side} @ ${result.avgPrice}, qty: ${result.filledQty}, commission: ${result.commission} USDT`,
+        );
         return result;
     }
 
@@ -412,25 +457,31 @@ export class GateClient implements IExchangeClient {
         throw new Error(`Gate order ${orderId || clientText} was not found after submission`);
     }
 
-    private async reconcileSubmittedOrder(
+    private async reconcileSubmittedOrderAck(
         gateSymbol: string,
+        symbol: string,
         clientText: string,
-        requestedAmount: number,
-        multiplier: number,
-    ): Promise<OrderResult | null> {
+        side: 'buy' | 'sell',
+        amount: number,
+        reduceOnly: boolean,
+        submittedAtMs: number,
+    ): Promise<MarketOrderSubmission | null> {
         for (let attempt = 0; attempt < ORDER_POLL_ATTEMPTS; attempt++) {
             await this.sleep(ORDER_POLL_DELAY_MS);
             try {
                 const order = await this.findOrderByText(gateSymbol, clientText);
                 if (order) {
-                    return this.waitForOrderResult(
-                        gateSymbol,
-                        order.id ? String(order.id) : undefined,
-                        clientText,
-                        requestedAmount,
-                        multiplier,
-                        order,
-                    );
+                    return {
+                        symbol,
+                        side,
+                        amount,
+                        reduceOnly,
+                        orderId: order.id ? String(order.id) : undefined,
+                        clientOrderId: clientText,
+                        submittedAtMs,
+                        acknowledgedAtMs: Date.now(),
+                        raw: { order, reconciled: true },
+                    };
                 }
             } catch (error: any) {
                 logger.warn(TAG, `Gate order reconciliation failed for ${clientText}: ${this.formatError(error)}`);
@@ -681,4 +732,10 @@ function parseNullableTimestamp(value: unknown): number | null {
     }
 
     return parsed < 10_000_000_000 ? parsed * 1000 : parsed;
+}
+
+function isGateOrder(value: unknown): value is GateOrder {
+    return typeof value === 'object'
+        && value !== null
+        && ('id' in value || 'text' in value || 'status' in value);
 }

@@ -579,6 +579,7 @@ Actions:
 - Sync -> `PATCH /bots/runtime-configs/{id}/` with `is_active=true` for active config.
 - Server info -> `GET /bots/runtime-configs/{id}/server-info/`.
 - Runtime diagnostics -> calls exchange health, active coins, open trades PnL and system load endpoints.
+- Speed XRPUSDT -> `POST /bots/runtime-configs/{id}/test-trade/`, доступно для testnet/live runtime при остановленном runtime.
 - Real trades -> `GET /bots/real-trades/?runtime_config_id={id}`.
 - Runtime errors -> `GET /bots/runtime-config-errors/?runtime_config_id={id}`.
 
@@ -589,6 +590,7 @@ Actions:
 - Backend constraint разрешает один неархивированный `TraderRuntimeConfig` на пользователя.
 - UI не показывает список runtime configs, archived configs и кнопку архивирования.
 - Под названием runtime config показывается `server_ip`, полученный через Django proxy из `arbitration-trader`.
+- Runtime page показывает блок speed probe metrics: общие latency values и per-exchange open/close ACK/fill-seen значения для Binance и Bybit.
 
 Children:
 
@@ -850,12 +852,13 @@ Actions:
 - trade amount USDT;
 - leverage;
 - max concurrent trades;
-- top liquid pairs count;
+- top 24h movers count;
 - max trade duration;
 - max leg drawdown;
 - open/close thresholds;
 - orderbook limit;
 - chunk size;
+- use_testnet;
 - active/status/sync metadata;
 - archive metadata;
 - timestamps.
@@ -874,6 +877,7 @@ Endpoints:
 | `GET` | `/bots/runtime-configs/{id}/open-trades-pnl/` | `traderRuntimeConfigApi.openTradesPnl` |
 | `GET` | `/bots/runtime-configs/{id}/system-load/` | `traderRuntimeConfigApi.systemLoad` |
 | `GET` | `/bots/runtime-configs/{id}/server-info/` | `traderRuntimeConfigApi.serverInfo` |
+| `POST` | `/bots/runtime-configs/{id}/test-trade/` | `traderRuntimeConfigApi.testTrade` |
 | `GET` | `/bots/runtime-config-errors/?runtime_config_id={id}` | `traderRuntimeErrorsApi.list` |
 | `GET` | `/bots/real-trades/?runtime_config_id={id}` | `runtimeTradesApi.list` |
 
@@ -898,16 +902,17 @@ Fields:
 - trade_amount_usdt;
 - leverage;
 - max_concurrent_trades;
-- top_liquid_pairs_count;
+- top_liquid_pairs_count, displayed as the number of top 24h movers;
 - open_threshold;
 - close_threshold;
 - max_trade_duration_minutes;
 - max_leg_drawdown_percent;
 - orderbook_limit;
 - chunk_size;
+- use_testnet;
 - is_active only in edit.
 
-`use_testnet` is not included in the frontend payload. Backend model default keeps new configs at `use_testnet=false`.
+New runtime configs use `use_testnet=true` by default in the dialog. Speed probe UI uses the current runtime environment and is disabled while the runtime is active.
 
 Validation:
 
@@ -1551,6 +1556,7 @@ Trader runtime:
 - `GET /bots/runtime-configs/{id}/open-trades-pnl/`
 - `GET /bots/runtime-configs/{id}/system-load/`
 - `GET /bots/runtime-configs/{id}/server-info/`
+- `POST /bots/runtime-configs/{id}/test-trade/`
 - `GET /bots/runtime-config-errors/?runtime_config_id={id}`
 - `GET /bots/real-trades/?runtime_config_id={id}`
 

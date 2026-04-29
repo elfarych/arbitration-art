@@ -1,7 +1,7 @@
 import axios, { AxiosInstance } from 'axios';
 import * as crypto from 'crypto';
 import type { ExchangeClientOptions, IExchangeClient } from './exchange-client.js';
-import type { ExchangePosition, ExchangeTicker, OrderResult, SymbolMarketInfo } from '../types/index.js';
+import type { ExchangePosition, ExchangeTicker, MarketOrderSubmission, OrderResult, SymbolMarketInfo } from '../types/index.js';
 import { mexcToUnified, unifiedToMexc } from './symbols.js';
 import { logger } from '../utils/logger.js';
 import { config } from '../config.js';
@@ -297,6 +297,19 @@ export class MexcClient implements IExchangeClient {
         amount: number,
         params: { reduceOnly?: boolean; clientOrderId?: string } = {},
     ): Promise<OrderResult> {
+        const submission = await this.submitMarketOrder(symbol, side, amount, params);
+        const result = await this.confirmOrderResult(submission);
+        this.assertFilledMarketOrder(result, submission.orderId || submission.clientOrderId, submission.amount);
+        logger.info(TAG, `Order filled: ${symbol} ${side} @ ${result.avgPrice}, qty: ${result.filledQty}, commission: ${result.commission} USDT`);
+        return result;
+    }
+
+    async submitMarketOrder(
+        symbol: string,
+        side: 'buy' | 'sell',
+        amount: number,
+        params: { reduceOnly?: boolean; clientOrderId?: string } = {},
+    ): Promise<MarketOrderSubmission> {
         this.assertPrivateRequestsAllowed();
         const mexcSymbol = unifiedToMexc(symbol);
         const market = this.getMarketOrThrow(mexcSymbol, symbol);
@@ -307,7 +320,7 @@ export class MexcClient implements IExchangeClient {
         const orderSide = this.getOrderSide(side, Boolean(params.reduceOnly));
         const positionMode = await this.getPositionModeForOrder(params.reduceOnly);
 
-        logger.info(TAG, `Creating ${side} order for ${symbol}, amount (base): ${amount}, vol (contracts): ${orderContracts}`);
+        logger.info(TAG, `Submitting ${side} order for ${symbol}, amount (base): ${amount}, vol (contracts): ${orderContracts}`);
 
         const payload: Record<string, unknown> = {
             symbol: mexcSymbol,
@@ -329,24 +342,55 @@ export class MexcClient implements IExchangeClient {
         }
 
         let orderId: string | undefined;
+        const submittedAtMs = Date.now();
         try {
             const createdId = await this.request<string | number>('POST', '/api/v1/private/order/submit', {}, payload);
             orderId = String(createdId);
         } catch (error: any) {
-            const reconciled = await this.reconcileSubmittedOrder(mexcSymbol, externalOid, expectedBaseAmount, contractSize);
+            const reconciled = await this.reconcileSubmittedOrderAck(
+                mexcSymbol,
+                symbol,
+                externalOid,
+                side,
+                expectedBaseAmount,
+                Boolean(params.reduceOnly),
+                submittedAtMs,
+            );
             if (reconciled) {
-                this.assertFilledMarketOrder(reconciled, externalOid, expectedBaseAmount);
-                logger.info(TAG, `Order filled after reconciliation: ${symbol} ${side} @ ${reconciled.avgPrice}, qty: ${reconciled.filledQty}, commission: ${reconciled.commission} USDT`);
                 return reconciled;
             }
 
             throw new Error(`MEXC order failed: ${this.formatError(error)}`);
         }
 
-        const result = await this.waitForOrderResult(mexcSymbol, orderId, externalOid, expectedBaseAmount, contractSize);
+        return {
+            symbol,
+            side,
+            amount: expectedBaseAmount,
+            reduceOnly: Boolean(params.reduceOnly),
+            orderId,
+            clientOrderId: externalOid,
+            submittedAtMs,
+            acknowledgedAtMs: Date.now(),
+            raw: { orderId, market },
+        };
+    }
 
-        this.assertFilledMarketOrder(result, orderId || externalOid, expectedBaseAmount);
-        logger.info(TAG, `Order filled: ${symbol} ${side} @ ${result.avgPrice}, qty: ${result.filledQty}, commission: ${result.commission} USDT`);
+    async confirmOrderResult(submission: MarketOrderSubmission): Promise<OrderResult> {
+        this.assertPrivateRequestsAllowed();
+        const mexcSymbol = unifiedToMexc(submission.symbol);
+        const contractSize = this.getContractSizeOrThrow(mexcSymbol, submission.symbol);
+        const result = await this.waitForOrderResult(
+            mexcSymbol,
+            submission.orderId,
+            submission.clientOrderId,
+            submission.amount,
+            contractSize,
+        );
+        logger.info(
+            TAG,
+            `Order confirmed: ${submission.symbol} ${submission.side} @ ${result.avgPrice}, qty: ${result.filledQty}, commission: ${result.commission} USDT`,
+        );
         return result;
     }
 
@@ -587,24 +631,31 @@ export class MexcClient implements IExchangeClient {
         throw new Error(`MEXC order ${orderId || externalOid} was not found after submission`);
     }
 
-    private async reconcileSubmittedOrder(
+    private async reconcileSubmittedOrderAck(
         mexcSymbol: string,
+        symbol: string,
         externalOid: string,
-        expectedBaseAmount: number,
-        contractSize: number,
-    ): Promise<OrderResult | null> {
+        side: 'buy' | 'sell',
+        amount: number,
+        reduceOnly: boolean,
+        submittedAtMs: number,
+    ): Promise<MarketOrderSubmission | null> {
         for (let attempt = 0; attempt < ORDER_POLL_ATTEMPTS; attempt++) {
             await this.sleep(ORDER_POLL_DELAY_MS);
             try {
                 const order = await this.fetchOrderByExternalOid(mexcSymbol, externalOid);
                 if (order) {
-                    return this.waitForOrderResult(
-                        mexcSymbol,
-                        order.orderId ? String(order.orderId) : undefined,
-                        externalOid,
-                        expectedBaseAmount,
-                        contractSize,
-                    );
+                    return {
+                        symbol,
+                        side,
+                        amount,
+                        reduceOnly,
+                        orderId: order.orderId ? String(order.orderId) : undefined,
+                        clientOrderId: externalOid,
+                        submittedAtMs,
+                        acknowledgedAtMs: Date.now(),
+                        raw: { order, reconciled: true },
+                    };
                 }
             } catch (error: any) {
                 logger.warn(TAG, `MEXC order reconciliation failed for ${externalOid}: ${this.formatError(error)}`);

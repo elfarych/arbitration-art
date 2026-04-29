@@ -214,6 +214,22 @@ export interface OrderResult {
     raw: any;
 }
 
+/**
+ * Exchange ACK returned after the private create-order request is accepted.
+ * Fill polling and accounting are performed later through confirmOrderResult().
+ */
+export interface MarketOrderSubmission {
+    symbol: string;
+    side: 'buy' | 'sell';
+    amount: number;
+    reduceOnly: boolean;
+    orderId?: string;
+    clientOrderId: string;
+    submittedAtMs: number;
+    acknowledgedAtMs: number;
+    raw: any;
+}
+
 // ──────────── Trade (Django API) ────────────
 
 /**

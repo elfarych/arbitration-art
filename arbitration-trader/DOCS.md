@@ -1130,6 +1130,8 @@ interface IExchangeClient {
 
     fetchPositions(symbols): Promise<ExchangePosition[]>;
 
+    fetchAllOpenPositions(): Promise<ExchangePosition[]>;
+
     loadMarkets(): Promise<void>;
 
     setLeverage(symbol, leverage): Promise<void>;
@@ -1138,13 +1140,20 @@ interface IExchangeClient {
 
     createMarketOrder(symbol, side, amount, params?): Promise<OrderResult>;
 
+    submitMarketOrder(symbol, side, amount, params?): Promise<MarketOrderSubmission>;
+
+    confirmOrderResult(submission): Promise<OrderResult>;
+
     getMarketInfo(symbol): SymbolMarketInfo | null;
 
     getUsdtSymbols(): string[];
 }
 ```
 
-This keeps `Trader` exchange-agnostic.
+`createMarketOrder()` остается совместимым одношаговым методом для rollback/cleanup-кода. Entry и close hot path
+используют двухфазный контракт: `submitMarketOrder()` возвращает ACK создания ордера без polling fills, а
+`confirmOrderResult()` отдельно получает статус, fills, average price и commission. `Trader` журналирует задержку между
+сигналом, create ACK и подтверждением fill без exchange-specific ветвления.
 
 ## 13. BinanceClient
 
@@ -1921,6 +1930,7 @@ Each `Trader` owns a chunk of symbols and keeps per-symbol mutable state:
 - `partialClose`
 - `closeIntentId`
 - `canOpenNewTrades`
+- `optimisticProfitCloseAttempted`
 
 Provider update callbacks schedule spread checks per symbol. `busy` acts as a local mutex to prevent duplicate
 open/close handling from concurrent book updates.
@@ -1960,7 +1970,7 @@ When a symbol has no active trade:
 3. Check global `TradeCounter`.
 4. Enforce per-symbol cooldown.
 5. Skip entry if `canOpenNewTrades=false`, runtime is stopping, or runtime risk lock is active.
-6. Before sending orders, verify that the symbol has no unexpected existing positions on either exchange.
+6. Ручные/неожиданные позиции контролируются startup reconciliation и фоновой reconciliation для idle symbols.
 7. Open when:
     - `currentBuySpread >= baselineBuy + openThreshold`, or
     - `currentSellSpread >= baselineSell + openThreshold`.
@@ -1980,22 +1990,31 @@ Direction semantics:
 `executeOpen()`:
 
 1. Locks the symbol with `busy`.
-2. In shadow mode, writes a JSONL signal and returns without orders.
-3. Reserves a trade slot atomically.
-4. Appends `open_intent` and `open_orders_submitting` events to `EXECUTION_JOURNAL_PATH`.
-5. Sends both market orders concurrently.
-6. On partial failure:
+2. Добавляет `entry_signal_detected` в `EXECUTION_JOURNAL_PATH`.
+3. В shadow mode пишет JSONL-сигнал, добавляет `open_aborted_before_orders` и возвращается без ордеров.
+4. Выполняет финальную быструю перепроверку orderbook:
+    - читает свежую primary/secondary snapshot pair;
+    - проверяет `ORDERBOOK_PAIR_MAX_AGE_MS` и `ORDERBOOK_PAIR_MAX_SKEW_MS`;
+    - пересчитывает spread, funding cost и `expected_net_edge` для того же направления;
+    - добавляет `entry_recheck_passed` или терминальное `entry_recheck_rejected`.
+5. Атомарно резервирует trade slot.
+6. Добавляет `open_intent`, `open_orders_submit_started` и compatibility event `open_orders_submitting` в
+   `EXECUTION_JOURNAL_PATH`.
+7. Параллельно отправляет оба market-order create request через `submitMarketOrder()`.
+8. Добавляет `open_order_create_ack`, когда биржа возвращает create-order ACK.
+9. Подтверждает order status, fills и commission через `confirmOrderResult()` и добавляет `open_order_confirmed`.
+10. On partial failure:
     - attempt reverse reduce-only rollback;
     - run full position cleanup;
     - release slot only when cleanup is confirmed;
     - apply cooldown.
-7. On cleanup failure:
+11. On cleanup failure:
     - log the cleanup error as critical;
     - store `unmanagedExposure`;
     - keep any reserved trade slot reserved;
     - set runtime risk lock and block new entries globally;
     - retry cleanup until flat.
-8. On success:
+12. On success:
     - use actual fill prices or VWAP fallback;
     - sum fees;
     - recompute real open spread;
@@ -2043,22 +2062,29 @@ When a symbol has `activeTrade`, no new entry is evaluated. Exit checks run in t
 1. Lock symbol with `busy`.
 2. Append `close_started` to `EXECUTION_JOURNAL_PATH`.
 3. Determine close side per exchange.
-4. Получить реальные позиции с обеих бирж. Если любая биржа не может подтвердить позиции, close attempt завершается
-   ошибкой и повторяется позже вместо записи flat-состояния в Django.
-5. Risk-lock the runtime if actual position size differs from Django amount beyond `POSITION_SIZE_TOLERANCE_PERCENT`.
-6. Close only legs that are still open.
-7. Use reduce-only market orders.
-8. Preserve successful per-leg close execution, fill size and commission in `partialClose` before retrying a failed
-   opposite leg.
-9. Append per-leg `close_leg_filled` events to the execution journal.
-10. Use fallback prices if a leg is already flat or execution price is missing.
-11. Compute:
+4. Для первой попытки close с reason `profit` сразу отправляет reduce-only market orders на amount из Django trade без
+   блокирующего `fetchConfirmedPosition()`.
+5. Для timeout, shutdown, liquidation и conservative retries получает реальные позиции с обеих бирж перед отправкой
+   reduce-only close orders. Если нужная позиция не подтверждается, close attempt завершается ошибкой и повторяется
+   позже вместо записи flat-состояния в Django.
+6. Включает runtime risk lock, если фактический размер позиции отличается от Django amount больше
+   `POSITION_SIZE_TOLERANCE_PERCENT`.
+7. В conservative mode закрывает только legs, которые остаются открытыми; optimistic profit close один раз отправляет
+   обе ожидаемые legs.
+8. Использует reduce-only market orders.
+9. Добавляет `close_orders_submit_started`, отправляет close orders через `submitMarketOrder()` и добавляет
+   `close_order_create_ack`.
+10. Подтверждает fills через `confirmOrderResult()` и добавляет `close_order_confirmed`.
+11. Сохраняет успешное per-leg close execution, fill size и commission в `partialClose` перед retry failed opposite leg.
+12. Добавляет per-leg `close_leg_filled` events в execution journal.
+13. Использует fallback prices, если leg уже flat или execution price отсутствует.
+14. Считает:
 - close commission
 - total commission
 - real PnL, using actual per-leg close sizes when they differ from the Django trade amount
 - close spread
 - final status
-12. Persist close into Django with retry loop.
+15. Persist close into Django with retry loop.
 
 If exchange close succeeded but Django close sync still failed after retries:
 
@@ -2075,6 +2101,7 @@ Only after successful close persistence:
 - clear `pendingCloseSync`;
 - clear `partialClose`;
 - clear close intent id;
+- clear optimistic profit-close retry marker;
 - release `TradeCounter` slot;
 - reset or refresh baselines.
 
@@ -2115,10 +2142,12 @@ If a `Trader` worker rejects unexpectedly:
 6. Close persistence in Django is treated as required state synchronization, not best-effort logging.
 7. Runtime risk lock blocks all new entries when cleanup or reconciliation detects unmanaged exposure.
 8. Startup performs account-wide position reconciliation before subscribing scanners.
-9. Execution journal unresolved intents block restart until operator reconciliation.
-10. Host-local process lock prevents duplicate runtime in the same deployment directory, but not across hosts.
-11. Dust positions below `minQty` may be ignored by close logic.
-12. `profitPercentage` is calculated against notional capital, not isolated margin after leverage.
+9. Фоновая reconciliation для idle symbols использует `fetchPositions()` вне entry hot path и помечает symbol unsafe
+   при обнаружении ручной/неожиданной exposure.
+10. Execution journal unresolved intents block restart until operator reconciliation.
+11. Host-local process lock prevents duplicate runtime in the same deployment directory, but not across hosts.
+12. Dust positions below `minQty` may be ignored by close logic.
+13. `profitPercentage` is calculated against notional capital, not isolated margin after leverage.
 
 ### 24.13. Realtime signal execution
 
@@ -2133,9 +2162,32 @@ against `ORDERBOOK_PAIR_MAX_AGE_MS` and validates primary/secondary local timest
 `ORDERBOOK_PAIR_MAX_SKEW_MS`. Entry, profit-close and liquidation-close signals are skipped when the pair is stale or
 skewed.
 
+Entry order submission выполняет финальную in-memory перепроверку orderbook непосредственно перед
+`submitMarketOrder()`. Recheck отклоняет entry, если snapshot pair stale/skewed, не хватает видимой глубины или
+пересчитанный `expected_net_edge` ниже `min_open_net_edge_percent`.
+
+Первый profit close использует optimistic reduce-only submit на ожидаемый amount из Django trade. Если submit,
+confirmation или полнота fill не подтверждаются, local state сохраняет active trade, а последующие retries используют
+conservative path с подтверждением позиций.
+
 The timeout watchdog remains interval-based and runs separately every 10 seconds. Cleanup, pending close sync and
 reconciliation retries remain protective background flows.
 
-Signal execution logs structured `latency_metrics` records for `open_signal`, `close_signal` and `close_sync`. The
-records expose socket update to check start, check start to signal detection, signal detection to order submit, exchange
-ack latency and full close sync duration where applicable.
+Signal execution пишет structured `latency_metrics` records для `open_signal`, `close_signal` и `close_sync`. Records
+показывают socket update to check start, check start to signal detection, signal detection to recheck start, recheck
+duration, signal detection to order submit, create ACK latency, ACK-to-fill-confirmation latency, full signal to
+confirmed fill duration, position-confirm duration для conservative closes и full close sync duration, где применимо.
+
+Execution journal events для latency flow:
+
+- `entry_signal_detected`
+- `entry_recheck_started`
+- `entry_recheck_passed`
+- `entry_recheck_rejected`
+- `open_orders_submit_started`
+- `open_order_create_ack`
+- `open_order_confirmed`
+- `close_signal_detected`
+- `close_orders_submit_started`
+- `close_order_create_ack`
+- `close_order_confirmed`

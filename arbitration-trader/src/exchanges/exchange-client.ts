@@ -1,6 +1,7 @@
 import type {
     ExchangePosition,
     ExchangeTicker,
+    MarketOrderSubmission,
     OrderResult,
     SymbolMarketInfo,
 } from '../types/index.js';
@@ -48,6 +49,17 @@ export interface IExchangeClient {
         amount: number,
         params?: { reduceOnly?: boolean; clientOrderId?: string },
     ): Promise<OrderResult>;
+
+    /** Submit a market order and return the private create-order ACK */
+    submitMarketOrder(
+        symbol: string,
+        side: 'buy' | 'sell',
+        amount: number,
+        params?: { reduceOnly?: boolean; clientOrderId?: string },
+    ): Promise<MarketOrderSubmission>;
+
+    /** Confirm market-order status, fills and commission after a submit ACK */
+    confirmOrderResult(submission: MarketOrderSubmission): Promise<OrderResult>;
 
     /** Get market info (lot sizes, precision, etc.) for a symbol */
     getMarketInfo(symbol: string): SymbolMarketInfo | null;

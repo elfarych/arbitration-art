@@ -6,12 +6,23 @@ import { config } from '../config.js';
 type ExecutionKind = 'open' | 'close' | 'cleanup';
 
 type ExecutionJournalEventName =
+    | 'entry_signal_detected'
+    | 'entry_recheck_started'
+    | 'entry_recheck_passed'
+    | 'entry_recheck_rejected'
     | 'open_intent'
     | 'open_orders_submitting'
+    | 'open_orders_submit_started'
+    | 'open_order_create_ack'
+    | 'open_order_confirmed'
     | 'open_leg_filled'
     | 'open_django_synced'
     | 'open_aborted_before_orders'
     | 'open_failed'
+    | 'close_signal_detected'
+    | 'close_orders_submit_started'
+    | 'close_order_create_ack'
+    | 'close_order_confirmed'
     | 'cleanup_started'
     | 'cleanup_completed'
     | 'cleanup_failed'
@@ -135,7 +146,7 @@ export class ExecutionJournal {
 
 function isUnsafeTerminalState(state: IntentState): boolean {
     if (state.kind === 'open') {
-        return !['open_django_synced', 'open_aborted_before_orders', 'cleanup_completed'].includes(state.event);
+        return !['open_django_synced', 'open_aborted_before_orders', 'entry_recheck_rejected', 'cleanup_completed'].includes(state.event);
     }
 
     if (state.kind === 'cleanup') {

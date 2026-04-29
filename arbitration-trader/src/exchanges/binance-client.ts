@@ -1,7 +1,7 @@
 import axios, { AxiosInstance } from 'axios';
 import * as crypto from 'crypto';
 import type { ExchangeClientOptions, IExchangeClient } from './exchange-client.js';
-import type { ExchangePosition, ExchangeTicker, OrderResult, SymbolMarketInfo } from '../types/index.js';
+import type { ExchangePosition, ExchangeTicker, MarketOrderSubmission, OrderResult, SymbolMarketInfo } from '../types/index.js';
 import { binanceToUnified, unifiedToBinance } from './symbols.js';
 import { logger } from '../utils/logger.js';
 import { config } from '../config.js';
@@ -255,10 +255,23 @@ export class BinanceClient implements IExchangeClient {
         amount: number, // Base currency amount.
         params: { reduceOnly?: boolean; clientOrderId?: string } = {},
     ): Promise<OrderResult> {
+        const submission = await this.submitMarketOrder(symbol, side, amount, params);
+        const result = await this.confirmOrderResult(submission);
+        this.assertFilledMarketOrder(result, submission.orderId || submission.clientOrderId, submission.amount);
+        logger.info(TAG, `Order filled: ${symbol} ${side} @ ${result.avgPrice}, qty: ${result.filledQty}, commission: ${result.commission} USDT`);
+        return result;
+    }
+
+    async submitMarketOrder(
+        symbol: string,
+        side: 'buy' | 'sell',
+        amount: number,
+        params: { reduceOnly?: boolean; clientOrderId?: string } = {},
+    ): Promise<MarketOrderSubmission> {
         const binanceSymbol = unifiedToBinance(symbol);
         const clientOrderId = params.clientOrderId || this.createClientOrderId();
         
-        logger.info(TAG, `Creating ${side} order for ${symbol}, amount: ${amount}`);
+        logger.info(TAG, `Submitting ${side} order for ${symbol}, amount: ${amount}`);
 
         // Construct quantity formatting. Trader already rounded the amount to a
         // valid lot size before calling the client.
@@ -270,7 +283,7 @@ export class BinanceClient implements IExchangeClient {
             type: 'MARKET',
             quantity: quantityStr,
             newClientOrderId: clientOrderId,
-            newOrderRespType: 'RESULT',
+            newOrderRespType: 'ACK',
         };
 
         if (params.reduceOnly) {
@@ -282,40 +295,79 @@ export class BinanceClient implements IExchangeClient {
         }
 
         let orderData;
+        const submittedAtMs = Date.now();
         try {
             orderData = await this.request('POST', '/fapi/v1/order', orderParams);
         } catch (e: any) {
-            const reconciled = await this.reconcileSubmittedOrder(binanceSymbol, clientOrderId, amount);
+            const reconciled = await this.reconcileSubmittedOrderAck(
+                binanceSymbol,
+                symbol,
+                clientOrderId,
+                side,
+                amount,
+                Boolean(params.reduceOnly),
+                submittedAtMs,
+            );
             if (reconciled) {
-                this.assertFilledMarketOrder(reconciled, clientOrderId, amount);
-                logger.info(TAG, `Order filled after reconciliation: ${symbol} ${side} @ ${reconciled.avgPrice}, qty: ${reconciled.filledQty}, commission: ${reconciled.commission} USDT`);
                 return reconciled;
             }
 
             throw new Error(`Binance order failed: ${e.message}`);
         }
 
-        let filled = orderData;
-        const orderId = orderData.orderId;
+        const orderId = orderData.orderId ? String(orderData.orderId) : undefined;
+        return {
+            symbol,
+            side,
+            amount,
+            reduceOnly: Boolean(params.reduceOnly),
+            orderId,
+            clientOrderId,
+            submittedAtMs,
+            acknowledgedAtMs: Date.now(),
+            raw: orderData,
+        };
+    }
+
+    async confirmOrderResult(submission: MarketOrderSubmission): Promise<OrderResult> {
+        const binanceSymbol = unifiedToBinance(submission.symbol);
+        const orderId = submission.orderId;
+        let filled: any = null;
+        let avgPrice = 0;
+        let lastPollError: Error | null = null;
 
         // Binance can return the order before final average price is available,
         // so poll until status and average fill are final.
-        let avgPrice = parseFloat(filled.avgPrice || filled.price || '0');
+        for (let attempt = 0; attempt < 6; attempt++) {
+            if (attempt > 0) {
+                await new Promise(r => setTimeout(r, 700));
+            }
 
-        for (let attempt = 0; attempt < 6 && (avgPrice <= 0 || filled.status !== 'FILLED'); attempt++) {
-            await new Promise(r => setTimeout(r, 700));
             try {
                 const checked = await this.request('GET', '/fapi/v1/order', {
                     symbol: binanceSymbol,
-                    orderId: orderId
+                    ...(orderId ? { orderId } : { origClientOrderId: submission.clientOrderId }),
                 });
                 if (checked) {
                     filled = checked;
-                    avgPrice = parseFloat(filled.avgPrice || '0');
+                    avgPrice = parseFloat(filled.avgPrice || filled.price || '0');
                 }
             } catch (e: any) {
-                logger.warn(TAG, `Failed to poll Binance order ${orderId}: ${e.message}`);
+                lastPollError = e instanceof Error ? e : new Error(String(e));
+                logger.warn(TAG, `Failed to poll Binance order ${orderId || submission.clientOrderId}: ${e.message}`);
+                continue;
             }
+
+            if (filled && avgPrice > 0 && filled.status === 'FILLED') {
+                break;
+            }
+        }
+
+        if (!filled) {
+            throw new Error(
+                `Binance order ${orderId || submission.clientOrderId} status could not be confirmed`
+                + (lastPollError ? `: ${lastPollError.message}` : ''),
+            );
         }
 
         // Extract commission from User Trades because order responses can omit
@@ -329,7 +381,7 @@ export class BinanceClient implements IExchangeClient {
             
             const trades = await this.request('GET', '/fapi/v1/userTrades', {
                 symbol: binanceSymbol,
-                orderId: orderId
+                ...(orderId ? { orderId } : { orderId: filled.orderId }),
             });
 
             if (Array.isArray(trades)) {
@@ -373,16 +425,22 @@ export class BinanceClient implements IExchangeClient {
             raw: filled,
         };
 
-        this.assertFilledMarketOrder(result, String(orderId), amount);
-        logger.info(TAG, `Order filled: ${symbol} ${side} @ ${result.avgPrice}, qty: ${result.filledQty}, commission: ${result.commission} USDT`);
+        logger.info(
+            TAG,
+            `Order confirmed: ${submission.symbol} ${submission.side} @ ${result.avgPrice}, qty: ${result.filledQty}, commission: ${result.commission} USDT`,
+        );
         return result;
     }
 
-    private async reconcileSubmittedOrder(
+    private async reconcileSubmittedOrderAck(
         binanceSymbol: string,
+        symbol: string,
         clientOrderId: string,
-        requestedAmount: number,
-    ): Promise<OrderResult | null> {
+        side: 'buy' | 'sell',
+        amount: number,
+        reduceOnly: boolean,
+        submittedAtMs: number,
+    ): Promise<MarketOrderSubmission | null> {
         try {
             await new Promise(r => setTimeout(r, 700));
             const order = await this.request('GET', '/fapi/v1/order', {
@@ -390,23 +448,17 @@ export class BinanceClient implements IExchangeClient {
                 origClientOrderId: clientOrderId,
             });
 
-            const avgPrice = parseFloat(order.avgPrice || order.price || '0');
-            const filledQty = parseFloat(order.executedQty || '0');
-            const result: OrderResult = {
-                orderId: String(order.orderId || clientOrderId),
-                avgPrice,
-                filledQty,
-                commission: 0,
-                commissionAsset: 'USDT',
-                status: order.status === 'FILLED' ? 'closed' : String(order.status || 'unknown').toLowerCase(),
+            return {
+                symbol,
+                side,
+                amount,
+                reduceOnly,
+                orderId: order.orderId ? String(order.orderId) : undefined,
+                clientOrderId,
+                submittedAtMs,
+                acknowledgedAtMs: Date.now(),
                 raw: order,
             };
-
-            if (filledQty < requestedAmount * (1 - 1e-8)) {
-                return result;
-            }
-
-            return result;
         } catch {
             return null;
         }

@@ -668,6 +668,7 @@ Endpoints:
 | `GET` | `/api/bots/runtime-configs/{id}/open-trades-pnl/` | Получить live PnL по текущим открытым сделкам активного runtime. |
 | `GET` | `/api/bots/runtime-configs/{id}/system-load/` | Получить текущую нагрузку CPU/RAM на сервере `arbitration-trader`. |
 | `GET` | `/api/bots/runtime-configs/{id}/server-info/` | Получить hostname и IP-адреса сервера `arbitration-trader`. |
+| `POST` | `/api/bots/runtime-configs/{id}/test-trade/` | Запустить изолированную XRPUSDT open/close сделку через runtime service и вернуть latency metrics. |
 
 Serializer fields:
 
@@ -723,11 +724,15 @@ updated_at
 - Первый lifecycle-запрос появляется только после явного включения runtime-конфига через update.
 - Diagnostic actions реализованы в `apps.bots.api.views.TraderRuntimeConfigViewSet`, HTTP proxy-логика вынесена в `apps.bots.services.trader_runtime_info`.
 - `active-payload` доступен только по `X-Service-Token`, использует `TraderRuntimeConfig.id` из URL и нужен для autostart `arbitration-trader` после перезапуска процесса. Если конфиг неактивен или архивирован, endpoint возвращает `204`.
-- Django ходит в `arbitration-trader` с тем же `X-Service-Token`, что и lifecycle-команды; retry/timeout управляются `SERVICE_REQUEST_RETRIES`, `SERVICE_REQUEST_TIMEOUT_SECONDS`, `SERVICE_REQUEST_RETRY_DELAY_SECONDS`. Timeout по умолчанию `90` секунд, чтобы запуск `arbitration-trader` с загрузкой рынков, сверкой позиций и websocket bootstrap не считался зависшим.
+- `top_liquid_pairs_count` передается в runtime payload как количество symbols, выбираемых торговым сервисом по абсолютному 24h price change на обеих биржах.
+- Django ходит в runtime service с тем же `X-Service-Token`, что и lifecycle-команды; retry/timeout управляются `SERVICE_REQUEST_RETRIES`, `SERVICE_REQUEST_TIMEOUT_SECONDS`, `SERVICE_REQUEST_RETRY_DELAY_SECONDS`. Timeout по умолчанию `90` секунд, чтобы запуск runtime service с загрузкой рынков, сверкой позиций и websocket bootstrap не считался зависшим.
+- Diagnostic endpoints `exchange-health`, `active-coins`, `open-trades-pnl`, `system-load` и `server-info` проксируются на compatibility routes runtime service с prefix `/engine/trader/runtime/...`.
 - `exchange-health` отправляет полный runtime payload вместе с ключами пользователя и не зависит от того, активен ли сейчас runtime в процессе `arbitration-trader`.
 - `active-coins` и `open-trades-pnl` читают только текущий active runtime внутри `arbitration-trader`; если запрошенный `runtime_config_id` не совпадает с активным, сервис возвращает пустой набор и `is_requested_runtime_active=false`.
 - `system-load` возвращает system-wide метрики хоста `arbitration-trader` плюс `active_runtime_config_id` для сопоставления с текущим runtime.
 - `server-info` возвращает `hostname`, primary non-internal IPv4 в `server_ip` и список non-internal IPv4 адресов в `ip_addresses`; endpoint нужен frontend для отображения IP торгового сервера.
+- `test-trade` доступен для testnet и live runtime configs. Django отправляет полный runtime payload в `POST {service_url}/runtime/test-trade`, а торговый сервис использует `use_testnet` для выбора testnet или live биржевых endpoints. Optional body поддерживает `amount_usdt`; если runtime service недоступен или возвращает ошибку, Django отвечает `502`.
+- Response `test-trade` содержит `success`, `symbol`, `exchange_symbol`, `amount_usdt`, `quantity`, общие метрики `detection_to_open_finished_ms`, `close_submit_to_close_finished_ms`, `total_ms`, а также per-exchange метрики Binance/Bybit для open/close ACK, fill-seen, order IDs и errors.
 
 ### 9.3. `TraderRuntimeConfigErrorViewSet`
 

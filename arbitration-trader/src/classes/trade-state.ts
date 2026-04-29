@@ -51,6 +51,7 @@ export interface PairState {
     partialClose: PartialCloseState;
     closeIntentId: string | null;
     canOpenNewTrades: boolean;
+    optimisticProfitCloseAttempted: boolean;
 }
 
 export function createPairState(canOpenNewTrades: boolean): PairState {
@@ -66,5 +67,6 @@ export function createPairState(canOpenNewTrades: boolean): PairState {
         partialClose: {},
         closeIntentId: null,
         canOpenNewTrades,
+        optimisticProfitCloseAttempted: false,
     };
 }

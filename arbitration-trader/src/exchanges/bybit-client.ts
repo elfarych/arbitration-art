@@ -1,7 +1,7 @@
 import axios, { AxiosInstance } from 'axios';
 import * as crypto from 'crypto';
 import type { ExchangeClientOptions, IExchangeClient } from './exchange-client.js';
-import type { ExchangePosition, ExchangeTicker, OrderResult, SymbolMarketInfo } from '../types/index.js';
+import type { ExchangePosition, ExchangeTicker, MarketOrderSubmission, OrderResult, SymbolMarketInfo } from '../types/index.js';
 import { bybitToUnified, unifiedToBybit } from './symbols.js';
 import { logger } from '../utils/logger.js';
 import { config } from '../config.js';
@@ -297,11 +297,24 @@ export class BybitClient implements IExchangeClient {
         amount: number,
         params: { reduceOnly?: boolean; clientOrderId?: string } = {},
     ): Promise<OrderResult> {
+        const submission = await this.submitMarketOrder(symbol, side, amount, params);
+        const result = await this.confirmOrderResult(submission);
+        this.assertFilledMarketOrder(result, submission.orderId || submission.clientOrderId, submission.amount);
+        logger.info(TAG, `Order filled: ${symbol} ${side} @ ${result.avgPrice}, qty: ${result.filledQty}, commission: ${result.commission} USDT`);
+        return result;
+    }
+
+    async submitMarketOrder(
+        symbol: string,
+        side: 'buy' | 'sell',
+        amount: number,
+        params: { reduceOnly?: boolean; clientOrderId?: string } = {},
+    ): Promise<MarketOrderSubmission> {
         const bybitSymbol = unifiedToBybit(symbol);
         const orderLinkId = params.clientOrderId || this.createOrderLinkId();
         const qty = this.formatDecimal(amount, 16);
 
-        logger.info(TAG, `Creating ${side} order for ${symbol}, amount: ${amount}`);
+        logger.info(TAG, `Submitting ${side} order for ${symbol}, amount: ${amount}`);
 
         const payload: Record<string, unknown> = {
             category: CATEGORY,
@@ -319,14 +332,20 @@ export class BybitClient implements IExchangeClient {
         }
 
         let createResult: BybitCreateOrderResult;
+        const submittedAtMs = Date.now();
         try {
             createResult = await this.request<BybitCreateOrderResult>('POST', '/v5/order/create', payload, true);
         } catch (error: any) {
             if (!(error instanceof BybitApiError)) {
-                const reconciled = await this.reconcileSubmittedOrder(symbol, orderLinkId, amount);
+                const reconciled = await this.reconcileSubmittedOrderAck(
+                    symbol,
+                    orderLinkId,
+                    side,
+                    amount,
+                    Boolean(params.reduceOnly),
+                    submittedAtMs,
+                );
                 if (reconciled) {
-                    this.assertFilledMarketOrder(reconciled, orderLinkId, amount);
-                    logger.info(TAG, `Order filled after reconciliation: ${symbol} ${side} @ ${reconciled.avgPrice}, qty: ${reconciled.filledQty}, commission: ${reconciled.commission} USDT`);
                     return reconciled;
                 }
             }
@@ -335,10 +354,30 @@ export class BybitClient implements IExchangeClient {
         }
 
         const orderId = createResult.orderId ? String(createResult.orderId) : undefined;
-        const result = await this.waitForOrderResult(symbol, orderId, orderLinkId, amount);
+        return {
+            symbol,
+            side,
+            amount,
+            reduceOnly: Boolean(params.reduceOnly),
+            orderId,
+            clientOrderId: orderLinkId,
+            submittedAtMs,
+            acknowledgedAtMs: Date.now(),
+            raw: createResult,
+        };
+    }
 
-        this.assertFilledMarketOrder(result, orderId || orderLinkId, amount);
-        logger.info(TAG, `Order filled: ${symbol} ${side} @ ${result.avgPrice}, qty: ${result.filledQty}, commission: ${result.commission} USDT`);
+    async confirmOrderResult(submission: MarketOrderSubmission): Promise<OrderResult> {
+        const result = await this.waitForOrderResult(
+            submission.symbol,
+            submission.orderId,
+            submission.clientOrderId,
+            submission.amount,
+        );
+        logger.info(
+            TAG,
+            `Order confirmed: ${submission.symbol} ${submission.side} @ ${result.avgPrice}, qty: ${result.filledQty}, commission: ${result.commission} USDT`,
+        );
         return result;
     }
 
@@ -592,17 +631,30 @@ export class BybitClient implements IExchangeClient {
         throw new Error(`Bybit order ${orderId || orderLinkId} was not found after submission`);
     }
 
-    private async reconcileSubmittedOrder(
+    private async reconcileSubmittedOrderAck(
         symbol: string,
         orderLinkId: string,
-        requestedAmount: number,
-    ): Promise<OrderResult | null> {
+        side: 'buy' | 'sell',
+        amount: number,
+        reduceOnly: boolean,
+        submittedAtMs: number,
+    ): Promise<MarketOrderSubmission | null> {
         for (let attempt = 0; attempt < ORDER_POLL_ATTEMPTS; attempt++) {
             await this.sleep(ORDER_POLL_DELAY_MS);
             try {
                 const order = await this.fetchOrder(symbol, undefined, orderLinkId);
                 if (order) {
-                    return this.waitForOrderResult(symbol, order.orderId, orderLinkId, requestedAmount);
+                    return {
+                        symbol,
+                        side,
+                        amount,
+                        reduceOnly,
+                        orderId: order.orderId ? String(order.orderId) : undefined,
+                        clientOrderId: orderLinkId,
+                        submittedAtMs,
+                        acknowledgedAtMs: Date.now(),
+                        raw: { order, reconciled: true },
+                    };
                 }
             } catch (error: any) {
                 logger.warn(TAG, `Bybit order reconciliation failed for ${orderLinkId}: ${this.formatError(error)}`);

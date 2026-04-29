@@ -9,6 +9,7 @@ import {
   type RuntimeTrade,
   type ServerInfoResponse,
   type SystemLoadResponse,
+  type TestTradeResponse,
   type TraderRuntimeConfig,
   type TraderRuntimeConfigError,
   type TraderRuntimeConfigPayload,
@@ -20,11 +21,13 @@ export const useTraderRuntimeStore = defineStore('traderRuntime', {
     loading: false,
     saving: false,
     diagnosticsLoading: false,
+    testTradeLoading: false,
     exchangeHealth: null as ExchangeHealthResponse | null,
     activeCoins: null as ActiveCoinsResponse | null,
     openTradesPnl: null as OpenTradesPnlResponse | null,
     systemLoad: null as SystemLoadResponse | null,
     serverInfo: null as ServerInfoResponse | null,
+    testTradeResult: null as TestTradeResponse | null,
     errors: [] as TraderRuntimeConfigError[],
     trades: [] as RuntimeTrade[],
   }),
@@ -103,6 +106,16 @@ export const useTraderRuntimeStore = defineStore('traderRuntime', {
       return this.serverInfo;
     },
 
+    async runTestTrade(id: number, amountUsdt?: number | string) {
+      this.testTradeLoading = true;
+      try {
+        this.testTradeResult = await traderRuntimeConfigApi.testTrade(id, amountUsdt);
+        return this.testTradeResult;
+      } finally {
+        this.testTradeLoading = false;
+      }
+    },
+
     async refreshDiagnostics(id: number) {
       this.diagnosticsLoading = true;
       try {
@@ -135,6 +148,7 @@ export const useTraderRuntimeStore = defineStore('traderRuntime', {
       this.openTradesPnl = null;
       this.systemLoad = null;
       this.serverInfo = null;
+      this.testTradeResult = null;
       this.errors = [];
       this.trades = [];
     },

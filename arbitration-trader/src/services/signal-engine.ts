@@ -42,6 +42,15 @@ export class SignalEngine {
         return { nextBaselineBuy, nextBaselineSell, decision: null };
     }
 
+    evaluateEntryRecheck(
+        orderType: 'buy' | 'sell',
+        prices: OrderbookPrices,
+        marketInfo: UnifiedMarketInfo,
+    ): EntrySignalDecision | null {
+        const spread = calculateOpenSpread(prices, orderType);
+        return this.buildNetEdgeDecision(orderType, spread, marketInfo);
+    }
+
     private updateBaseline(previous: number | null, current: number): number {
         if (previous === null) {
             return current;
@@ -60,6 +69,14 @@ export class SignalEngine {
             return null;
         }
 
+        return this.buildNetEdgeDecision(orderType, spread, marketInfo);
+    }
+
+    private buildNetEdgeDecision(
+        orderType: 'buy' | 'sell',
+        spread: number,
+        marketInfo: UnifiedMarketInfo,
+    ): EntrySignalDecision | null {
         const fundingCostPercent = this.estimateFundingCostPercent(orderType, marketInfo);
         const expectedNetEdge = spread
             - config.entryFeeBufferPercent

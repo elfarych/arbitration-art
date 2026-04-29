@@ -1,0 +1,25 @@
+{
+  "name": "arbitration-ws-futures-trader",
+  "version": "1.0.0",
+  "description": "Low-latency Fastify trader for Binance USD-M and Bybit linear futures",
+  "main": "dist/main.js",
+  "scripts": {
+    "start": "tsx src/main.ts",
+    "build": "tsc",
+    "test": "tsx --test tests/*.test.ts"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "dotenv": "^17.4.0",
+    "fastify": "^4.26.2",
+    "ws": "^8.20.0"
+  },
+  "devDependencies": {
+    "@types/node": "^25.5.2",
+    "@types/ws": "^8.18.1",
+    "tsx": "^4.21.0",
+    "typescript": "^6.0.2"
+  }
+}

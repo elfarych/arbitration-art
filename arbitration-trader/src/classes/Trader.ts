@@ -16,6 +16,8 @@ import type {
     OrderBookProvider,
     OrderBookSnapshot,
     OrderbookPrices,
+    MarketOrderSubmission,
+    OrderResult,
     RuntimeTradePnlSnapshot,
     TradeClosePayload,
     TradeRecord,
@@ -36,6 +38,20 @@ interface SignalExecutionContext extends SignalCheckContext {
 }
 
 type LatencyMetrics = Record<string, number | string | boolean | null>;
+
+type OrderLegName = 'primary' | 'secondary';
+
+interface SubmittedOrderLeg {
+    leg: OrderLegName;
+    client: IExchangeClient;
+    submission: MarketOrderSubmission;
+}
+
+interface ConfirmedOrderLeg {
+    leg: OrderLegName;
+    result: OrderResult;
+    confirmedAtMs: number;
+}
 
 /**
  * Watches a chunk of symbols and executes arbitrage trades for that chunk.
@@ -512,6 +528,15 @@ export class Trader {
                 return;
             }
 
+            await executionJournal.record(openIntentId, 'open', 'entry_signal_detected', symbol, {
+                order_type: orderType,
+                amount: targetCoins,
+                spread: d(spread, 4),
+                expected_net_edge: d(expectedNetEdge, 4),
+                funding_cost_percent: d(fundingCostPercent, 4),
+                signal_detected_at_ms: signalContext?.signalDetectedAtMs ?? Date.now(),
+            });
+
             if (config.shadowMode) {
                 await shadowRecorder.recordEntrySignal({
                     symbol,
@@ -522,85 +547,185 @@ export class Trader {
                     funding_cost_percent: d(fundingCostPercent, 4),
                     prices,
                 });
+                await executionJournal.record(openIntentId, 'open', 'open_aborted_before_orders', symbol, {
+                    reason: 'shadow_mode',
+                });
                 state.cooldownUntil = Date.now() + COOLDOWN_MS;
                 return;
             }
+
+            const recheckStartedAtMs = Date.now();
+            await this.recordJournalSafely(openIntentId, 'open', 'entry_recheck_started', symbol, {
+                order_type: orderType,
+                amount: targetCoins,
+                signal_spread: d(spread, 4),
+                signal_expected_net_edge: d(expectedNetEdge, 4),
+            });
+
+            const recheck = this.recheckEntrySignal(symbol, orderType, targetCoins);
+            const recheckFinishedAtMs = Date.now();
+            if (!recheck) {
+                await executionJournal.record(openIntentId, 'open', 'entry_recheck_rejected', symbol, {
+                    order_type: orderType,
+                    amount: targetCoins,
+                    reason: 'edge_or_orderbook_invalid',
+                    recheck_duration_ms: recheckFinishedAtMs - recheckStartedAtMs,
+                });
+                this.logLatencyMetrics('open_signal', symbol, {
+                    ...this.buildSignalLatencyMetrics(signalContext, recheckFinishedAtMs),
+                    signal_detected_to_order_submit_start_ms: null,
+                    signal_detected_to_recheck_start_ms: this.diffFromSignal(signalContext, recheckStartedAtMs),
+                    recheck_duration_ms: recheckFinishedAtMs - recheckStartedAtMs,
+                    entry_recheck_passed: false,
+                    order_submitted: false,
+                });
+                return;
+            }
+
+            await this.recordJournalSafely(openIntentId, 'open', 'entry_recheck_passed', symbol, {
+                order_type: orderType,
+                amount: targetCoins,
+                spread: d(recheck.spread, 4),
+                expected_net_edge: d(recheck.expectedNetEdge, 4),
+                funding_cost_percent: d(recheck.fundingCostPercent, 4),
+                recheck_duration_ms: recheckFinishedAtMs - recheckStartedAtMs,
+            });
 
             // Reserve a global slot atomically. This closes a race where multiple
             // symbols pass canOpen() before any one of them opens.
             if (!this.tradeCounter.reserve()) {
                 logger.debug(this.tag, `Skipping ${symbol}: concurrent trade limit reached just now`);
+                await executionJournal.record(openIntentId, 'open', 'open_aborted_before_orders', symbol, {
+                    reason: 'concurrent_trade_limit',
+                });
                 return;
             }
             slotReserved = true;
 
             const amount = targetCoins;
 
-            logger.info(this.tag, `🔴 OPENING ${symbol} (${orderType}), amount: ${amount}, spread: ${spread.toFixed(3)}%, expected net edge: ${expectedNetEdge.toFixed(3)}%`);
+            logger.info(this.tag, `OPENING ${symbol} (${orderType}), amount: ${amount}, spread: ${recheck.spread.toFixed(3)}%, expected net edge: ${recheck.expectedNetEdge.toFixed(3)}%`);
 
             await executionJournal.record(openIntentId, 'open', 'open_intent', symbol, {
                 order_type: orderType,
                 amount,
-                spread: d(spread, 4),
-                expected_net_edge: d(expectedNetEdge, 4),
-                funding_cost_percent: d(fundingCostPercent, 4),
+                spread: d(recheck.spread, 4),
+                expected_net_edge: d(recheck.expectedNetEdge, 4),
+                funding_cost_percent: d(recheck.fundingCostPercent, 4),
             });
 
             // Determine order sides for each exchange.
             const primarySide = orderType === 'buy' ? 'buy' : 'sell';
             const secondarySide = orderType === 'buy' ? 'sell' : 'buy';
 
-            await this.assertNoUnexpectedPositions(symbol, state);
-
-            // Execute both legs concurrently to reduce legging risk. allSettled
-            // lets us inspect partial success and flatten any filled leg.
+            // Submit both legs concurrently to reduce legging risk. Fill
+            // confirmation runs after create-order ACKs are measured.
             ordersMayHaveReachedExchange = true;
-            await executionJournal.record(openIntentId, 'open', 'open_orders_submitting', symbol, {
+            const orderSubmitStartedAtMs = Date.now();
+            const primarySubmitPromise = this.submitOrderLeg('primary', this.primaryClient, symbol, primarySide, amount);
+            const secondarySubmitPromise = this.submitOrderLeg('secondary', this.secondaryClient, symbol, secondarySide, amount);
+            await this.recordJournalSafely(openIntentId, 'open', 'open_orders_submit_started', symbol, {
+                primary_side: primarySide,
+                secondary_side: secondarySide,
+                amount,
+                submit_started_at_ms: orderSubmitStartedAtMs,
+            });
+            await this.recordJournalSafely(openIntentId, 'open', 'open_orders_submitting', symbol, {
                 primary_side: primarySide,
                 secondary_side: secondarySide,
                 amount,
             });
-            const orderSubmitStartedAtMs = Date.now();
-            const [pSettled, sSettled] = await Promise.allSettled([
-                this.primaryClient.createMarketOrder(symbol, primarySide, amount),
-                this.secondaryClient.createMarketOrder(symbol, secondarySide, amount),
+
+            const [pSubmitSettled, sSubmitSettled] = await Promise.allSettled([
+                primarySubmitPromise,
+                secondarySubmitPromise,
             ]);
-            const exchangeAckAtMs = Date.now();
+            const submittedLegs = [pSubmitSettled, sSubmitSettled]
+                .filter((result): result is PromiseFulfilledResult<SubmittedOrderLeg> => result.status === 'fulfilled')
+                .map(result => result.value);
+
+            for (const submitted of submittedLegs) {
+                await this.recordJournalSafely(openIntentId, 'open', 'open_order_create_ack', symbol, {
+                    leg: submitted.leg,
+                    order_id: submitted.submission.orderId ?? null,
+                    client_order_id: submitted.submission.clientOrderId,
+                    acknowledged_at_ms: submitted.submission.acknowledgedAtMs,
+                    submit_to_ack_ms: submitted.submission.acknowledgedAtMs - orderSubmitStartedAtMs,
+                });
+            }
+
+            if (pSubmitSettled.status === 'rejected' || sSubmitSettled.status === 'rejected') {
+                throw new Error(`Open order submit failed: ${this.describeSettledErrors([pSubmitSettled, sSubmitSettled]).join('; ')}`);
+            }
+
+            const [pSettled, sSettled] = await Promise.allSettled([
+                this.confirmOrderLeg(pSubmitSettled.value),
+                this.confirmOrderLeg(sSubmitSettled.value),
+            ]);
+            const confirmedLegs = [pSettled, sSettled]
+                .filter((result): result is PromiseFulfilledResult<ConfirmedOrderLeg> => result.status === 'fulfilled')
+                .map(result => result.value);
+
+            for (const confirmed of confirmedLegs) {
+                await this.recordJournalSafely(openIntentId, 'open', 'open_order_confirmed', symbol, {
+                    leg: confirmed.leg,
+                    order_id: confirmed.result.orderId,
+                    filled_qty: confirmed.result.filledQty,
+                    avg_price: confirmed.result.avgPrice,
+                    commission: confirmed.result.commission,
+                    status: confirmed.result.status,
+                    confirmed_at_ms: confirmed.confirmedAtMs,
+                });
+            }
+
+            const exchangeAckAtMs = this.maxAcknowledgedAt(submittedLegs) ?? Date.now();
+            const fillConfirmedAtMs = this.maxConfirmedAt(confirmedLegs) ?? Date.now();
             this.logLatencyMetrics('open_signal', symbol, {
                 ...this.buildSignalLatencyMetrics(signalContext, orderSubmitStartedAtMs),
+                signal_detected_to_recheck_start_ms: this.diffFromSignal(signalContext, recheckStartedAtMs),
+                recheck_duration_ms: recheckFinishedAtMs - recheckStartedAtMs,
                 order_submit_start_to_exchange_ack_ms: exchangeAckAtMs - orderSubmitStartedAtMs,
+                order_create_ack_to_fill_confirmed_ms: fillConfirmedAtMs - exchangeAckAtMs,
+                full_signal_to_confirmed_fill_ms: this.diffFromSignal(signalContext, fillConfirmedAtMs),
                 primary_fulfilled: pSettled.status === 'fulfilled',
                 secondary_fulfilled: sSettled.status === 'fulfilled',
             });
+
+            const incompleteOpen = this.findIncompleteOrderResults([pSettled, sSettled], amount);
+            if (incompleteOpen.length > 0) {
+                throw new Error(`Open order did not fully fill: ${incompleteOpen.join('; ')}`);
+            }
 
             if (pSettled.status === 'rejected' || sSettled.status === 'rejected') {
                 logger.error(this.tag, `❌ Atomic execution failed for ${symbol}! Reverting successful legs...`);
                 
                 // Roll back the leg that actually opened.
                 if (pSettled.status === 'fulfilled') {
+                    const result = pSettled.value.result;
                     await executionJournal.record(openIntentId, 'open', 'open_leg_filled', symbol, {
                         leg: 'primary',
-                        order_id: pSettled.value.orderId,
-                        filled_qty: pSettled.value.filledQty,
-                        avg_price: pSettled.value.avgPrice,
-                        commission: pSettled.value.commission,
+                        order_id: result.orderId,
+                        filled_qty: result.filledQty,
+                        avg_price: result.avgPrice,
+                        commission: result.commission,
                     });
                     const revSide = primarySide === 'buy' ? 'sell' : 'buy';
                     // reduceOnly is critical to avoid opening a new opposite
                     // margin position during rollback.
-                    await this.primaryClient.createMarketOrder(symbol, revSide, pSettled.value.filledQty, { reduceOnly: true })
+                    await this.primaryClient.createMarketOrder(symbol, revSide, result.filledQty, { reduceOnly: true })
                         .catch((error: any) => logger.error(this.tag, `Primary rollback failed for ${symbol}: ${error.message}`));
                 }
                 if (sSettled.status === 'fulfilled') {
+                    const result = sSettled.value.result;
                     await executionJournal.record(openIntentId, 'open', 'open_leg_filled', symbol, {
                         leg: 'secondary',
-                        order_id: sSettled.value.orderId,
-                        filled_qty: sSettled.value.filledQty,
-                        avg_price: sSettled.value.avgPrice,
-                        commission: sSettled.value.commission,
+                        order_id: result.orderId,
+                        filled_qty: result.filledQty,
+                        avg_price: result.avgPrice,
+                        commission: result.commission,
                     });
                     const revSide = secondarySide === 'buy' ? 'sell' : 'buy';
-                    await this.secondaryClient.createMarketOrder(symbol, revSide, sSettled.value.filledQty, { reduceOnly: true })
+                    await this.secondaryClient.createMarketOrder(symbol, revSide, result.filledQty, { reduceOnly: true })
                         .catch((error: any) => logger.error(this.tag, `Secondary rollback failed for ${symbol}: ${error.message}`));
                 }
 
@@ -619,8 +744,8 @@ export class Trader {
                 return;
             }
 
-            const primaryResult = pSettled.value;
-            const secondaryResult = sSettled.value;
+            const primaryResult = pSettled.value.result;
+            const secondaryResult = sSettled.value.result;
 
             await Promise.all([
                 executionJournal.record(openIntentId, 'open', 'open_leg_filled', symbol, {
@@ -641,14 +766,14 @@ export class Trader {
 
             // Some exchange APIs initially return 0.00 average price for instant
             // market orders. Fall back to pre-order VWAP for persistence.
-            const pPriceSafe = primaryResult.avgPrice > 0 ? primaryResult.avgPrice : (primarySide === 'buy' ? prices.primaryAsk : prices.primaryBid);
-            const sPriceSafe = secondaryResult.avgPrice > 0 ? secondaryResult.avgPrice : (secondarySide === 'buy' ? prices.secondaryAsk : prices.secondaryBid);
+            const pPriceSafe = primaryResult.avgPrice > 0 ? primaryResult.avgPrice : (primarySide === 'buy' ? recheck.prices.primaryAsk : recheck.prices.primaryBid);
+            const sPriceSafe = secondaryResult.avgPrice > 0 ? secondaryResult.avgPrice : (secondarySide === 'buy' ? recheck.prices.secondaryAsk : recheck.prices.secondaryBid);
 
             const totalCommission = d(primaryResult.commission + secondaryResult.commission, 6);
 
             // Recalculate spread from actual fill prices to include market order
             // slippage.
-            let realOpenSpread = spread;
+            let realOpenSpread = recheck.spread;
             if (pPriceSafe > 0 && sPriceSafe > 0) {
                 realOpenSpread = orderType === 'buy'
                     ? ((sPriceSafe - pPriceSafe) / pPriceSafe) * 100
@@ -1010,6 +1135,13 @@ export class Trader {
                 trade_id: trade.id,
                 reason,
             });
+            if (signalContext && (reason === 'profit' || reason === 'liquidation')) {
+                await this.recordJournalSafely(closeIntentId, 'close', 'close_signal_detected', symbol, {
+                    trade_id: trade.id,
+                    reason,
+                    signal_detected_at_ms: signalContext.signalDetectedAtMs,
+                });
+            }
 
             const primaryCloseSide = orderType === 'buy' ? 'sell' : 'buy';
             const secondaryCloseSide = orderType === 'buy' ? 'buy' : 'sell';
@@ -1020,30 +1152,37 @@ export class Trader {
 
             const info = this.marketInfo.getInfo(symbol);
             const minQty = info?.minQty || 0;
-
-            // 1. Check current positions to make closing idempotent. A missing
-            // position is accepted only after a second confirmation to reduce
-            // exchange lag / eventual consistency false negatives.
-            const [pPos, sPos] = await Promise.all([
-                fetchConfirmedPosition(this.primaryClient, symbol, primaryExpectedSide, minQty, this.tag),
-                fetchConfirmedPosition(this.secondaryClient, symbol, secondaryExpectedSide, minQty, this.tag),
-            ]);
-
-            const pSize = pPos?.size ?? 0;
-            const sSize = sPos?.size ?? 0;
             const expectedAmount = parseFloat(trade.amount as any);
-            this.lockOnPositionSizeMismatch(symbol, state, trade.id, expectedAmount, pSize, sSize);
+            const useOptimisticProfitClose = reason === 'profit'
+                && !state.optimisticProfitCloseAttempted
+                && !state.partialClose.primary
+                && !state.partialClose.secondary;
 
-            // 2. Execute missing closures only. This avoids flipping positions if
-            // a previous close attempt partially succeeded.
-            const closePromises: Array<Promise<{
-                leg: 'primary' | 'secondary';
-                price: number;
-                orderId: string;
-                commission: number;
-                size: number;
-                closedAt: string;
-            }>> = [];
+            let pSize = 0;
+            let sSize = 0;
+            let positionConfirmDurationMs: number | null = null;
+
+            if (useOptimisticProfitClose) {
+                state.optimisticProfitCloseAttempted = true;
+                pSize = expectedAmount;
+                sSize = expectedAmount;
+            } else {
+                // Conservative retries and non-profit exits confirm current
+                // exchange positions before sending reduce-only close orders.
+                const positionConfirmStartedAtMs = Date.now();
+                const [pPos, sPos] = await Promise.all([
+                    fetchConfirmedPosition(this.primaryClient, symbol, primaryExpectedSide, minQty, this.tag),
+                    fetchConfirmedPosition(this.secondaryClient, symbol, secondaryExpectedSide, minQty, this.tag),
+                ]);
+                positionConfirmDurationMs = Date.now() - positionConfirmStartedAtMs;
+                pSize = pPos?.size ?? 0;
+                sSize = sPos?.size ?? 0;
+                this.lockOnPositionSizeMismatch(symbol, state, trade.id, expectedAmount, pSize, sSize);
+            }
+
+            // 2. Execute missing closures only. Conservative retries avoid
+            // flipping positions if a previous close attempt partially succeeded.
+            const closeSubmitPromises: Array<Promise<SubmittedOrderLeg>> = [];
             const pOpen = parseFloat(trade.primary_open_price as any);
             const sOpen = parseFloat(trade.secondary_open_price as any);
             const shouldClosePrimary = pSize > 0 && pSize >= minQty;
@@ -1051,15 +1190,8 @@ export class Trader {
             const closeOrderSubmitStartedAtMs = shouldClosePrimary || shouldCloseSecondary ? Date.now() : null;
 
             if (shouldClosePrimary) {
-                closePromises.push(
-                    this.primaryClient.createMarketOrder(symbol, primaryCloseSide, pSize, { reduceOnly: true }).then(r => ({
-                        leg: 'primary' as const,
-                        price: r.avgPrice,
-                        orderId: r.orderId,
-                        commission: r.commission,
-                        size: r.filledQty,
-                        closedAt: new Date().toISOString(),
-                    }))
+                closeSubmitPromises.push(
+                    this.submitOrderLeg('primary', this.primaryClient, symbol, primaryCloseSide, pSize, { reduceOnly: true })
                 );
             } else if (state.partialClose.primary) {
                 pPrice = state.partialClose.primary.price;
@@ -1071,15 +1203,8 @@ export class Trader {
             }
 
             if (shouldCloseSecondary) {
-                closePromises.push(
-                    this.secondaryClient.createMarketOrder(symbol, secondaryCloseSide, sSize, { reduceOnly: true }).then(r => ({
-                        leg: 'secondary' as const,
-                        price: r.avgPrice,
-                        orderId: r.orderId,
-                        commission: r.commission,
-                        size: r.filledQty,
-                        closedAt: new Date().toISOString(),
-                    }))
+                closeSubmitPromises.push(
+                    this.submitOrderLeg('secondary', this.secondaryClient, symbol, secondaryCloseSide, sSize, { reduceOnly: true })
                 );
             } else if (state.partialClose.secondary) {
                 sPrice = state.partialClose.secondary.price;
@@ -1090,8 +1215,55 @@ export class Trader {
                 sPrice = secondaryCloseSide === 'buy' ? (prices?.secondaryAsk ?? sOpen) : (prices?.secondaryBid ?? sOpen);
             }
 
-            const closeResults = await Promise.allSettled(closePromises);
-            const closeOrdersSettledAtMs = closeOrderSubmitStartedAtMs !== null ? Date.now() : null;
+            if (closeOrderSubmitStartedAtMs !== null) {
+                await this.recordJournalSafely(closeIntentId, 'close', 'close_orders_submit_started', symbol, {
+                    trade_id: trade.id,
+                    reason,
+                    optimistic_profit_close: useOptimisticProfitClose,
+                    primary_size: shouldClosePrimary ? pSize : 0,
+                    secondary_size: shouldCloseSecondary ? sSize : 0,
+                    submit_started_at_ms: closeOrderSubmitStartedAtMs,
+                });
+            }
+
+            const closeSubmitResults = await Promise.allSettled(closeSubmitPromises);
+            const submittedCloseLegs = closeSubmitResults
+                .filter((result): result is PromiseFulfilledResult<SubmittedOrderLeg> => result.status === 'fulfilled')
+                .map(result => result.value);
+            for (const submitted of submittedCloseLegs) {
+                await this.recordJournalSafely(closeIntentId, 'close', 'close_order_create_ack', symbol, {
+                    leg: submitted.leg,
+                    order_id: submitted.submission.orderId ?? null,
+                    client_order_id: submitted.submission.clientOrderId,
+                    acknowledged_at_ms: submitted.submission.acknowledgedAtMs,
+                    submit_to_ack_ms: closeOrderSubmitStartedAtMs === null
+                        ? null
+                        : submitted.submission.acknowledgedAtMs - closeOrderSubmitStartedAtMs,
+                });
+            }
+
+            const closeSubmitErrors = this.describeSettledErrors(closeSubmitResults);
+
+            const closeResults = await Promise.allSettled(
+                submittedCloseLegs.map(submitted => this.confirmOrderLeg(submitted)),
+            );
+            const confirmedCloseLegs = closeResults
+                .filter((result): result is PromiseFulfilledResult<ConfirmedOrderLeg> => result.status === 'fulfilled')
+                .map(result => result.value);
+            for (const confirmed of confirmedCloseLegs) {
+                await this.recordJournalSafely(closeIntentId, 'close', 'close_order_confirmed', symbol, {
+                    leg: confirmed.leg,
+                    order_id: confirmed.result.orderId,
+                    filled_qty: confirmed.result.filledQty,
+                    avg_price: confirmed.result.avgPrice,
+                    commission: confirmed.result.commission,
+                    status: confirmed.result.status,
+                    confirmed_at_ms: confirmed.confirmedAtMs,
+                });
+            }
+
+            const closeOrdersAckAtMs = this.maxAcknowledgedAt(submittedCloseLegs);
+            const closeOrdersConfirmedAtMs = this.maxConfirmedAt(confirmedCloseLegs);
             if (reason === 'profit' || reason === 'liquidation') {
                 this.logLatencyMetrics('close_signal', symbol, {
                     ...this.buildSignalLatencyMetrics(
@@ -1100,55 +1272,77 @@ export class Trader {
                         'close_signal_detected_to_close_submit_start_ms',
                     ),
                     order_submit_start_to_exchange_ack_ms: (
-                        closeOrderSubmitStartedAtMs !== null && closeOrdersSettledAtMs !== null
-                            ? closeOrdersSettledAtMs - closeOrderSubmitStartedAtMs
+                        closeOrderSubmitStartedAtMs !== null && closeOrdersAckAtMs !== null
+                            ? closeOrdersAckAtMs - closeOrderSubmitStartedAtMs
                             : null
                     ),
+                    order_create_ack_to_fill_confirmed_ms: (
+                        closeOrdersAckAtMs !== null && closeOrdersConfirmedAtMs !== null
+                            ? closeOrdersConfirmedAtMs - closeOrdersAckAtMs
+                            : null
+                    ),
+                    full_signal_to_confirmed_fill_ms: this.diffFromSignal(signalContext, closeOrdersConfirmedAtMs),
+                    position_confirm_duration_ms: positionConfirmDurationMs,
+                    optimistic_profit_close: useOptimisticProfitClose,
                     primary_order_submitted: shouldClosePrimary,
                     secondary_order_submitted: shouldCloseSecondary,
                 });
             }
-            const closeErrors: string[] = [];
+            const closeErrors: string[] = [...closeSubmitErrors];
             for (const result of closeResults) {
                 if (result.status === 'rejected') {
                     closeErrors.push(result.reason instanceof Error ? result.reason.message : String(result.reason));
                     continue;
                 }
 
-                if (result.value.leg === 'primary') {
+                const confirmed = result.value;
+                const order = confirmed.result;
+                const expectedCloseSize = confirmed.leg === 'primary' ? pSize : sSize;
+                if (order.filledQty <= 0) {
+                    closeErrors.push(`${confirmed.leg} close returned no fill: status=${order.status}, order=${order.orderId}`);
+                    continue;
+                }
+
+                if (!this.isCompleteOrderResult(order, expectedCloseSize)) {
+                    closeErrors.push(
+                        `${confirmed.leg} close incomplete: status=${order.status}, filled=${order.filledQty}, expected=${expectedCloseSize}`,
+                    );
+                }
+
+                if (confirmed.leg === 'primary') {
                     state.partialClose.primary = {
-                        price: result.value.price,
-                        orderId: result.value.orderId,
-                        commission: result.value.commission,
-                        size: result.value.size,
-                        closedAt: result.value.closedAt,
+                        price: order.avgPrice,
+                        orderId: order.orderId,
+                        commission: order.commission,
+                        size: order.filledQty,
+                        closedAt: new Date().toISOString(),
                     };
                     await executionJournal.record(closeIntentId, 'close', 'close_leg_filled', symbol, {
                         leg: 'primary',
-                        order_id: result.value.orderId,
-                        filled_qty: result.value.size,
-                        avg_price: result.value.price,
-                        commission: result.value.commission,
+                        order_id: order.orderId,
+                        filled_qty: order.filledQty,
+                        avg_price: order.avgPrice,
+                        commission: order.commission,
                     });
-                    pPrice = result.value.price;
-                    pOrder = result.value.orderId;
+                    pPrice = order.avgPrice;
+                    pOrder = order.orderId;
                 } else {
                     state.partialClose.secondary = {
-                        price: result.value.price,
-                        orderId: result.value.orderId,
-                        commission: result.value.commission,
-                        size: result.value.size,
-                        closedAt: result.value.closedAt,
+                        price: order.avgPrice,
+                        orderId: order.orderId,
+                        commission: order.commission,
+                        size: order.filledQty,
+                        closedAt: new Date().toISOString(),
                     };
                     await executionJournal.record(closeIntentId, 'close', 'close_leg_filled', symbol, {
                         leg: 'secondary',
-                        order_id: result.value.orderId,
-                        filled_qty: result.value.size,
-                        avg_price: result.value.price,
-                        commission: result.value.commission,
+                        order_id: order.orderId,
+                        filled_qty: order.filledQty,
+                        avg_price: order.avgPrice,
+                        commission: order.commission,
                     });
-                    sPrice = result.value.price;
-                    sOrder = result.value.orderId;
+                    sPrice = order.avgPrice;
+                    sOrder = order.orderId;
                 }
             }
 
@@ -1262,6 +1456,128 @@ export class Trader {
         } else {
             // Close: buy primary, sell secondary.
             return ((secondaryPrice - primaryPrice) / primaryPrice) * 100;
+        }
+    }
+
+    private recheckEntrySignal(
+        symbol: string,
+        orderType: 'buy' | 'sell',
+        targetCoins: number,
+    ): ({
+        orderType: 'buy' | 'sell';
+        spread: number;
+        expectedNetEdge: number;
+        fundingCostPercent: number;
+        prices: OrderbookPrices;
+    } | null) {
+        const info = this.marketInfo.getInfo(symbol);
+        if (!info) {
+            return null;
+        }
+
+        const prices = this.getPrices(symbol, targetCoins, false);
+        if (!prices) {
+            return null;
+        }
+
+        const decision = this.signalEngine.evaluateEntryRecheck(orderType, prices, info);
+        if (!decision || decision.orderType !== orderType) {
+            return null;
+        }
+
+        return {
+            ...decision,
+            prices,
+        };
+    }
+
+    private async submitOrderLeg(
+        leg: OrderLegName,
+        client: IExchangeClient,
+        symbol: string,
+        side: 'buy' | 'sell',
+        amount: number,
+        params: { reduceOnly?: boolean; clientOrderId?: string } = {},
+    ): Promise<SubmittedOrderLeg> {
+        const submission = await client.submitMarketOrder(symbol, side, amount, params);
+        return { leg, client, submission };
+    }
+
+    private async confirmOrderLeg(submitted: SubmittedOrderLeg): Promise<ConfirmedOrderLeg> {
+        const result = await submitted.client.confirmOrderResult(submitted.submission);
+        return {
+            leg: submitted.leg,
+            result,
+            confirmedAtMs: Date.now(),
+        };
+    }
+
+    private isCompleteOrderResult(result: OrderResult, expectedAmount: number): boolean {
+        const isFullFill = result.filledQty >= expectedAmount * (1 - 1e-8);
+        return result.filledQty > 0 && result.avgPrice > 0 && result.status === 'closed' && isFullFill;
+    }
+
+    private findIncompleteOrderResults(
+        results: Array<PromiseSettledResult<ConfirmedOrderLeg>>,
+        expectedAmount: number,
+    ): string[] {
+        const incomplete: string[] = [];
+        for (const result of results) {
+            if (result.status !== 'fulfilled') {
+                continue;
+            }
+
+            if (!this.isCompleteOrderResult(result.value.result, expectedAmount)) {
+                incomplete.push(
+                    `${result.value.leg}: status=${result.value.result.status}, filled=${result.value.result.filledQty}, expected=${expectedAmount}`,
+                );
+            }
+        }
+
+        return incomplete;
+    }
+
+    private describeSettledErrors<T>(results: Array<PromiseSettledResult<T>>): string[] {
+        return results
+            .filter((result): result is PromiseRejectedResult => result.status === 'rejected')
+            .map(result => result.reason instanceof Error ? result.reason.message : String(result.reason));
+    }
+
+    private maxAcknowledgedAt(legs: SubmittedOrderLeg[]): number | null {
+        if (legs.length === 0) {
+            return null;
+        }
+
+        return Math.max(...legs.map(leg => leg.submission.acknowledgedAtMs));
+    }
+
+    private maxConfirmedAt(legs: ConfirmedOrderLeg[]): number | null {
+        if (legs.length === 0) {
+            return null;
+        }
+
+        return Math.max(...legs.map(leg => leg.confirmedAtMs));
+    }
+
+    private diffFromSignal(context: SignalExecutionContext | undefined, atMs: number | null): number | null {
+        if (!context || atMs === null) {
+            return null;
+        }
+
+        return Math.max(0, atMs - context.signalDetectedAtMs);
+    }
+
+    private async recordJournalSafely(
+        intentId: string,
+        kind: 'open' | 'close' | 'cleanup',
+        event: Parameters<typeof executionJournal.record>[2],
+        symbol: string,
+        data: Record<string, unknown> = {},
+    ): Promise<void> {
+        try {
+            await executionJournal.record(intentId, kind, event, symbol, data);
+        } catch (error: any) {
+            logger.error(this.tag, `Failed to append execution journal event ${event} for ${symbol}: ${error.message}`);
         }
     }
 
@@ -1379,6 +1695,13 @@ export class Trader {
             }
 
             if (!state.activeTrade) {
+                if (state.canOpenNewTrades) {
+                    try {
+                        await this.assertNoUnexpectedPositions(symbol, state);
+                    } catch (error: any) {
+                        logger.error(this.tag, `Idle position reconciliation failed for ${symbol}: ${error.message}`);
+                    }
+                }
                 continue;
             }
 
@@ -1488,6 +1811,7 @@ export class Trader {
         state.pendingCloseSync = null;
         state.partialClose = {};
         state.closeIntentId = null;
+        state.optimisticProfitCloseAttempted = false;
         this.tradeCounter.release();
         this.riskLock.clear(this.reconciliationRiskKey(symbol));
         this.riskLock.clear(this.executionJournalRiskKey(symbol));

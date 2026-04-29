@@ -47,6 +47,7 @@
                 map-options
                 :rules="[requiredRule, distinctExchangeRule]"
               />
+              <q-toggle v-model="form.use_testnet" label="Testnet" color="positive" dark />
             </div>
           </section>
 
@@ -56,7 +57,7 @@
               <q-input v-model.number="form.trade_amount_usdt" type="number" min="0" step="0.01" label="Сумма сделки USDT" outlined dense dark :rules="[positiveRule]" />
               <q-input v-model.number="form.leverage" type="number" min="1" step="1" label="Плечо" outlined dense dark :rules="[positiveRule]" />
               <q-input v-model.number="form.max_concurrent_trades" type="number" min="1" step="1" label="Сделок одновременно" outlined dense dark :rules="[positiveRule]" />
-              <q-input v-model.number="form.top_liquid_pairs_count" type="number" min="1" step="1" label="Ликвидных пар" outlined dense dark :rules="[positiveRule]" />
+              <q-input v-model.number="form.top_liquid_pairs_count" type="number" min="1" step="1" label="Top 24h movers" outlined dense dark :rules="[positiveRule]" />
             </div>
           </section>
 
@@ -129,6 +130,7 @@ const defaultForm: TraderRuntimeConfigPayload = {
   service_url: 'http://127.0.0.1:3002',
   primary_exchange: 'binance',
   secondary_exchange: 'bybit',
+  use_testnet: true,
   trade_amount_usdt: 10,
   leverage: 3,
   max_concurrent_trades: 1,
@@ -155,6 +157,7 @@ function configToPayload(config: TraderRuntimeConfig): TraderRuntimeConfigPayloa
     service_url: config.service_url,
     primary_exchange: config.primary_exchange,
     secondary_exchange: config.secondary_exchange,
+    use_testnet: config.use_testnet,
     trade_amount_usdt: Number(config.trade_amount_usdt),
     leverage: config.leverage,
     max_concurrent_trades: config.max_concurrent_trades,

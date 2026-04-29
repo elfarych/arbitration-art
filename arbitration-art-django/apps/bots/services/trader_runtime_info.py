@@ -22,8 +22,10 @@ def _perform_request(
     *,
     payload: dict[str, Any] | None = None,
     params: dict[str, Any] | None = None,
+    timeout_seconds: float | None = None,
 ) -> Any:
     retries, timeout, retry_delay = request_settings()
+    effective_timeout = timeout_seconds or timeout
     last_error = "Unknown trader runtime info error."
     try:
         headers = service_headers()
@@ -38,7 +40,7 @@ def _perform_request(
                 json=payload,
                 params=params,
                 headers=headers,
-                timeout=timeout,
+                timeout=effective_timeout,
             )
             response.raise_for_status()
 
@@ -129,4 +131,28 @@ def fetch_trader_runtime_server_info(runtime_config_id: int) -> Any:
             "/engine/trader/runtime/server-info",
         ),
         params={"runtime_config_id": runtime_config.id},
+    )
+
+
+def run_trader_runtime_test_trade(
+    runtime_config_id: int,
+    *,
+    amount_usdt: Any = None,
+) -> Any:
+    runtime_config = _get_runtime_config(runtime_config_id)
+    payload = build_trader_runtime_payload(runtime_config)
+    payload["test_trade"] = {
+        "symbol": "XRPUSDT",
+    }
+    if amount_usdt not in (None, ""):
+        payload["test_trade"]["amount_usdt"] = amount_usdt
+
+    return _perform_request(
+        "POST",
+        join_control_url(
+            runtime_config.service_url,
+            "/runtime/test-trade",
+        ),
+        payload=payload,
+        timeout_seconds=30,
     )
