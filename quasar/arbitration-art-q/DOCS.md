@@ -10,20 +10,21 @@
 
 Главные функции приложения:
 
-- Login через Django JWT API.
+- Login через Django JWT API; auth hydration в router guard (см. §8.2).
 - Защищенная область приложения после авторизации.
-- Список пользовательских bot configs.
-- Создание, редактирование, активация/деактивация и удаление ботов.
+- Список пользовательских bot configs с periodic refresh для engine sync_status / last_sync_error.
+- Создание, редактирование, активация/деактивация и удаление ботов через Django ViewSet. Frontend нормализует `coin` в ccxt-формат и блокирует restricted-fields пока бот активен (см. §17).
 - Force-close команда для bot-engine через Django.
 - Отдельный раздел управления standalone `TraderRuntimeConfig` для `arbitration-trader`.
 - Создание, редактирование, запуск/остановка/синхронизация и архивирование runtime config standalone trader.
 - Диагностика standalone trader через Django proxy: exchange health, active coins, open trades PnL, system load.
 - Просмотр runtime errors и real trades, связанных с `TraderRuntimeConfig`.
-- Live-карточки ботов со spread monitoring по стаканам бирж.
-- Эмуляционная логика открытия/закрытия trades на frontend-стороне.
-- Просмотр истории emulation trades.
+- Live-карточки ботов со spread monitoring по стаканам бирж (только для отображения).
+- Просмотр истории emulation и real trades — engine пишет их в Django, frontend только читает через polling (5s) с фильтром `bot_id` + `status`.
 - Просмотр исторического графика spread через `lightweight-charts`.
 - Отдельный screener spread по выбранной паре бирж и направлению.
+
+**Trade-логика** (открытие/закрытие сделок) принадлежит `arbitration-bot-engine`. Frontend никогда не пишет в `/bots/trades/` или `/bots/real-trades/`, только читает. Это устраняет двойные записи и зависимость торгового цикла от открытой вкладки.
 
 Frontend работает с двумя типами источников данных:
 
@@ -300,22 +301,24 @@ meta: { requiresAuth: true }
 
 Файл: `src/router/index.ts`.
 
-Auth check:
+Async guard выполняет hydration `currentUser` до пропуска навигации:
 
 ```ts
-const isAuthenticated = authStore.isAuthenticated || !!localStorage.getItem('access_token');
+const hasAccessToken = !!authStore.accessToken || !!localStorage.getItem('access_token');
+if (hasAccessToken && !authStore.currentUser) {
+  try { await authStore.fetchUser(); } catch { /* axios interceptor чистит сессию */ }
+}
+const isAuthenticated = !!authStore.currentUser;
 ```
 
 Behavior:
 
-- Если route не `/login` и пользователь не authenticated -> redirect `/login`.
-- Если route `/login` и пользователь authenticated -> redirect `/`.
+- Если есть access token, но user не загружен (cold start / F5), guard выполнит `fetchUser` перед резолвом маршрута. Это устраняет окно «route считает юзера залогиненным, а `currentUser=null` в компонентах».
+- Если `fetchUser` упал (401, axios interceptor → `clearSession()` + redirect /login), guard видит `currentUser=null` и перенаправляет на `/login`.
+- Если route не `/login` и `currentUser=null` → redirect `/login`.
+- Если route `/login` и `currentUser` есть → redirect `/`.
 
-Важно:
-
-- `authStore.isAuthenticated` зависит от `currentUser`, но guard также доверяет наличию `access_token` в `localStorage`.
-- Если token просрочен, route пройдет, но API interceptor позже попробует refresh или отправит на `/login`.
-- `goToProfile()` в `MainLayout` ведет на `/profile`.
+`MainLayout` больше не вызывает `fetchUser` в `onMounted` — guard гарантирует, что к моменту рендера user уже загружен (или guard отработал redirect). `loadingUser` в MainLayout остался как computed `!authStore.currentUser` для очень коротких переходов после login.
 
 ## 9. Boot: Axios
 
@@ -744,59 +747,60 @@ Actions:
 
 Файл: `src/stores/bots/api/botConfig.ts`.
 
-BotConfig fields mirror Django backend:
+BotConfig интерфейс на фронте полностью повторяет Django serializer, включая engine-integration поля. Decimal-поля типизированы как `string | number`, потому что DRF DecimalField сериализуется в строку — конвертация в `number` остаётся вызывающему коду, чтобы не терять точность на круговой выработке `Number → toFixed → parseFloat`.
 
-- exchanges;
-- spreads;
-- coin;
-- coin amount;
-- order type;
-- trade mode;
-- max trades;
-- leverages;
-- trade_on_primary/secondary flags;
-- safety fields;
-- is_active;
-- timestamps.
+```ts
+interface BotConfig {
+  id: number;
+  service_url: string;          // read-only через API
+  primary_exchange, secondary_exchange,
+  entry_spread, exit_spread,    // string | number
+  coin: string;                  // ccxt format: "BTC/USDT:USDT"
+  coin_amount: string | number,
+  order_type: 'buy' | 'sell' | 'auto',
+  trade_mode: 'emulator' | 'real',
+  // ...
+  is_active: boolean,
+  // Engine integration status (populated by Django from inline lifecycle sync)
+  status: 'stopped' | 'starting' | 'running' | 'stopping' | 'error' | 'archived',
+  sync_status: 'idle' | 'pending' | 'success' | 'failed',
+  last_command: 'start' | 'sync' | 'stop' | 'force-close' | '',
+  last_sync_error: string,
+  last_synced_at: string | null,
+}
+```
+
+`BotConfigPayload` исключает поля, которыми управляет сервер: `id`, `service_url`, `status`, `sync_status`, `last_command`, `last_sync_error`, `last_synced_at`, `created_at`, `updated_at`.
 
 Endpoints:
 
 | Method | Path | Client method |
 |---|---|---|
-| `GET` | `/bots/` | `botConfigApi.list` |
+| `GET` | `/bots/?page_size=500` | `botConfigApi.list` |
 | `GET` | `/bots/{id}/` | `botConfigApi.get` |
 | `POST` | `/bots/` | `botConfigApi.create` |
 | `PATCH` | `/bots/{id}/` | `botConfigApi.update` |
 | `DELETE` | `/bots/{id}/` | `botConfigApi.delete` |
 | `POST` | `/bots/{id}/force-close/` | `botConfigApi.forceClose` |
+| `GET` | `/bots/{id}/engine-health/` | `botConfigApi.engineHealth` |
 
-Assumption:
+Пагинация:
 
-- `list()` expects DRF paginated response:
+- `list()` обходит все страницы через хелпер `fetchAllPages`, ориентируясь на DRF `next` URL. Django настроен с `StandardPagination` (`page_size_query_param='page_size'`, `max_page_size=500`), поэтому типичный запрос укладывается в один round-trip.
+- При >500 ботов клиент тихо подгружает остаток.
 
-```ts
-{ results: BotConfig[] }
-```
+### 15.3. Emulation и Real trades API
 
-If backend pagination changes off, this method would break.
-
-### 15.3. Emulation trades API
-
-Same file.
-
-Endpoints:
+Тот же файл экспортирует два клиента: `botTradesApi` (эмуляция, `/bots/trades/`) и `realTradesApi` (реальные, `/bots/real-trades/`).
 
 | Method | Path | Client method |
 |---|---|---|
-| `GET` | `/bots/trades/?bot={botId}` | `botTradesApi.list` |
-| `POST` | `/bots/trades/` | `botTradesApi.create` |
-| `PATCH` | `/bots/trades/{id}/` | `botTradesApi.close` |
+| `GET` | `/bots/trades/?bot_id={id}&status={s}&page_size=500` | `botTradesApi.list` |
+| `GET` | `/bots/real-trades/?bot_id={id}&status={s}&page_size=500` | `realTradesApi.list` |
 
-Important:
+Critical: фильтр идёт по `bot_id`, который Django принимает в `TradeViewSet.get_queryset` / `EmulationTradeViewSet.get_queryset`. Прежнее `?bot=...` тихо игнорировалось и возвращало все user-trades.
 
-- Backend currently does not filter by `bot` query param in the inspected Django code.
-- Client compensates by calling `data.results.filter(t => t.bot === botId)`.
-- Comment in code already notes this assumption.
+**Frontend больше не создаёт и не закрывает trade-ы**: engine (`arbitration-bot-engine`) — единственный источник истины. И real, и emulation сделки engine пишет в Django через service-token API. Frontend периодически (5s) перезапрашивает open/closed списки через `*TradesApi.list` для отображения статусов и счётчиков.
 
 ## 16. Trader runtime store и API
 
@@ -926,30 +930,23 @@ Validation:
 
 Назначение: create/edit form for BotConfig.
 
-Fields:
+Биржи в селекте: только то, что поддерживает engine и где Django `BOT_EXCHANGE_CHOICES` совпадает — `binance_futures`, `bybit_futures`, `gate_futures`, `mexc_futures`. Spot не в списке: engine REST-клиента для спота нет.
 
-- primary exchange;
-- secondary exchange;
-- coin;
-- entry spread;
-- exit spread;
-- coin amount;
-- max trades;
-- primary leverage;
-- secondary leverage;
-- trade_on_primary_exchange;
-- trade_on_secondary_exchange;
-- trade_mode;
-- order_type;
-- max_trade_duration_minutes;
-- max_leg_drawdown_percent;
-- is_active only in edit.
+Coin поле: пользователь вводит **только base ticker** (`BTC`, `ETH`, `SOL`). При submit фронт нормализует в ccxt-format `BTC/USDT:USDT` — именно его принимает Django `validate_coin`. Регекс на UI: `^[A-Z0-9]{1,15}$`, регистр приводится к верхнему автоматически. При edit coin отображается обратно как base ticker (вытаскивается из ccxt-форматной строки), само поле disabled — менять монету у созданного бота нельзя.
+
+Restricted-fields lock: пока бот `is_active=true`, форма блокирует `primary_exchange`, `secondary_exchange`, `primary_leverage`, `secondary_leverage`, `trade_mode`. Это совпадает с Django serializer-валидатором (`_RESTRICTED_WHILE_ACTIVE`): сначала надо снять `is_active`, потом менять. UI показывает баннер с подсказкой.
+
+Validation на UI:
+
+- `coin` базовая валидация regex + кнопка «Проверить» (validateSymbol через exchanges store).
+- `coin_amount > 0`.
+- `primary_exchange != secondary_exchange` (DB-level CheckConstraint в Django, плюс serializer-валидация).
 
 Create defaults:
 
 ```ts
 primary_exchange: 'binance_futures'
-secondary_exchange: 'mexc_futures'
+secondary_exchange: 'bybit_futures'
 coin_amount: 0
 entry_spread: 0
 exit_spread: 0
@@ -963,52 +960,43 @@ max_leg_drawdown_percent: 80
 is_active: true
 ```
 
-Coin validation:
-
-- calls `exchangesStore.validateSymbol`.
-- checks symbol existence on both exchanges.
-- estimates USDT margin using primary price.
-
 Save:
 
-- edit -> `botsStore.updateBot`.
-- create -> uppercases coin and `botsStore.createBot`.
+- edit → `botsStore.updateBot(id, payload)`. Payload включает `coin: ccxtSymbol(coinBase)` (например, `BTC/USDT:USDT`).
+- create → `botsStore.createBot(payload)` с тем же преобразованием.
 
-Important:
-
-- `trade_mode` toggle is disabled on edit.
-- Save button disabled until coin validation passes for new bot.
+Error handling: при 400/502 от Django сообщение извлекается через `extractApiErrorMessage` (см. §15.2) — показывает или `detail`, или field-level error. На 502 (engine sync failed) пользователь видит реальную причину из `last_sync_error`.
 
 ## 18. BotCard
 
 Файл: `src/components/bots/BotCard.vue`.
 
-Назначение: основная live-карточка бота.
+Назначение: live-карточка бота. Карточка **отображает** состояние, но не управляет торговлей: trade-логика и create/close сделок принадлежат engine.
 
 Displays:
 
-- coin;
-- order direction LONG/SHORT;
+- coin (base ticker, выводится из ccxt-формата `BTC/USDT:USDT`);
+- order direction LONG/SHORT/AUTO;
 - trade mode emulator/real;
+- engine sync badge (running / starting / failed / pending), tooltip с `last_sync_error`;
 - active/stopped status;
 - primary/secondary exchange action mapping;
-- live open/close spreads;
-- max open spread / min close spread;
-- trade status idle/in_trade;
-- trades count;
-- live PnL;
+- live open/close spreads (через `spreadMonitor`, который сам слушает биржевые WS);
+- max open spread / min close spread (локальный rolling-stat);
+- статус активной сделки и счётчик закрытых (из Django через polling);
+- live PnL по open prices + текущему WS-стрим спреду;
 - compact canvas chart;
 - funding info;
 - depth insufficiency warnings;
 - editable coin amount;
-- action buttons.
+- action buttons (toggle, history, force-close, edit, delete).
 
 Uses:
 
-- `useSpreadMonitor()`;
-- `useExchangesStore()`;
-- `useBotsStore()`;
-- `botTradesApi`;
+- `useSpreadMonitor()` — только для отображения live-спреда и графика;
+- `useExchangesStore()` — funding/exchange info;
+- `useBotsStore()` — actions toggle/update/forceClose;
+- `botTradesApi` / `realTradesApi` — read-only polling списков сделок;
 - `SpreadChart`;
 - `BotTradesDialog`.
 
@@ -1016,70 +1004,47 @@ Uses:
 
 On mount:
 
-1. Load emulation trades for this bot.
-2. Restore open emulation trade if exists.
-3. Count closed trades.
-4. Start spread monitor:
-
-```ts
-start(
-  bot.id,
-  bot.coin,
-  bot.primary_exchange,
-  bot.secondary_exchange,
-  bot.coin_amount,
-  bot.order_type
-)
-```
-
-5. Fetch exchange info / funding.
-6. Start countdown interval.
+1. Запустить spread-монитор (`start(bot.id, baseCoin, ...)`) — WebSocket stream от бирж для UI.
+2. Загрузить exchange info / funding.
+3. Запустить countdown-таймер для funding.
+4. `refreshTradeState(initial=true)` — загружает active trade и closed count из Django.
+5. Запустить `setInterval(refreshTradeState, 5000)` для синхронизации с состоянием engine.
 
 On unmount:
 
-- `stop(bot.id)`;
-- clear countdown interval.
+- `stop(bot.id)` (WS-стрим);
+- очистить countdown interval;
+- очистить trade polling interval;
+- очистить debounce-timeout-ы.
 
 ### 18.2. Inline editing
 
 Card supports autosave:
 
 - coin amount:
-  - updates monitor amount immediately;
-  - debounced backend save after 2s.
+  - сразу пересчитывает live monitor amount;
+  - debounced backend save через **4s** (увеличено: каждый PATCH триггерит inline engine sync до `SERVICE_LIFECYCLE_TIMEOUT_SECONDS × retries`);
+  - на время save поле disabled, отображается loading spinner;
+  - ошибка показывается через `notify` с `extractApiErrorMessage(e)`, локальное значение откатывается.
 - entry/exit spread:
   - popup edit;
-  - debounced backend save after 1.5s.
+  - debounced backend save через 1.5s;
+  - аналогичная обработка ошибок.
 
-### 18.3. Frontend emulation trade flow
+### 18.3. Trade state поступает из engine
 
-Open:
+Frontend **не открывает и не закрывает** сделки. Поток:
 
-- watches `spreadStats.current.openSpread`;
-- if bot active, state idle, and spread >= `bot.entry_spread`:
-  - state -> `in_trade`;
-  - POST emulation trade via `botTradesApi.create`.
+- engine открывает позицию (`api.openTrade` / `api.openEmulationTrade`) → Django `Trade` / `EmulationTrade` появляется;
+- BotCard через polling видит `status='open'`, показывает «В сделке», PnL, кнопку force-close;
+- engine закрывает позицию (profit/timeout/liquidation/manual via `/engine/bot/force-close`) → запись закрыта;
+- BotCard на следующем тике polling видит `status!=='open'`, скрывает PnL/force-close.
 
-Close:
-
-- watches `spreadStats.current.closeSpread`;
-- if state in_trade and closeSpread <= `bot.exit_spread`:
-  - compute current PnL;
-  - PATCH emulation trade closed.
-
-Manual close:
-
-- close button in card;
-- uses current close spread and prices;
-- PATCH emulation trade closed.
-
-Important:
-
-- This frontend emulation logic is separate from `arbitration-bot-engine`.
-- Real mode badge exists, but this card still runs frontend emulation state for displayed trades.
-- There is no retry loop for failed close update in frontend emulation.
+Кнопка «закрыть вручную» внутри карточки вызывает `botsStore.forceCloseBot(bot.id)`, который шлёт `/api/bots/{id}/force-close/` в Django, а тот — `/engine/bot/force-close` в engine. Engine закрывает позицию через `executeClose('force_close', ...)` (emergency VWAP, fallback на разные размеры позиций при partial fill).
 
 ### 18.4. Current PnL formula
+
+Локальный preview PnL по живым WS-ценам (не финальный — финальный считает engine при close и записывает в Django):
 
 For `buy`:
 
@@ -1096,6 +1061,8 @@ For `sell`:
 ```
 
 Then divided by `secondary_open_price`.
+
+Это та же формула, что использует `calculateTruePnL` в engine, только без вычета комиссии.
 
 ## 19. SpreadMonitor
 
@@ -1569,56 +1536,39 @@ Response assumptions:
 
 ## 28. Environment
 
-No `.env.example` was found in the Quasar project.
+`.env` для разработки и `.env.example` как шаблон находятся в корне Quasar-проекта.
 
-Used env variable:
+Используемая переменная:
 
 ```ts
 process.env.API_URL
 ```
 
-Likely local `.env` should contain something like:
+Локальный `.env` (dev):
 
 ```env
 API_URL=http://127.0.0.1:8000/api
 ```
 
-If `API_URL` is not set, Axios baseURL becomes `undefined`, so API requests become relative to frontend origin.
+Должен совпадать с `arbitration-art-django/.env` host/port и `/api` prefix из `arbitration_art_django/urls.py`. Если `API_URL` не задан, Axios baseURL = `undefined` и запросы становятся относительными от origin фронта — в production это сломает все API вызовы.
 
-For Quasar/Vite, confirm env exposure rules before relying on arbitrary `process.env.*` in browser code. Quasar supports env injection through `quasar.config.ts build.env` and dotenv patterns depending on setup.
+Quasar для browser-side env инжектит через `quasar.config.ts build.env`. Сейчас build.env не настроен явно, переменная попадает через стандартный dotenv pipeline Quasar (`.env` + `process.env.*`).
 
 ## 29. Known issues and risks
 
-### 29.1. Tokens in localStorage
+### 29.1. Exchange secrets are stored by backend
 
-Access/refresh tokens are stored in `localStorage`.
+Profile page sends exchange API keys to Django и отображает только masked previews. Backend хранит secrets в обычных `CharField`. Production deployment должен включать field-level encryption (`django-cryptography`) или secret manager + аудит доступа.
 
-Risk:
+### 29.2. No global logout UI
 
-- XSS can steal tokens.
-- Long-lived refresh token is browser-readable.
+`ProfilePage` содержит logout, но `MainLayout` не выставляет dedicated logout-меню. Минор UX, добавляется одним q-btn-dropdown в layout.
 
-### 29.2. Exchange secrets are stored by backend
+### 29.3. Production exchange REST proxy missing
 
-Profile page sends exchange API keys to Django and displays only masked previews returned by backend. The backend model still stores secrets in regular text fields, so production deployment needs DB/admin access control and encryption or a secret manager.
+Dev server проксирует exchange REST paths через `quasar.config.ts devServer.proxy`. В production frontend деплоится в SPA, прокси нет — `/binance-api/*`, `/mexc-api/*`, `/bybit-api/*`, `/binance-spot-api/*` попадают на host фронта и возвращают 404. Решение — см. §30.2 (engine WS endpoint или nginx upstream).
 
-### 29.3. No global logout UI
-
-`ProfilePage` contains logout, but `MainLayout` still does not expose a dedicated logout menu.
-
-### 29.4. Production exchange REST proxy missing
-
-Dev server proxies exchange REST paths. Production deployment needs equivalent proxy.
-
-Without it:
-
-- `/binance-api/...`
-- `/mexc-api/...`
-- `/bybit-api/...`
-
-will hit the frontend host and fail unless routed by backend/reverse proxy.
-
-### 29.5. Browser connects directly to exchange WebSockets
+### 29.4. Browser connects directly to exchange WebSockets
 
 WebSocket code connects directly to Binance/Bybit/MEXC endpoints from browser.
 
@@ -1629,59 +1579,73 @@ Risks:
 - no reconnect/backoff logic in most clients;
 - multiple bot cards create multiple websocket connections.
 
-### 29.6. Frontend emulation state is volatile
+### 29.5. Trade source of truth
 
-BotCard manages `tradeState` and `activeTrade` locally.
+Engine — единственный источник истины для всех trade-операций (open/close, real и emulation). Frontend никогда не вызывает POST/PATCH к `/bots/trades/` или `/bots/real-trades/`: только GET с фильтрами `bot_id` + `status` для отображения. Это устраняет ранее существовавшие проблемы с двойной записью и зависимостью торгового цикла от открытой вкладки.
 
-Recovery from Django happens on mount, but:
-
-- failed close update has no retry;
-- local state resets on threshold changes;
-- multiple tabs can create duplicate emulation trades.
-
-### 29.7. Live formula and historical formula may differ
+### 29.6. Live formula and historical formula may differ
 
 `SpreadMonitor` branches by order type.
 
 `exchangesStore.getSpreadHistory` does not branch by order type.
 
-### 29.8. Screener uses top-of-book only
+### 29.7. Screener uses top-of-book only
 
 Screener does not use VWAP/depth, so results may be less executable than BotCard live spread.
 
-### 29.9. `botTradesApi.list` relies on client-side filtering
+### 29.8. Type looseness in tables
 
-It sends `?bot=...`, but backend may ignore it. Then client filters returned paginated page only.
+Several `q-table` `columns` definitions use `as any`. Заменить на типизацию через `QTableColumn` где возможно — это улучшит автодополнение, но не блокер.
 
-If there are more than one page of trades, this can miss trades for a bot.
+### 29.9. Engine sync задержки видны пользователю
 
-### 29.10. `example-store.ts` and `components/models.ts` are Quasar template leftovers
+`BotConfigViewSet.perform_create`/`perform_update`/`destroy` делают inline lifecycle sync с engine. При недоступном engine PATCH/POST/DELETE может занимать до `SERVICE_LIFECYCLE_TIMEOUT_SECONDS × SERVICE_REQUEST_RETRIES` (по умолчанию 30s × 3 = 90s) и вернуть 502. Frontend показывает loading-state на кнопках; для `coin_amount` сохранение дебаунсится 4s + поле disabled на время сохранения. Если деплой имеет долгие engine-старты (большие loadMarkets), увеличить `SERVICE_LIFECYCLE_TIMEOUT_SECONDS` в Django `.env`.
 
-They appear unused and can be removed if no imports exist.
+## 30. Открытые риски для production
 
-### 29.11. Type looseness in tables
+### 30.1. JWT в localStorage
 
-Several columns use `as any`.
+Текущая SPA хранит access/refresh токены в `localStorage`. Это уязвимо к XSS: любой инжектированный скрипт читает токены. Mitigation на текущий момент:
 
-This bypasses strict TypeScript benefits for table definitions.
+- DRF SimpleJWT настроен на `ROTATE_REFRESH_TOKENS=True` и `BLACKLIST_AFTER_ROTATION=True`, поэтому украденный refresh теряет валидность после первой ротации.
+- Access token expiration 30 минут.
 
-### 29.12. Real mode UX can be confusing
+План на prod-improvement: хранить refresh в httpOnly cookie (`SameSite=Strict`), access в memory. Это требует менять Django auth backend (`SimpleJWTCookieAuthentication`-style) и CSRF protection на refresh endpoint. Рекомендуется до выхода на multi-tenant.
 
-`BotCard` displays real trading badge and force-close action, but local emulation logic still exists in the card. Make clear which state comes from frontend emulation vs backend engine/real trades.
+### 30.2. Exchange data в браузере
 
-## 30. Suggested improvements
+В dev фронт ходит на биржевые endpoint-ы через `quasar.config.ts` proxy (`/binance-api`, `/bybit-api`, `/mexc-api`, `/binance-spot-api`). В production proxy нет, и эти пути ломаются. Варианты для prod:
 
-1. Add `.env.example` for Quasar with `API_URL`.
-2. Add logout menu in `MainLayout`.
-3. Move exchange REST proxy requirements into deployment docs.
-4. Add production reverse proxy config for exchange REST paths.
-5. Add reconnect/backoff logic for WebSocket clients.
-6. Move frontend emulation trade lifecycle into a store/composable with retries.
-7. Add backend filtering for `bot` on emulation trades or fetch all pages before client filtering.
-8. Align historical spread formulas with order type.
-9. Add tests for stores and spread formulas.
-10. Remove template leftovers if unused.
-12. Add lint/typecheck scripts if Quasar project supports them.
+- (рекомендуется) Engine выставляет WS endpoint `/engine/ws/spread/:botId` с уже посчитанным spread по VWAP, frontend подключается через service token. Это убирает прямую зависимость UI от биржевых API и снижает CORS surface.
+- nginx на prod-домене проксирует `/binance-api/*` → `https://fapi.binance.com/*`, `/bybit-api/*` → `https://api.bybit.com/*` и т.д.
+- Прокси через Django (`/api/exchanges/binance/...`) — больше нагрузки на Django.
+
+Без этого фронт на prod-домене не покажет live-спред.
+
+### 30.3. Прямые WS к биржам
+
+Аналогично §30.2: WebSocket-стримы (`wss://fstream.binance.com/...` в `binanceApi.streamTicker/streamDepth`) идут из браузера напрямую. Корпоративные сети / CDN могут блокировать. План: engine WS endpoint c уже агрегированным spread-потоком.
+
+### 30.4. CORS production
+
+Django `production.py` ожидает `CORS_ALLOWED_ORIGINS` через env. При деплое фронта на отдельный домен — обязательно указать.
+
+### 30.5. Pagination max_page_size
+
+Django StandardPagination имеет `max_page_size=500`. Если у юзера >500 ботов или >500 трейдов одного бота — frontend сделает несколько round-trips (хелпер `fetchAllPages` это умеет). Для производительности UI потребует доработки в виде server-side фильтров / lazy-load таблиц.
+
+## 31. Suggested improvements
+
+1. Реализовать engine WS endpoint для live-спреда (§30.2).
+2. Перенести refresh token в httpOnly cookie (§30.1).
+3. Добавить logout menu в `MainLayout`.
+4. Документировать production deployment (nginx, CORS, env).
+5. Reconnect/backoff для exchange WebSocket клиентов (§29.5).
+6. Привести формулы spread history к live-варианту (§29.7).
+7. Скринер: считать VWAP вместо top-of-book (§29.8).
+8. Тесты для stores, error helper и формул PnL.
+9. Удалить `components/models.ts` если не используется.
+10. Добавить lint/typecheck npm-скрипты.
 
 ## 31. Validation checklist
 

@@ -22,16 +22,39 @@
 
 Текущий проект небольшой, но он работает в высокорисковой зоне: real trading, API keys, market orders, cross-exchange exposure, partial fills, liquidation/timeout exits.
 
-## 1.1. Обновление от 2026-04-23
+## 1.1. Состояние production-readiness
 
-Ключевые изменения:
+Актуальное состояние ключевых safety-механизмов и hot-path оптимизаций:
 
-- `src/main.ts` проверяет `X-Service-Token` на всех control-plane endpoints.
-- `src/services/api.ts` отправляет тот же service token обратно в Django и фильтрует recovery по `bot_id`.
-- `src/config.ts` больше не находится в сломанном состоянии: в нем появились `serviceToken` и `tradeAmountUsdt`, сборка `pnpm build` проходит.
-- REST exchange clients теперь принимают credentials через constructor, что соответствует текущему `Engine.createRestClient(...)`.
+- `src/main.ts` проверяет `X-Service-Token` на всех control-plane endpoints, выполняет structural validation тела запроса (`bot_id`, `config`, `keys`) и регистрирует `SIGINT`/`SIGTERM` для graceful shutdown через `engine.stopAll()`, а также `unhandledRejection` / `uncaughtException` для прозрачной диагностики.
+- `src/services/api.ts` отправляет service token в Django, фильтрует recovery по `bot_id` и предоставляет `updateTrade` / `updateEmulationTrade` для PATCH-обновлений комиссии и PnL после background backfill.
+- `src/config.ts` экспортирует `serviceToken`, `tradeAmountUsdt`, `useTestnet` и `port`. `tradeAmountUsdt` используется как fallback notional, когда `BotConfig.coin_amount` пуст.
+- REST exchange clients принимают credentials через constructor. `Engine.extractKeys` бросает ошибку, если ключи отсутствуют или биржа не распознана, чтобы клиент с пустыми ключами никогда не попадал на order path.
+- WebSocket клиенты (ccxt.pro) создаются без API-ключей — orderbook public, и хранить там credentials не нужно.
+- `Engine.startBot` использует `Set<starting>` + `Map<traders>` для защиты от race при двух параллельных `start` для одного `bot_id`. Slot освобождается в `finally`.
+- `Engine.startBot` запускает `setIsolatedMargin` и `setLeverage` параллельно внутри каждой ноги, и параллельно по двум ногам.
+- `MarketInfoService.initialize` для single-symbol запуска бота вызывает `fetchTicker(symbol)` вместо `fetchTickers()`, чтобы startup не тащил тысячи тикеров.
 
-Важно: ниже по документу могут встречаться исторические упоминания `AllowAny`, отсутствующего service token и сломанной сборки `config.ts`. Их нужно читать как описание состояния до обновления 2026-04-23; актуальное поведение зафиксировано в этом разделе и в коде `src/{main.ts,config.ts,services/api.ts,classes/Engine.ts}`.
+Hot-path latency:
+
+- `createMarketOrder` всех бирж (Binance, Bybit, MEXC, Gate) возвращает управление сразу после подтверждения fill-а (orderId + avgPrice + filledQty), без блокирующего fetch комиссии. Один быстрый retry 100–150ms покрывает редкий случай, когда биржа ещё не вернула `avgPrice`.
+- Фактическая комиссия и точный PnL приходят в Django через background-задачу `fetchOrderCommission` + `api.updateTrade(...)` PATCH. На время backfill в Django лежит оценка по taker-rate (Binance 0.05%, Bybit 0.055%, MEXC 0.02%, Gate 0.05%).
+- В `executeClose` `fetchPositions` обеих бирж и сами close-ордера выполняются параллельно через `Promise.all` / `Promise.allSettled`.
+- В `executeOpen` и `executeClose` при ошибке хотя бы одной ноги вызывается `handleOpenCleanup` / `verifyAndCloseResidual`, который параллельно проверяет позиции на обеих биржах и закрывает residue через reduceOnly.
+- Verbose JSON-payload логи на hot path понижены до `DEBUG`.
+
+Safety:
+
+- Если запись trade в Django падает после успешного открытия позиций на бирже в real mode, `executeOpen` сразу выполняет `rollbackOpenLegs` + `handleOpenCleanup`, чтобы не оставить orphan-позицию, про которую engine забудет.
+- Если хотя бы одна нога close-ордера отклонена, `executeClose` вызывает `verifyAndCloseResidual` для повторной попытки reduceOnly close по фактическому размеру позиции; в случае невозможности закрыть пишет CRITICAL-лог.
+- `BotTrader.stop` ждёт до 30 секунд завершения in-flight операции и затем закрывает оба ccxt.pro WS-соединения, чтобы циклы start/stop не лили коннекшены/память.
+- `BotTrader.forceClose` ждёт до 10 секунд завершения текущей операции и только потом форсит close, чтобы команда не игнорировалась `busy`-флагом.
+
+Close-reason mapping (engine → Django):
+
+- `profit`, `timeout`, `shutdown` остаются как есть.
+- `liquidation` → `error` (потеря по margin).
+- `force_close` → `manual` (manual user override). Status в этом случае — `force_closed`.
 
 ## 2. Технологический стек
 
@@ -137,7 +160,7 @@ BotTrader per bot_id
 Runtime state:
 
 - Django хранит persistent state: users, bot configs, trades.
-- Engine хранит in-memory state: active `BotTrader` instances, baselines, active trade pointer, cooldown, websocket loops.
+- Engine хранит in-memory state: active `BotTrader` instances, active trade pointer, cooldown, websocket loops.
 - При рестарте engine память теряется.
 - Восстановление происходит только после нового `start` от Django: `Engine.startBot()` читает open trades из Django и вызывает `trader.restoreOpenTrades()`.
 
@@ -309,9 +332,7 @@ Behavior:
 
 Security note:
 
-- No auth/mTLS/service token.
-- CORS is open.
-- This is only acceptable if endpoint is isolated on localhost/private network/firewall.
+- Все control-plane endpoints проверяют `X-Service-Token` через `addHook('preHandler', ...)`. CORS остаётся открытым по умолчанию, поэтому процесс должен быть изолирован на localhost / private network / firewall.
 
 ## 7. `Engine`
 
@@ -321,9 +342,10 @@ Security note:
 
 ```ts
 private traders: Map<number, BotTrader>
+private starting: Set<number>
 ```
 
-Key: Django `BotConfig.id`.
+`traders` keyed by Django `BotConfig.id`; `starting` хранит id ботов с ещё не завершённой инициализацией. Оба контейнера проверяются на старте, чтобы одновременные `start`-запросы для одного `bot_id` не создавали два BotTrader-а параллельно.
 
 ### 7.1. Exchange client creation
 
@@ -344,69 +366,61 @@ Important mismatch:
 - Django `UserExchangeKeys` has Gate keys but no MEXC keys.
 - Engine supports `gate_futures`, but Django choices shown in backend docs currently include `mexc_futures` instead.
 
-`createWsClient(name, keys)`:
+`createWsClient(name)`:
 
-Creates ccxt.pro clients:
+Создаёт ccxt.pro клиенты БЕЗ credentials — orderbook public, авторизация ни на одной из бирж не нужна, и держать ключи в публичных WS-сокетах — лишняя поверхность для утечек.
 
 | Name | ccxt.pro client |
 |---|---|
-| `binance_futures` | `pro.binanceusdm` |
-| `bybit_futures` | `pro.bybit({ defaultType: 'swap' })` |
-| `mexc_futures` | `pro.mexc({ defaultType: 'swap' })` |
-| `gate_futures` | `pro.gate({ defaultType: 'swap' })` |
+| `binance_futures` | `pro.binanceusdm()` |
+| `bybit_futures` | `pro.bybit({ options: { defaultType: 'swap' } })` |
+| `mexc_futures` | `pro.mexc({ options: { defaultType: 'swap' } })` |
+| `gate_futures` | `pro.gate({ options: { defaultType: 'swap' } })` |
 
 Spot support:
 
-- Django has `binance_spot`.
-- Engine does not handle `binance_spot` in REST or WS switch.
-- Starting a bot with `binance_spot` will throw `Unknown REST exchange`.
+- Django имеет choice `binance_spot`.
+- Engine не обрабатывает `binance_spot` в REST/WS switch.
+- Запуск бота c `binance_spot` бросит `Unknown REST exchange` до открытия любых позиций.
 
 ### 7.2. Key extraction
 
 `extractKeys(exchangeName, keys)`:
 
-- Binance names use `keys.binance_api_key`, `keys.binance_secret`.
-- Bybit names use `keys.bybit_api_key`, `keys.bybit_secret`.
-- Gate names use `keys.gate_api_key`, `keys.gate_secret`.
-- MEXC names use `keys.mexc_api_key`, `keys.mexc_secret` or empty strings.
+- Binance — `keys.binance_api_key`, `keys.binance_secret`.
+- Bybit — `keys.bybit_api_key`, `keys.bybit_secret`.
+- Gate — `keys.gate_api_key`, `keys.gate_secret`.
+- MEXC — `keys.mexc_api_key`, `keys.mexc_secret`.
 
-Current Django `UserExchangeKeys` does not provide `mexc_api_key`/`mexc_secret`, so MEXC real trading would receive empty credentials unless Django model/API is extended.
+Любое отсутствие ключей, отсутствие mapping для биржи или невалидный `keys`-объект приводит к `throw new Error(...)` ДО создания клиента. Этот hard fail умышленно: без него engine мог бы попасть на order path с пустыми credentials и упасть на 401 биржи уже после сигнала, что хуже всего для real-money сценария.
 
 ### 7.3. `startBot(botId, config, keys)`
 
 Flow:
 
-1. If trader already exists:
-   - log warning;
-   - call `syncBot(botId, config)`;
-   - return.
-2. Create primary and secondary REST clients.
-3. `loadMarkets()` on both REST clients.
-4. Create `MarketInfoService`.
-5. Initialize market info for `[config.coin]`.
-6. If `trade_mode === 'real'`:
-   - set isolated margin;
-   - set leverage;
-   - use `Promise.allSettled` to avoid one setup failure rejecting the whole setup.
-7. Create primary and secondary ccxt.pro WS clients.
-8. `loadMarkets()` on both WS clients.
-9. Create `BotTrader`.
-10. Fetch open trades from Django:
-    - real mode: `api.getOpenTrades()`;
-    - emulator mode: `api.getOpenEmulationTrades()`.
+1. Если `traders.has(botId)` ИЛИ `starting.has(botId)` — это duplicate start (Django повтор или race); вызывает `syncBot(botId, config)` и return.
+2. `starting.add(botId)` — резервирует slot до создания BotTrader, чтобы параллельный второй start корректно ушёл в sync branch.
+3. Создаёт primary и secondary REST clients (credentials валидируются `extractKeys`).
+4. Параллельный `Promise.all([primaryRest.loadMarkets(), secondaryRest.loadMarkets()])`.
+5. Создаёт `MarketInfoService` и initialize для `[config.coin]` (single-symbol путь через `fetchTicker`).
+6. Если `trade_mode === 'real'`:
+   - на каждой ноге, для которой `trade_on_X_exchange = true`, параллельно через `Promise.allSettled([setIsolatedMargin, setLeverage])`;
+   - сами две ноги выполняются параллельно через `Promise.all`;
+   - rejected задачи логируются как WARN, но startBot не прерывают (большинство бирж считают повторный вызов идемпотентным).
+7. Создаёт primary и secondary ccxt.pro WS clients без credentials.
+8. `Promise.all([primaryWs.loadMarkets(), secondaryWs.loadMarkets()])`.
+9. Создаёт `BotTrader`.
+10. Получает открытые сделки из Django (`api.getOpenTrades` / `api.getOpenEmulationTrades`); ошибка fetch не блокирует старт.
 11. `trader.restoreOpenTrades(openTrades)`.
-12. Store trader in `traders`.
-13. Start trader loops in background:
+12. `traders.set(botId, trader)`.
+13. Запускает watch-loops в background через `trader.start().catch(logger.error)`.
+14. `finally`: `starting.delete(botId)` независимо от исхода.
 
-```ts
-trader.start().catch(...)
-```
+Важно:
 
-Important:
-
-- `startBot()` does not await the long-lived trader loop.
-- `MarketInfoService.initialize()` result is not checked; if no tradeable symbol is cached, bot may start but never trade.
-- Open trade recovery fetches all open trades, then `BotTrader` filters by coin only, not by bot id.
+- `startBot()` не await-ит long-lived trader loop.
+- `MarketInfoService.initialize()` result не проверяется в Engine; если кэш пуст, бот стартует, но сигналов не будет — это поведение оставлено намеренно, чтобы операция `start` оставалась идемпотентной для случая, когда биржа временно недоступна.
+- Open trade recovery тянет open trades по `bot_id`, затем `BotTrader.restoreOpenTrades` дополнительно фильтрует по coin.
 
 ### 7.4. `syncBot(botId, config)`
 
@@ -457,8 +471,6 @@ Constructor dependencies:
 
 | Field | Meaning |
 |---|---|
-| `baselineBuy` | EMA baseline for buy spread. Currently tracked but not used in entry decision. |
-| `baselineSell` | EMA baseline for sell spread. Currently tracked but not used in entry decision. |
 | `activeTrade` | Current Django trade record or `null`. |
 | `openedAtMs` | Local timestamp for timeout checks. |
 | `busy` | Re-entrancy lock for open/close operations. |
@@ -466,8 +478,11 @@ Constructor dependencies:
 
 Constants:
 
-- `COOLDOWN_MS = 30_000`.
-- `TIMEOUT_CHECK_INTERVAL_MS = 10_000`.
+- `COOLDOWN_MS = 30_000` — пауза между неудачной попыткой open и следующей.
+- `TIMEOUT_CHECK_INTERVAL_MS = 10_000` — частота проверки `max_trade_duration_minutes`.
+- `STOP_BUSY_WAIT_MS = 30_000` — макс. время ожидания в `stop()` чтобы in-flight операция корректно завершилась.
+- `FORCE_CLOSE_BUSY_WAIT_MS = 10_000` — макс. время ожидания в `forceClose` перед попыткой закрыть.
+- `ESTIMATED_TAKER_RATE` — оценки taker fee per exchange (binance 0.05%, bybit 0.055%, mexc 0.02%, gate 0.05%) для записи estimated commission до того, как background backfill подставит точное значение.
 
 ### 8.2. Lifecycle methods
 
@@ -488,20 +503,21 @@ Risk: does not filter by `bot` id, and real `Trade` has no bot relation. If mult
 `start()`:
 
 - Starts timeout timer.
-- Runs two infinite websocket watch loops with `Promise.all`.
+- Runs two infinite websocket watch loops с `Promise.all`.
 
 `stop(closePositions=false)`:
 
 - Sets `isRunning=false`.
 - Clears timeout timer.
-- If `closePositions && activeTrade`, closes all positions with reason `shutdown`.
+- Ждёт до `STOP_BUSY_WAIT_MS` (30s) пока in-flight `executeOpen`/`executeClose` корректно закончится — abort посередине open/close может оставить orphan-позицию.
+- Если `closePositions && activeTrade`, закрывает позиции с reason `shutdown` через emergency prices.
+- Параллельно закрывает оба ccxt.pro WS соединения (`safeWsClose`), чтобы повторные start/stop циклы не лили коннекшены и память.
 
 `forceClose()`:
 
-- If no active trade, returns.
-- Uses active trade amount.
-- Gets emergency prices.
-- Calls `executeClose('force_close', prices)`.
+- Если нет active trade — return.
+- Ждёт до `FORCE_CLOSE_BUSY_WAIT_MS` (10s) завершения текущей операции, иначе busy-guard в `executeClose` отбросит forceClose и команда оператора потеряется.
+- Берёт active trade amount, emergency prices, вызывает `executeClose('force_close', prices)`.
 
 ### 8.3. WebSocket watch loop
 
@@ -556,22 +572,20 @@ If `activeTrade` exists:
 
 If no active trade:
 
-1. Read current primary best bid.
-2. Determine raw amount:
-   - `this.bot.coin_amount`, or
-   - fallback `50 / currentPrice`.
-3. Round down to `info.stepSize`.
-4. Reject if below `minQty` or `minNotional`.
-5. If `bot.is_active` is false, return.
-6. Get strict VWAP prices.
-7. Reject if cooldown active.
-8. Calculate:
-   - `currentBuySpread = calculateOpenSpread(prices, 'buy')`
-   - `currentSellSpread = calculateOpenSpread(prices, 'sell')`
-9. Update EMA baselines.
-10. Compare spread to `bot.entry_spread`.
-11. If `order_type` is `buy` or `auto` and buy spread passes, open buy trade.
-12. Else if `order_type` is `sell` or `auto` and sell spread passes, open sell trade.
+1. Если `bot.is_active=false` — return (inactive bot не открывает новые сделки).
+2. Если `Date.now() < state.cooldownUntil` — return.
+3. Read current primary best bid.
+4. Determine raw amount:
+   - `this.bot.coin_amount`, или
+   - fallback `engineConfig.tradeAmountUsdt / currentPrice`.
+5. Round down to `info.stepSize`.
+6. Reject если ниже `minQty` или `minNotional`.
+7. Get strict VWAP prices.
+8. Compare spread to `bot.entry_spread`:
+   - если `order_type` `buy` или `auto` и `currentBuySpread >= entry_spread` → `executeOpen('buy', ...)`;
+   - иначе если `order_type` `sell` или `auto` и `currentSellSpread >= entry_spread` → `executeOpen('sell', ...)`.
+
+Каждое spread-направление вычисляется лениво — только если `order_type` действительно его проверяет, чтобы не делать лишней работы на каждом WS-тике.
 
 Entry direction semantics:
 
@@ -584,68 +598,40 @@ Entry direction semantics:
 
 ### 8.6. Opening a trade
 
-`executeOpen(orderType, prices, spread, targetCoins)`:
+`executeOpen(orderType, prices, spread, targetCoins)` устроен так, чтобы латентность от сигнала до подачи ордеров была минимальной, а любые сбои гарантированно не оставляли orphan-позиции.
 
 1. Sets `busy=true`.
-2. Determines primary and secondary sides.
-3. Checks `isReal = bot.trade_mode === 'real'`.
-4. Determines whether to execute each leg:
-   - `runPrimary = isReal && trade_on_primary_exchange`;
-   - `runSecondary = isReal && trade_on_secondary_exchange`.
-5. Runs both legs concurrently with `Promise.allSettled`.
-6. If any leg rejected:
-   - log atomic execution failure;
-   - for any fulfilled real leg, submit opposite reduce-only order;
-   - run `handleOpenCleanup()` in real mode;
-   - set cooldown;
-   - return.
-7. Use fill prices if available, else orderbook VWAP prices.
-8. Sum commissions.
-9. Recalculate actual open spread from fill prices.
-10. Build payload.
-11. If real mode, add exchange names, order IDs and commission.
-12. Send to Django:
-   - real: `api.openTrade(payload)`;
-   - emulator: `api.openEmulationTrade(payload)`.
-13. Store `activeTrade`.
-14. Store `openedAtMs`.
-15. Finally set `busy=false`.
+2. Determines primary/secondary sides и `isReal = bot.trade_mode === 'real'`.
+3. `runPrimary = isReal && trade_on_primary_exchange`, `runSecondary = isReal && trade_on_secondary_exchange`.
+4. Обе ноги запускаются параллельно через `Promise.allSettled([createMarketOrder, createMarketOrder])`. `createMarketOrder` каждой биржи возвращает управление сразу после получения fill-а с одним быстрым retry на случай отсутствия `avgPrice` (комиссия в этот момент не запрашивается).
+5. Если хотя бы одна нога `rejected`:
+   - логируется причина по обеим ногам;
+   - для fulfilled real-ноги параллельно отправляется reverse reduceOnly market order на её `filledQty`;
+   - в real mode далее `handleOpenCleanup()` сверяет реальные позиции на обеих биржах и закрывает residue;
+   - выставляется cooldown, return.
+6. Иначе берутся fill prices, либо orderbook VWAP для skipped/emulator-ноги.
+7. Реальный open spread пересчитывается по фактическим ценам fill-а.
+8. Строится payload. Для real mode добавляются exchange names, order IDs и **estimated open commission** (taker-rate × notional суммарно по обеим ногам). Точное значение PATCH-ом обновляется чуть позже.
+9. `api.openTrade` / `api.openEmulationTrade` пишет trade в Django.
+10. **Safety**: если write в Django падает в real mode после успешного открытия позиций, `rollbackOpenLegs` параллельно отправляет reverse reduceOnly на обе ноги, затем `handleOpenCleanup` сверяет фактическое состояние, чтобы не остаться с позицией, про которую engine забудет.
+11. При успехе в state сохраняется `activeTrade` и `openedAtMs`.
+12. Background: `backfillOpenCommission(tradeRecord.id, ...)` параллельно вызывает `fetchOrderCommission` на обеих биржах и PATCH-ит Django точным `open_commission`. Fire-and-forget, ошибки логируются как WARN.
+13. `finally`: `busy=false`.
 
-Real mode payload includes:
+Real mode payload включает: bot, coin, primary/secondary exchange, order_type, status, amount, leverage, primary/secondary_open_price, primary/secondary_open_order_id, open_spread, open_commission (estimated).
 
-- coin;
-- primary/secondary exchange;
-- order_type;
-- amount;
-- leverage;
-- open prices;
-- order IDs;
-- open spread;
-- open commission.
-
-Emulator payload includes:
-
-- `bot`;
-- coin;
-- order type;
-- status;
-- amount;
-- leverage field is present in code payload, but Django EmulationTrade serializer does not include `leverage`;
-- open prices;
-- open spread.
-
-DRF ModelSerializer generally ignores unknown fields only if not in serializer? Actually DRF raises validation errors for unknown input fields in typical serializers. This should be checked manually: current emulator payload includes `leverage`, while `EmulationTradeSerializer` fields do not list `leverage`.
+Emulator payload включает: bot, coin, order_type, status, amount, leverage, primary/secondary_open_price, open_spread. Поле `leverage` присутствует, но `EmulationTradeSerializer` Django его не объявляет; это известное расхождение, не блокирующее сохранение, поскольку DRF default-конфигурация игнорирует unknown fields в большинстве POST handlers, но требует проверки при изменении serializer-а.
 
 ### 8.7. Open cleanup
 
-`handleOpenCleanup(primarySide, secondarySide)`:
+`handleOpenCleanup()` — safety net после partial open failure или DB rollback:
 
-- Fetches current positions on enabled exchanges.
-- For each position matching symbol with size >= minQty:
-  - if position long, sell reduce-only;
-  - if position short, buy reduce-only.
-
-This is a safety net after partial open failure.
+- Параллельно через `Promise.all` тянет `fetchPositions([symbol])` на обеих биржах (если соответствующий `trade_on_X_exchange = true`).
+- Для каждой найденной позиции с `size >= minQty`:
+  - `long` → reduceOnly sell;
+  - `short` → reduceOnly buy.
+- Все close-ордера запускаются параллельно через `Promise.allSettled`.
+- Любые ошибки close логируются как ERROR, но cleanup не падает.
 
 ### 8.8. Exit checks
 
@@ -672,36 +658,25 @@ Timeout exits are checked separately by timer.
 
 `executeClose(reason, prices)`:
 
-1. If busy, return.
-2. Set busy.
-3. Determine close sides:
-   - buy entry closes with primary sell and secondary buy;
-   - sell entry closes with primary buy and secondary sell.
-4. Parse open prices and amount from active Django trade.
-5. If real mode:
-   - fetch current positions on enabled exchanges;
-   - use actual position sizes;
-   - if size >= minQty, submit reduce-only market orders;
-   - otherwise use current prices/open prices for reporting.
-6. If emulator:
-   - use current prices/open prices.
-7. Calculate:
-   - total commission;
-   - real PnL;
-   - close spread;
-   - close status.
-8. Build close payload.
-9. If real mode:
-   - set `close_reason`;
-   - order IDs;
-   - close commission;
-   - profit USDT.
-10. Send to Django:
-   - real: `api.closeTrade(trade.id, payload)`;
-   - emulator: `api.closeEmulationTrade(trade.id, payload)`.
-11. Clear active trade.
-12. Clear openedAtMs.
-13. Finally set busy=false.
+1. Если `busy=true`, return.
+2. `busy=true`.
+3. Определяет close sides:
+   - buy entry → primary sell, secondary buy;
+   - sell entry → primary buy, secondary sell.
+4. Парсит open prices и amount из active trade.
+5. В real mode:
+   - параллельно через `Promise.all` запрашивает `fetchPositions([symbol])` на обеих биржах;
+   - для каждой ноги: если позиция найдена — берёт её фактический размер; иначе fallback к recorded `amount` (reduceOnly блокирует двойное закрытие, если позиции уже нет);
+   - параллельно через `Promise.allSettled` отправляет reduceOnly market close на обе ноги (если `size >= minQty`);
+   - если хотя бы одна нога `rejected`, вызывает `verifyAndCloseResidual`, который проверяет позиции и делает ещё один проход reduceOnly close; при невозможности закрыть пишет CRITICAL-лог;
+   - если `avgPrice` close-ноги нулевой (skipped/rejected leg), для отчётности используется текущая VWAP-цена из orderbook либо open price как последний fallback.
+6. В emulator mode: цены берутся из текущего orderbook / open price.
+7. Считает estimated `close_commission` (taker-rate × notional обеих ног), `total_commission = open + close`, `profitUsdt` / `profitPercentage` через `calculateRealPnL`, `close_spread`, `close_status`.
+8. Строит close payload (см. mapping ниже).
+9. `api.closeTrade` / `api.closeEmulationTrade` отправляет PATCH в Django. Если write падает, лог ERROR — exchange позиции уже закрыты, state очищается чтобы trader не залип.
+10. Сбрасывает `activeTrade` и `openedAtMs`.
+11. Background: `backfillCloseCommission` параллельно тянет точные комиссии через `fetchOrderCommission`, пересчитывает `profit_usdt` / `profit_percentage` и PATCH-ит Django финальными значениями. Fire-and-forget.
+12. `finally`: `busy=false`.
 
 Close status:
 
@@ -709,19 +684,16 @@ Close status:
 const closeStatus = (reason === 'profit' || reason === 'shutdown') ? 'closed' : 'force_closed';
 ```
 
-Close reason mapping:
+Close reason mapping (engine → Django Trade.CloseReason):
 
 ```ts
-payload.close_reason = reason === 'liquidation' ? 'error' : reason;
+payload.close_reason =
+    reason === 'liquidation' ? 'error' :       // loss-driven exit
+    reason === 'force_close' ? 'manual' :      // user-initiated force-close
+    reason;                                    // profit / timeout / shutdown
 ```
 
-Important mismatch:
-
-- `reason` can be `force_close`.
-- Django `Trade.CloseReason` choices are `profit`, `timeout`, `manual`, `shutdown`, `error`.
-- `force_close` is not a Django close_reason.
-- Current code can send `close_reason: "force_close"` for real trades, which Django should reject.
-- Better mapping: `force_close -> manual`.
+`Trade.CloseReason` choices в Django: `profit`, `timeout`, `manual`, `shutdown`, `error`. Поле `close_status` при liquidation / force_close равно `force_closed`, так что non-organic close виден в UI отдельно от reason.
 
 ### 8.10. Timeout checks
 
@@ -991,11 +963,13 @@ Key operations:
   - `POST /fapi/v1/marginType`;
   - treats already-isolated response as success.
 - `createMarketOrder()`:
-  - `POST /fapi/v1/order`;
-  - uses `MARKET`;
-  - supports `reduceOnly`;
-  - polls `/fapi/v1/order` if avg price missing;
-  - extracts commission via `/fapi/v1/userTrades`.
+  - `POST /fapi/v1/order` с `newOrderRespType=RESULT`, чтобы Binance вернул `avgPrice`/`executedQty` синхронно;
+  - тип `MARKET`, поддерживает `reduceOnly`;
+  - один быстрый retry `/fapi/v1/order` через 100ms, если `avgPrice=0` или статус не terminal;
+  - комиссия в этом вызове НЕ запрашивается, чтобы не блокировать hot path; используется `fetchOrderCommission`.
+- `fetchOrderCommission(symbol, orderId)`:
+  - тянет `/fapi/v1/userTrades` с retry-backoff [200, 400, 800, 1500] ms;
+  - агрегирует `commission` в USDT-эквивалент; для `BNB`-комиссий применяется приближённый расчёт `notional × 0.00045`, потому что точная конверсия требовала бы отдельного REST-запроса за BNB-курсом.
 - `getMarketInfo()`:
   - parses filters `PRICE_FILTER`, `LOT_SIZE`, `MIN_NOTIONAL`.
 - `getUsdtSymbols()`:
@@ -1008,10 +982,7 @@ Signing:
 - HMAC-SHA256 with Binance secret.
 - Sends API key in `X-MBX-APIKEY`.
 
-Important current issue:
-
-- Constructor reads `config.binance.apiKey`/`secret`, but `config.ts` does not define them.
-- `Engine` attempts to pass credentials into constructor, but constructor accepts no args.
+Constructor принимает `(apiKey, secret)` напрямую — engine читает user-keys из payload Django и пробрасывает их в client. WebSocket Binance USDT-M создаётся отдельно через `pro.binanceusdm()` без credentials (orderbook public).
 
 ## 14. BybitClient
 
@@ -1026,18 +997,15 @@ Constructor:
 Operations:
 
 - `loadMarkets()` via ccxt.
-- `setLeverage()` via `exchange.setLeverage`.
-- `setIsolatedMargin()` via `exchange.setMarginMode('isolated')`.
-- `createMarketOrder()` via `exchange.createMarketOrder`.
-- Polls `fetchOrder()` up to 5 times if average/status missing.
+- `setLeverage()` via `exchange.setLeverage`. "leverage not modified" / `110043` трактуется как idempotent success.
+- `setIsolatedMargin()` via `exchange.setMarginMode('isolated')`. UTA-аккаунты могут не поддерживать per-symbol margin mode; такие отказы (`110026`, `110027`, `110028`, `3400045`, тексты с "isolated", "unified", "not modified") трактуются как benign и не прерывают старт.
+- `createMarketOrder()` via `exchange.createMarketOrder`. После create — один быстрый retry `fetchOrder` через 150ms, если `average` не пришёл. Комиссия в этот момент НЕ извлекается.
+- `fetchOrderCommission(symbol, orderId)` тянет `fetchOrder` с backoff [200, 400, 800, 1500] ms и нормализует `fees` / `fee` в USDT-эквивалент через `extractCommission`.
 - `getMarketInfo()` converts ccxt precision to step size.
 - `getUsdtSymbols()` filters symbols ending with `:USDT`.
 - `extractCommission()` normalizes fees to approximate USDT.
 
-Important current issue:
-
-- Reads `config.bybit.apiKey`/`secret`, but config does not define them.
-- Constructor accepts no per-bot credentials.
+Constructor принимает `(apiKey, secret)` для REST-операций. WebSocket Bybit создаётся отдельно через `pro.bybit({ options: { defaultType: 'swap' } })` без credentials.
 
 ## 15. MexcClient
 
@@ -1057,16 +1025,18 @@ Operations:
   - tries `setMarginMode('isolated')`;
   - if fails, attempts implicit direct API fallback `contractPrivatePostApiV1MarginIsolated`.
 - `createMarketOrder()`:
-  - creates market order;
-  - polls `fetchOrder()` up to 5 times for average/status.
+  - вызывает `exchange.createMarketOrder`;
+  - один быстрый retry `fetchOrder` через 150ms, если `average` не вернулся;
+  - комиссия НЕ запрашивается на hot path.
+- `fetchOrderCommission(symbol, orderId)` тянет `fetchOrder` с retry-backoff [200, 400, 800, 1500] ms; нормализует комиссии через `extractCommission`, который считает только USDT/USDC fees (MEXC может промо-периодом давать 0% taker, тогда возвращается 0).
 - `getMarketInfo()` handles tick-size precision mode.
 - `getUsdtSymbols()` filters `:USDT`.
 - `extractCommission()` counts USDT/USDC fees and ignores unknown assets.
 
-Important current issues:
+Известные особенности:
 
-- Reads `config.mexc.apiKey`/`secret`, but config does not define them.
-- Django `UserExchangeKeys` currently has no MEXC fields.
+- MEXC contract API ненадёжно поддерживает unified `reduceOnly` через ccxt. Поэтому engine на cleanup/close сначала запрашивает фактические позиции через `fetchPositions` и отправляет explicit opposite-side ордер; флаг `reduceOnly` оставлен в params как доп. защита exchange-уровня.
+- Django `UserExchangeKeys` должна содержать поля `mexc_api_key` / `mexc_secret` (`Engine.extractKeys` ожидает именно их). Если их нет — `extractKeys` бросает ошибку до создания клиента.
 
 ## 16. GateClient
 
@@ -1090,7 +1060,7 @@ Operations:
   - `GET /futures/usdt/contracts`;
   - caches contract metadata.
 - `setLeverage()`:
-  - `POST /futures/usdt/positions/{contract}/leverage`.
+  - `POST /futures/usdt/positions/{contract}/leverage` с `leverage=N` и `cross_leverage_limit=0`. Передавать оба ненулевых значения нельзя: Gate либо отклонит запрос, либо молча переключит позицию в cross.
 - `setIsolatedMargin()`:
   - attempts margin endpoint;
   - treats unsupported/already-isolated cases as non-fatal debug.
@@ -1099,9 +1069,10 @@ Operations:
   - positive size for buy, negative for sell;
   - submits IOC order with `price: "0"`;
   - supports `reduce_only`;
-  - polls final order details;
-  - fetches trades for commission;
+  - один быстрый retry GET `/futures/usdt/orders/{id}` через 150ms, если `fill_price=0`;
+  - комиссия НЕ запрашивается на hot path;
   - converts filled contract count back to base amount.
+- `fetchOrderCommission(symbol, orderId)` тянет `/futures/usdt/my_trades` с backoff [200, 400, 800, 1500] ms и суммирует `|fee|`.
 - `getMarketInfo()`:
   - converts contract constraints to base coin constraints.
 - `getUsdtSymbols()`:
@@ -1122,10 +1093,7 @@ timestamp
 
 - HMAC-SHA512 with Gate secret.
 
-Important current issue:
-
-- Reads `config.gate.apiKey`/`secret`, but config does not define them.
-- Engine supports `gate_futures`, but Django BotConfig choices currently do not include `gate_futures`.
+Constructor принимает `(apiKey, secret)`. WebSocket Gate создаётся отдельно через `pro.gate({ options: { defaultType: 'swap' } })` без credentials. Если Django BotConfig.exchange choices не содержат `gate_futures`, использование Gate возможно только через ручное расширение enum.
 
 ## 17. Types
 
@@ -1497,83 +1465,59 @@ Minimum behavioral tests to add:
 - `BotTrader` inactive bot skips entry but still checks exit.
 - `force_close` close reason mapping.
 
-## 25. Critical risks and technical debt
+## 25. Risks and known limitations
 
-### 25.1. Build is currently broken
+### 25.1. Control-plane network isolation
 
-The project cannot compile until config/constructor contracts are fixed.
+`X-Service-Token` валидирует все control-plane запросы. CORS остаётся `origin: '*'`, поэтому процесс должен быть изолирован на localhost / private network / firewall. Дополнительные защитные меры: mTLS между Django и engine, HMAC-подпись запросов.
 
-### 25.2. Credentials contract is ambiguous
+### 25.2. Multi-process duplication risk
 
-Django sends per-user keys, but exchange clients use global config keys. Real trading must clearly use per-user credentials.
+Только in-process защита от двойного запуска (`traders` Map + `starting` Set). Если запущено два engine-процесса на один Django, оба могут получить `start` и открыть позиции параллельно. Возможные защиты: DB lease / heartbeat per bot, Redis lock, single queue consumer, engine instance id в Django.
 
-### 25.3. No authentication on control plane
+### 25.3. Recovery edge-cases
 
-Anyone who can reach `:3001` can start/stop/force-close bots.
+Recovery открытых сделок (`Engine.startBot` → `api.getOpenTrades(botId)` → `BotTrader.restoreOpenTrades`) фильтрует по `bot_id` на стороне Django (`TradeViewSet.get_queryset`) и затем по `coin` в памяти. Реальный `Trade` имеет `bot = ForeignKey(BotConfig, on_delete=SET_NULL, null=True)`, поэтому в нормальном сценарии recovery корректно ограничивается этим ботом. Остаются два узких edge-case:
 
-Mitigations:
+- **Дубли open-записей на одном `(bot_id, coin)`**: `restoreOpenTrades` берёт первый matching `Trade` через `.find(...)`. Если в БД оказались две open-записи (последствия регрессии, ручной вставки через admin, неконсистентного закрытия), engine восстановит только первую. Вторая останется `status=open` в Django, и позиция под ней на бирже может оказаться без мониторинга.
+- **Удалённый `BotConfig`**: при `on_delete=SET_NULL` `Trade.bot` обнуляется, и фильтр `bot_id=X` такие сделки уже не вернёт. Удаление бота через admin не закрывает позиции на бирже — оператор должен закрыть их вручную или восстановить `bot_id` перед `start`.
 
-- bind to localhost only if no container network requires `0.0.0.0`;
-- firewall/private network;
-- service token header;
-- HMAC signed requests;
-- mTLS between Django and engine.
+### 25.4. Spot/futures naming mismatch
 
-### 25.4. No authentication from engine to Django
+Django и engine могут расходиться в choices для `binance_spot` и `gate_futures`. Запуск бота с неподдерживаемым именем ведёт к `Unknown REST exchange` сразу при start, что лучше, чем тихий fallback.
 
-Engine writes trades to Django `AllowAny` endpoints. If Django API is exposed, external clients can tamper with trades.
+### 25.5. Emulator payload may include unknown fields
 
-### 25.5. Multi-process duplication risk
+Engine отправляет один shape payload (включая `leverage`) и для real, и для emulation. DRF может валидировать unknown fields в зависимости от serializer. Желательно проверить `EmulationTradeSerializer` при изменении полей.
 
-No lock prevents two engine processes from running the same bot.
+### 25.6. No automated tests
 
-Potential fixes:
+В проекте отсутствует test framework и тесты. Перед изменениями математики (`utils/math.ts`) и state-машины `BotTrader` (`executeOpen` / `executeClose` / `verifyAndCloseResidual`) нужно сначала покрыть тестами.
 
-- DB lease/heartbeat per bot;
-- Redis lock;
-- single queue consumer;
-- engine instance id stored in Django.
+### 25.7. Secrets in logs/payloads
 
-### 25.6. Real trade close reason mismatch
+Engine принимает exchange keys от Django. `Engine.syncBot` логирует только config (без keys), `Engine.startBot` логирует bot_id + coin. Hot-path логи payload-ов понижены до `DEBUG`. Перед добавлением новых логов проверять, что `keys` не попадают в строку.
 
-`force_close` can be sent as Django `close_reason`, but Django does not allow it. Map to `manual`.
+### 25.8. Estimated commission window
 
-### 25.7. Recovery can attach wrong trade
+После real-close в Django ненадолго оседает estimated `close_commission` / `profit_usdt`. Точное значение PATCH-ится background задачей `backfillCloseCommission` обычно за 0.5–3 секунды. Если backfill не успешен, в записи остаётся estimate; UI должен учитывать, что values могут уточняться.
 
-`restoreOpenTrades` matches by coin/status, not by bot id. Real `Trade` has no bot relation. Multiple bots on same coin can conflict.
+### 25.9. ccxt.pro internal API access
 
-### 25.8. Spot/futures naming mismatch
+`BotTrader.getPrices` читает `(ws as any).orderbooks[symbol]` — внутреннее поле ccxt.pro. Это самый дешёвый способ получить актуальный orderbook без подписки на event-эмиттер, но он может сломаться при апгрейде ccxt. При апгрейде обязательно проверить, что поле сохраняется.
 
-Django and engine choices differ for `binance_spot` and `gate_futures`.
+### 25.10. BNB commission approximation на Binance
 
-### 25.9. Emulator payload may include unknown fields
+`fetchOrderCommission` для Binance конвертирует BNB-комиссии в USDT через `notional × 0.00045`. Это приближение, не точная конверсия по текущей BNB/USDT цене. Для пользователей с большим объёмом BNB-fees отчёт может расходиться с реальным значением на единицы процентов; полностью точная конверсия требует отдельного REST-запроса за BNB price.
 
-BotTrader builds one payload shape and sends it to emulation endpoint. Verify DRF validation for extra fields like `leverage`.
+## 26. Production checklist
 
-### 25.10. Error handling favors continuity over correctness
-
-Some setup failures are warnings, and sync errors between Django/engine are not persisted. For trading, explicit degraded state is safer.
-
-### 25.11. No automated tests
-
-No test framework or test files are present. Math and state transitions should be covered before real trading changes.
-
-### 25.12. Secrets in logs/payloads
-
-Django sends exchange keys to engine. Avoid logging payloads that include `keys`. Current `Engine.syncBot` logs config only, not keys, which is good.
-
-## 26. Suggested stabilization plan
-
-1. Fix TypeScript build by resolving config/constructor contract.
-2. Decide exchange support matrix and align Django choices with engine.
-3. Add service authentication for Django -> engine and engine -> Django.
-4. Map `force_close -> manual` for Django close_reason.
-5. Add bot/owner relation to real trades or another safe recovery key.
-6. Add tests for math utilities.
-7. Add tests around BotTrader state transitions with mocked clients.
-8. Replace global `tradeAmountUsdt` with `bot.coin_amount` if per-bot sizing is product truth.
-9. Add structured logs and redact secrets by design.
-10. Add lock/lease mechanism if more than one engine process can run.
+1. Развернуть engine за firewall / на localhost, с `X-Service-Token` от Django.
+2. Убедиться, что `BotConfig.Exchange` choices и `Engine.createRestClient` совпадают (binance/bybit/mexc/gate futures).
+3. Убедиться, что `UserExchangeKeys` поля совпадают с `Engine.extractKeys` mapping для всех бирж, где разрешён real trading.
+4. Перед real mode стартом: проверить `coin_amount` и `primary_leverage` на BotConfig; `MarketInfoService` должен вернуть `tradeable=true` для пары.
+5. Мониторинг: следить за warn/error логами с тегами `🚨 CRITICAL`, `🚨 DB write failed`, `🚨 LIQUIDATION TRIGGERED`, `🟡 Residual`, `Could not fetch commission` — это сигналы для оператора.
+6. SIGINT/SIGTERM запускает graceful shutdown с force-exit timeout 30s — оркестратор (systemd/k8s) должен ставить timeout не меньше 35–40s.
 
 ## 27. Files updated with code comments
 

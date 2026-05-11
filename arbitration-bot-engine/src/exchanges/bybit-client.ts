@@ -62,11 +62,16 @@ export class BybitClient implements IExchangeClient {
             await this.exchange.setMarginMode('isolated', symbol);
             logger.debug(TAG, `Isolated margin set for ${symbol}`);
         } catch (e: any) {
-            // Bybit may throw if margin mode is already isolated
-            if (e.message?.includes('isolated') || e.message?.includes('110026')) {
-                logger.debug(TAG, `Margin already isolated for ${symbol}`);
+            // Bybit Unified Trading Accounts (UTA) do not support per-symbol
+            // margin mode; the API returns codes 110026/110027/110028/3400045
+            // or text including "isolated", "not modified", or "unified account".
+            // For those cases the call is a no-op and must not abort engine start.
+            const msg = e?.message || '';
+            const benign = /isolated|110026|110027|110028|3400045|unified|not modified/i.test(msg);
+            if (benign) {
+                logger.debug(TAG, `Margin mode call skipped for ${symbol}: ${msg}`);
             } else {
-                throw new Error(`Failed to set isolated margin on Bybit: ${e.message}`);
+                throw new Error(`Failed to set isolated margin on Bybit: ${msg}`);
             }
         }
     }
@@ -77,43 +82,59 @@ export class BybitClient implements IExchangeClient {
         amount: number,
         params: any = {},
     ): Promise<OrderResult> {
-        logger.info(TAG, `Creating ${side} order for ${symbol}, amount: ${amount}`);
+        logger.debug(TAG, `Creating ${side} order for ${symbol}, amount: ${amount}`);
 
         const order = await this.exchange.createMarketOrder(symbol, side, amount, undefined, params);
         let filled = order;
 
-        // DB Lag fallback: Bybit API sometimes requires over 500ms to calculate fills
-        let retries = 0;
-        while ((!filled.average || filled.status !== 'closed') && retries < 5) {
-            await new Promise(r => setTimeout(r, 1000)); // 1000ms * 5 = up to 5s buffer
-            retries++;
+        // Fast single retry: Bybit usually returns the filled order immediately
+        // but the average price field can be unset for the first tick after
+        // execution. A short 150ms retry avoids blocking the hot path for
+        // multiple seconds the way the previous 5×1000ms loop did.
+        if ((!filled.average || filled.status !== 'closed') && order.id) {
+            await new Promise(r => setTimeout(r, 150));
             try {
                 const checked = await this.exchange.fetchOrder(order.id, symbol);
                 if (checked) filled = checked;
-                
-                // If the exchange finally returned a valid price, we can stop waiting
-                if (filled.average && filled.status === 'closed') {
-                    break;
-                }
             } catch (e) {
-                // If fetch drops, ignore and keep trying until timeout
+                // Ignore fetch errors during the quick retry.
             }
         }
-
-        const commission = this.extractCommission(filled);
 
         const result: OrderResult = {
             orderId: String(filled.id),
             avgPrice: filled.average ?? filled.price ?? 0,
             filledQty: filled.filled ?? amount,
-            commission,
+            // Commission is backfilled asynchronously via fetchOrderCommission
+            // to keep the latency-critical execution path short.
+            commission: 0,
             commissionAsset: 'USDT',
             status: filled.status ?? 'unknown',
             raw: filled,
         };
 
-        logger.info(TAG, `Order filled: ${symbol} ${side} @ ${result.avgPrice}, qty: ${result.filledQty}, commission: ${result.commission} USDT`);
+        logger.info(TAG, `Order placed: ${symbol} ${side} @ ${result.avgPrice}, qty: ${result.filledQty}, id=${result.orderId}`);
         return result;
+    }
+
+    async fetchOrderCommission(symbol: string, orderId: string): Promise<number> {
+        // Bybit may take a moment to attach fee details after fill; retry with
+        // backoff up to ~3 seconds in total.
+        const delays = [200, 400, 800, 1500];
+        for (let i = 0; i < delays.length; i++) {
+            try {
+                const order = await this.exchange.fetchOrder(orderId, symbol);
+                const commission = this.extractCommission(order);
+                if (commission > 0 || order.status === 'closed') {
+                    return commission;
+                }
+            } catch (e) {
+                // continue retrying
+            }
+            await new Promise(r => setTimeout(r, delays[i]));
+        }
+        logger.warn(TAG, `Could not fetch commission for order ${orderId} after retries`);
+        return 0;
     }
 
     getMarketInfo(symbol: string): SymbolMarketInfo | null {

@@ -27,21 +27,46 @@ def request_settings() -> tuple[int, float, float]:
     return retries, timeout, retry_delay
 
 
-def exchange_keys_for_user(user) -> dict[str, str]:
+def exchange_keys_for_user(user, exchanges: tuple[str, ...] | None = None) -> dict[str, str]:
+    """Return the subset of API credentials needed for the given exchanges.
+
+    Sending every user's full key set on every lifecycle command unnecessarily
+    enlarges the surface for credential leakage (engine logs, intermediate
+    proxies, error reports). When the caller specifies which exchanges the
+    runtime actually needs, only those pairs are emitted. The exchange names
+    must match the prefixes used by Engine.extractKeys
+    (``binance``/``bybit``/``gate``/``mexc``); both bot-style names
+    ("binance_futures") and short names ("binance") are accepted.
+    """
+
     keys = getattr(user, "exchange_keys", None)
     if keys is None:
         return {}
 
-    return {
-        "binance_api_key": keys.binance_api_key,
-        "binance_secret": keys.binance_secret,
-        "bybit_api_key": keys.bybit_api_key,
-        "bybit_secret": keys.bybit_secret,
-        "gate_api_key": keys.gate_api_key,
-        "gate_secret": keys.gate_secret,
-        "mexc_api_key": keys.mexc_api_key,
-        "mexc_secret": keys.mexc_secret,
+    sources = {
+        "binance": ("binance_api_key", "binance_secret"),
+        "bybit": ("bybit_api_key", "bybit_secret"),
+        "gate": ("gate_api_key", "gate_secret"),
+        "mexc": ("mexc_api_key", "mexc_secret"),
     }
+
+    if exchanges is None:
+        wanted = set(sources.keys())
+    else:
+        wanted = set()
+        for name in exchanges:
+            if not name:
+                continue
+            prefix = name.split("_", 1)[0].lower()
+            if prefix in sources:
+                wanted.add(prefix)
+
+    result: dict[str, str] = {}
+    for prefix in wanted:
+        api_key_field, secret_field = sources[prefix]
+        result[api_key_field] = getattr(keys, api_key_field, "")
+        result[secret_field] = getattr(keys, secret_field, "")
+    return result
 
 
 def build_trader_runtime_payload(runtime_config: TraderRuntimeConfig) -> dict[str, Any]:

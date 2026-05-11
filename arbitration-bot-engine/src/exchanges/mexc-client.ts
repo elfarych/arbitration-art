@@ -85,40 +85,61 @@ export class MexcClient implements IExchangeClient {
         amount: number,
         params: any = {},
     ): Promise<OrderResult> {
-        logger.info(TAG, `Creating ${side} order for ${symbol}, amount: ${amount}`);
+        logger.debug(TAG, `Creating ${side} order for ${symbol}, amount: ${amount}`);
 
+        // MEXC contract API does not honour reduceOnly via the unified ccxt flag
+        // reliably. The engine pre-fetches actual position size and submits an
+        // explicit opposite-side close, but we still pass reduceOnly so MEXC can
+        // reject the order at the exchange layer if it does support it.
         const order = await this.exchange.createMarketOrder(symbol, side, amount, undefined, params);
         let filled = order;
 
-        // Poll for execution details because MEXC can initially return an order
-        // object with missing average price or open status immediately after fill.
-        let retries = 0;
-        while ((!filled.average || filled.status !== 'closed') && retries < 5) {
-            await new Promise(r => setTimeout(r, 1000));
-            retries++;
+        // Fast single retry: MEXC sometimes returns an order with the average
+        // price still missing immediately after a market fill. A short retry
+        // covers exchange lag without blocking the hot path for seconds.
+        if ((!filled.average || filled.status !== 'closed') && order.id) {
+            await new Promise(r => setTimeout(r, 150));
             try {
                 const checked = await this.exchange.fetchOrder(order.id, symbol);
-                if (checked && checked.average) filled = checked;
-                if (filled.average && filled.status === 'closed') break;
+                if (checked) filled = checked;
             } catch (e) {
-                // Ignore fetch errors during polling
+                // Ignore fetch errors during the quick retry.
             }
         }
-
-        const commission = this.extractCommission(filled);
 
         const result: OrderResult = {
             orderId: String(filled.id),
             avgPrice: filled.average ?? filled.price ?? 0,
             filledQty: filled.filled ?? amount,
-            commission,
+            // Commission is backfilled asynchronously to keep this path fast.
+            commission: 0,
             commissionAsset: 'USDT',
             status: filled.status ?? 'unknown',
             raw: filled,
         };
 
-        logger.info(TAG, `Order filled: ${symbol} ${side} @ ${result.avgPrice}, qty: ${result.filledQty}, prev commission: ${result.commission}`);
+        logger.info(TAG, `Order placed: ${symbol} ${side} @ ${result.avgPrice}, qty: ${result.filledQty}, id=${result.orderId}`);
         return result;
+    }
+
+    async fetchOrderCommission(symbol: string, orderId: string): Promise<number> {
+        // MEXC fee endpoints can be slow to flush. Retry briefly so we do not
+        // permanently record a zero commission for a real-money trade.
+        const delays = [200, 400, 800, 1500];
+        for (let i = 0; i < delays.length; i++) {
+            try {
+                const order = await this.exchange.fetchOrder(orderId, symbol);
+                const commission = this.extractCommission(order);
+                if (commission > 0 || order.status === 'closed') {
+                    return commission;
+                }
+            } catch (e) {
+                // continue retrying
+            }
+            await new Promise(r => setTimeout(r, delays[i]));
+        }
+        logger.warn(TAG, `Could not fetch commission for order ${orderId} after retries`);
+        return 0;
     }
 
     getMarketInfo(symbol: string): SymbolMarketInfo | null {

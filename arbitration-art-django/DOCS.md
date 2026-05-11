@@ -12,12 +12,12 @@
 
 - Аутентификация пользователей через Simple JWT.
 - Хранение пользовательских API-ключей бирж в модели `UserExchangeKeys`, включая MEXC.
-- CRUD настроек ботов `BotConfig` с привязкой к владельцу и per-record `service_url`.
+- CRUD настроек ботов `BotConfig` с привязкой к владельцу и server-managed `service_url`.
 - CRUD `TraderRuntimeConfig` для управляемого из Django standalone `arbitration-trader`.
 - Хранение ошибок `TraderRuntimeConfigError`, которые standalone `arbitration-trader` отправляет в Django через service-token API.
-- Сигнальную синхронизацию lifecycle-команд с внешними runtime-сервисами через service layer и `transaction.on_commit(...)`.
+- Inline lifecycle-команды к bot-engine из ViewSet (`POST`/`PATCH`/`DELETE`/`force-close`), с возвратом 502 при недоступном engine и сохранённым `sync_status=FAILED` для retry. Для standalone trader runtime config сохранён прежний сигнальный путь через `transaction.on_commit`.
 - Хранение истории эмуляционных сделок `EmulationTrade`.
-- Хранение истории реальных сделок `Trade` с привязкой к `owner` и источнику запуска (`bot` или `runtime_config`).
+- Хранение истории реальных сделок `Trade` с привязкой к `owner`, `bot` и/или `runtime_config`. `opened_at` фиксируется engine-ом в момент fill-а, а не в момент DB write.
 - Django admin для ручного просмотра и редактирования основных сущностей.
 
 Текущие приложения:
@@ -218,9 +218,12 @@ TIME_ZONE=Asia/Almaty
 | `TIME_ZONE` | base | нет | Дефолт env-схемы: `Asia/Almaty`. |
 | `CORS_ALLOWED_ORIGINS` | production | нет | Список origin-ов frontend в prod. |
 | `SECURE_SSL_REDIRECT` | production | нет | Дефолт `True`. |
-| `SERVICE_SHARED_TOKEN` | Django -> trader/bot-engine | да для service calls | Shared token для запросов между Django и runtime-сервисами. |
-| `SERVICE_REQUEST_TIMEOUT_SECONDS` | Django -> trader/bot-engine | нет | Дефолт `90`; timeout должен покрывать bootstrap `arbitration-trader`, который может занимать десятки секунд. |
-| `SERVICE_REQUEST_RETRIES` | Django -> trader/bot-engine | нет | Количество retry для service-request. |
+| `SERVICE_SHARED_TOKEN` | Django -> trader/bot-engine | да для service calls | Shared token для запросов между Django и runtime-сервисами. Без него `is_service_request` всегда False, и engine не сможет писать trade-ы в Django. |
+| `BOT_ENGINE_SERVICE_URL_DEFAULT` | base | нет | Дефолтный `service_url` для новых `BotConfig`. Это поле read-only через API, что закрывает SSRF-вектор «юзер шлёт ключи на свой произвольный host». Поле остаётся в БД для multi-engine deployment-ов через admin. |
+| `SERVICE_LIFECYCLE_TIMEOUT_SECONDS` | Django -> bot-engine | нет | Дефолт `30`. Используется для START/STOP/FORCE-CLOSE, которым нужен запас на `loadMarkets`, `setIsolatedMargin`, `setLeverage`. |
+| `SERVICE_SYNC_TIMEOUT_SECONDS` | Django -> bot-engine | нет | Дефолт `5`. Используется для SYNC: in-memory edit на стороне engine должен возвращаться за миллисекунды. |
+| `SERVICE_REQUEST_TIMEOUT_SECONDS` | Django -> arbitration-trader (legacy) | нет | Дефолт `30`. Используется только клиентом standalone trader runtime info; для bot-engine используются split-таймауты выше. |
+| `SERVICE_REQUEST_RETRIES` | Django -> trader/bot-engine | нет | Количество retry для service-request. Применимо ко всем service-calls. |
 | `SERVICE_REQUEST_RETRY_DELAY_SECONDS` | Django -> trader/bot-engine | нет | Пауза между retry service-request. |
 
 Не копировать реальные значения `.env` в документацию, логи, issues или PR.
@@ -415,6 +418,7 @@ Meta:
 
 - `ordering = ["-created_at"]`
 - verbose names: `bot configuration`, `bot configurations`
+- `CheckConstraint('bot_config_distinct_exchanges')`: `~Q(primary_exchange=F("secondary_exchange"))`. DB-level гарантия, что обе ноги конфигурируются на разные биржи; иначе engine подписался бы на один и тот же orderbook дважды и спред всегда был бы нулевым.
 
 `__str__`:
 
@@ -506,15 +510,15 @@ Choices:
 | `primary_open_order_id` | `CharField(100)` | да | ID open ордера primary. |
 | `secondary_open_order_id` | `CharField(100)` | да | ID open ордера secondary. |
 | `open_spread` | `DecimalField(10, 4)` | нет | Спред открытия. |
-| `open_commission` | `DecimalField(12, 6)` | нет | Total open commission в USDT, default `0`. |
-| `opened_at` | `DateTimeField(auto_now_add)` | нет | Время открытия. |
+| `open_commission` | `DecimalField(18, 6)` | нет | Total open commission в USDT, default `0`. Расширено до 18 знаков, чтобы вместить большие позиции high-leverage. |
+| `opened_at` | `DateTimeField(default=timezone.now)` | нет | Время фактического fill-а на бирже, передаётся engine-ом. До production-readiness рефакторинга было `auto_now_add` и фиксировало момент DB write, теперь — момент фактического открытия. |
 | `primary_close_price` | `DecimalField(20, 8)` | да | Close цена primary. |
 | `secondary_close_price` | `DecimalField(20, 8)` | да | Close цена secondary. |
 | `primary_close_order_id` | `CharField(100)` | да | ID close ордера primary. |
 | `secondary_close_order_id` | `CharField(100)` | да | ID close ордера secondary. |
 | `close_spread` | `DecimalField(10, 4)` | да | Спред закрытия. |
-| `close_commission` | `DecimalField(12, 6)` | да | Total close commission в USDT. |
-| `profit_usdt` | `DecimalField(12, 6)` | да | Profit в USDT. |
+| `close_commission` | `DecimalField(18, 6)` | да | Total close commission в USDT. Расширено до 18 знаков. |
+| `profit_usdt` | `DecimalField(18, 6)` | да | Profit в USDT. Расширено до 18 знаков, чтобы вместить high-leverage экстремумы. |
 | `profit_percentage` | `DecimalField(10, 4)` | да | Profit %. |
 | `closed_at` | `DateTimeField` | да | Время закрытия. |
 
@@ -561,17 +565,19 @@ Endpoints:
 | Method | Path | Назначение |
 |---|---|---|
 | `GET` | `/api/bots/` | Список bot configs текущего пользователя. |
-| `POST` | `/api/bots/` | Создать bot config для текущего пользователя. |
+| `POST` | `/api/bots/` | Создать bot config. Если `is_active=true`, ViewSet синхронно вызывает engine START и возвращает 502 при ошибке. |
 | `GET` | `/api/bots/{id}/` | Получить bot config текущего пользователя. |
-| `PUT` | `/api/bots/{id}/` | Полностью обновить bot config. |
-| `PATCH` | `/api/bots/{id}/` | Частично обновить bot config. |
-| `DELETE` | `/api/bots/{id}/` | Удалить bot config. |
-| `POST` | `/api/bots/{id}/force-close/` | Отправить force-close в bot-engine. |
+| `PUT` | `/api/bots/{id}/` | Полностью обновить bot config. Inline lifecycle: START если активен, STOP при выходе из is_active=True. |
+| `PATCH` | `/api/bots/{id}/` | Частично обновить bot config. То же поведение, что и PUT. |
+| `DELETE` | `/api/bots/{id}/` | Сначала inline STOP (если бот активен), потом удаление. 502 без удаления, если engine не подтвердил остановку. |
+| `POST` | `/api/bots/{id}/force-close/` | Inline FORCE-CLOSE через engine. |
+| `GET` | `/api/bots/{id}/engine-health/` | Probe engine `/health` для service_url этого бота. 502 если engine недоступен. Side effect-free. |
 
-Serializer fields:
+Serializer fields (`BotConfigSerializer`):
 
 ```text
 id
+service_url
 primary_exchange
 secondary_exchange
 entry_spread
@@ -588,6 +594,11 @@ trade_on_secondary_exchange
 max_trade_duration_minutes
 max_leg_drawdown_percent
 is_active
+status
+sync_status
+last_command
+last_sync_error
+last_synced_at
 created_at
 updated_at
 ```
@@ -596,18 +607,38 @@ Read-only:
 
 ```text
 id
+service_url
+status
+sync_status
+last_command
+last_sync_error
+last_synced_at
 created_at
 updated_at
 ```
 
-`owner` не принимается из API. Он всегда выставляется из `request.user` в `perform_create`.
+`owner` не принимается из API, выставляется из `request.user` в `perform_create`. `service_url` read-only через API: дефолт берётся из `settings.BOT_ENGINE_SERVICE_URL_DEFAULT`. Это закрывает SSRF-вектор: иначе аутентифицированный пользователь мог бы PATCH-нуть свой `service_url` на attacker-host и получить туда payload с собственными биржевыми ключами.
 
-Side effects:
+Дополнительные валидаторы:
 
-- `POST /api/bots/` -> `sync_with_engine(bot, "start")`
-- update -> `sync_with_engine(bot, "sync")`
-- delete -> `sync_with_engine(instance, "stop")`, затем `instance.delete()`
-- force-close -> `sync_with_engine(bot, "force-close")`
+- `coin` — должен соответствовать ccxt USDT-margined формату `^[A-Z0-9]{1,20}/USDT:USDT$` (например `BTC/USDT:USDT`); неверный формат отклоняется на этапе validation, иначе engine стартует, но никогда не найдёт пару в orderbook.
+- `coin_amount > 0`.
+- `primary_exchange != secondary_exchange` (плюс DB-level `CheckConstraint`).
+- Если `is_active=true` и `trade_mode=real`, хотя бы одна из ног (`trade_on_primary_exchange`/`trade_on_secondary_exchange`) должна быть включена.
+- Поля `trade_mode`, `primary_exchange`, `secondary_exchange`, `primary_leverage`, `secondary_leverage` запрещено менять, пока бот активен. Для смены нужно сначала `is_active=false` (engine закроет позиции и сбросит trader), потом изменить поле, потом `is_active=true` (engine стартует новый trader с правильной margin/leverage конфигурацией).
+
+Side effects (inline, без `transaction.on_commit`):
+
+- `POST` `is_active=true` → `sync_bot_lifecycle(START)`. На fail — 502, запись остаётся в БД с `sync_status=FAILED`, `last_sync_error` заполнен, можно ретраить через PATCH.
+- `POST` `is_active=false` → engine call не выполняется (бот создан как pre-staged).
+- `PUT`/`PATCH` (стал активным или остался активным) → `START` (engine идемпотентен: START уже запущенного трейдера эквивалентен SYNC).
+- `PUT`/`PATCH` (был активен, стал неактивен) → `STOP`.
+- `PUT`/`PATCH` (был и остался неактивным) → engine не дёргается.
+- `DELETE` (активный) → синхронный `STOP` + delete row; 502 без delete, если engine не подтвердил.
+- `DELETE` (неактивный) → просто delete row.
+- `force-close` → синхронный `FORCE-CLOSE`.
+
+Сигнальный путь `bot_config_pre_delete` остаётся как safety net для admin/cascade удалений: если активный бот удалён без прохождения через ViewSet (например, при cascade-delete пользователя), сигнал шлёт best-effort `STOP` на engine. В нормальном flow inline `STOP` уже отработал, и signal видит `is_active=False` (in-memory мутация в `destroy`) и пропускает дубль.
 
 Пример create request:
 
@@ -617,7 +648,7 @@ Side effects:
   "secondary_exchange": "bybit_futures",
   "entry_spread": "0.5000",
   "exit_spread": "0.1000",
-  "coin": "BTC",
+  "coin": "BTC/USDT:USDT",
   "coin_amount": "0.01000000",
   "order_type": "auto",
   "trade_mode": "emulator",
@@ -942,78 +973,91 @@ Read-only:
 
 ```text
 id
-opened_at
+owner
 ```
 
-Write methods доступны только request-ам с `X-Service-Token`. JWT-пользователи используют endpoint для чтения своих реальных сделок.
+`opened_at` writable на POST так что engine записывает фактическое время fill-а (не время DB write). Поскольку POST доступен только с `X-Service-Token`, конечный пользователь подделать `opened_at` не может. `bot` и `runtime_config` запрещены к смене на PATCH (валидируется в `TradeSerializer.validate`), чтобы трейд нельзя было перепривязать к другому боту после открытия. Write methods доступны только request-ам с `X-Service-Token`. JWT-пользователи используют endpoint для чтения своих реальных сделок.
 
 ## 10. Интеграция с bot-engine
 
-Файл: `apps/bots/api/views.py`.
+Файлы:
 
-Константа:
+- `apps/bots/services/lifecycle.py` — orchestration: построение payload, вызовы engine, обновление sync metadata.
+- `apps/bots/services/trader_runtime_shared.py` — общие хелперы (URL join, service headers, filtered exchange keys).
+- `apps/bots/api/views.py` — ViewSet методы вызывают lifecycle inline.
 
-```python
-ENGINE_URL = "http://127.0.0.1:3001/engine/bot"
-```
+URL берётся из `BotConfig.service_url` per-record. Дефолт — `settings.BOT_ENGINE_SERVICE_URL_DEFAULT`. Поле read-only через API, чтобы пользователь не мог перенаправить payload с собственными ключами на чужой host.
 
-Функция `get_engine_payload(bot)` собирает payload:
+Service token прокидывается обратной стороной: Django шлёт `X-Service-Token` в каждом запросе к engine, engine валидирует его в `preHandler` и отвергает чужие запросы (engine также шлёт этот токен обратно в Django при записи trade-ов).
+
+### Payload
+
+`_bot_runtime_payload(bot)` для START/SYNC:
 
 ```json
 {
   "bot_id": 123,
+  "owner_id": 7,
   "config": {
-    "...": "BotConfigSerializer(bot).data"
+    "id": 123,
+    "primary_exchange": "binance_futures",
+    "secondary_exchange": "bybit_futures",
+    "entry_spread": "0.5000",
+    "exit_spread": "0.1000",
+    "coin": "BTC/USDT:USDT",
+    "coin_amount": "0.01000000",
+    "order_type": "auto",
+    "trade_mode": "real",
+    "primary_leverage": 5,
+    "secondary_leverage": 5,
+    "trade_on_primary_exchange": true,
+    "trade_on_secondary_exchange": true,
+    "max_trade_duration_minutes": 60,
+    "max_leg_drawdown_percent": 80.0,
+    "is_active": true
   },
   "keys": {
     "binance_api_key": "...",
     "binance_secret": "...",
     "bybit_api_key": "...",
-    "bybit_secret": "...",
-    "gate_api_key": "...",
-    "gate_secret": "..."
+    "bybit_secret": "..."
   }
 }
 ```
 
-Если у пользователя нет `exchange_keys`, `keys` будет `{}`.
+`keys` содержит **только пары для бирж этого бота** (primary + secondary). `exchange_keys_for_user(user, exchanges=(primary, secondary))` фильтрует по prefix-имени биржи (`binance_futures` → `binance`). Лишние ключи не отправляются — это снижает surface при отладке/логировании.
 
-Функция `sync_with_engine(bot, action="sync")`:
-
-- Собирает URL: `f"{ENGINE_URL}/{action}"`.
-- Для `force-close` и `stop` отправляет:
+Для STOP/FORCE-CLOSE отправляется минимальный payload:
 
 ```json
-{
-  "bot_id": 123
-}
+{ "bot_id": 123 }
 ```
 
-- Для остальных action отправляет полный payload с config и keys.
-- HTTP method: `POST`.
-- Timeout: 5 секунд.
-- Ошибки `requests.RequestException` не пробрасываются, а печатаются через `print`.
+### Action mapping и timeouts
 
-Action mapping:
+| Django событие | Engine action | URL | Timeout |
+|---|---|---|---|
+| Create bot, is_active=true | `start` | `POST {service_url}/engine/bot/start` | `SERVICE_LIFECYCLE_TIMEOUT_SECONDS` (default 30s) |
+| Update bot, остаётся активным или становится активным | `start` (идемпотентен в engine) | `POST {service_url}/engine/bot/start` | `SERVICE_LIFECYCLE_TIMEOUT_SECONDS` |
+| Update bot, был активен → стал неактивен | `stop` | `POST {service_url}/engine/bot/stop` | `SERVICE_LIFECYCLE_TIMEOUT_SECONDS` |
+| Delete bot (активный) | `stop` | `POST {service_url}/engine/bot/stop` | `SERVICE_LIFECYCLE_TIMEOUT_SECONDS` |
+| Force close | `force-close` | `POST {service_url}/engine/bot/force-close` | `SERVICE_LIFECYCLE_TIMEOUT_SECONDS` |
+| Engine health probe (read-only) | (GET) | `GET {service_url}/health` | `SERVICE_SYNC_TIMEOUT_SECONDS` (default 5s) |
 
-| Django событие | Engine action | URL |
-|---|---|---|
-| Create bot | `start` | `POST http://127.0.0.1:3001/engine/bot/start` |
-| Update bot | `sync` | `POST http://127.0.0.1:3001/engine/bot/sync` |
-| Delete bot | `stop` | `POST http://127.0.0.1:3001/engine/bot/stop` |
-| Force close | `force-close` | `POST http://127.0.0.1:3001/engine/bot/force-close` |
+START заменяет SYNC потому что [`Engine.startBot`](../arbitration-bot-engine/src/classes/Engine.ts) **идемпотентен**: если bot_id уже зарегистрирован, он форвардит конфиг существующему trader-у через `syncConfig`. Это убирает класс багов «бот не стартует после re-activate, потому что Django шлёт SYNC, а engine не имеет trader-а в памяти».
 
-Поведение при выключении `is_active`:
+### Failure handling
 
-- Код все равно вызывает `sync`.
-- Комментарий в коде говорит, что engine сам должен обработать `is_active=false`: не открывать новые сделки, но позволить текущим ордерам завершиться.
+Lifecycle sync **inline** в `BotConfigViewSet.perform_create` / `perform_update` / `destroy`. На `LifecycleSyncError`:
 
-Важные замечания:
+- `perform_create` / `perform_update` оборачивают в `EngineSyncError` (502 Bad Gateway). Запись в БД создаётся/обновляется (поэтому юзер не теряет конфиг), `sync_status=FAILED`, `last_sync_error` заполнен с детальным сообщением. Юзер может ретраить через повторный PATCH.
+- `destroy` отказывается удалять row, возвращает 502 с текстом ошибки. После того как engine станет доступен, юзер ретраит DELETE.
 
-- Engine URL захардкожен и не конфигурируется через env.
-- Ошибки синхронизации не видны API-клиенту: bot config может успешно сохраниться в Django, но engine не получить обновление.
-- Используется `print`, а не structured logging.
-- В payload уходят plaintext exchange secrets.
+Сигнал `bot_config_pre_delete` остаётся как fallback для admin/cascade-deletion, делает best-effort STOP и проглатывает ошибки (нельзя ронять cascade-delete).
+
+### Engine response contract
+
+Engine отвечает `{ success: true }` или `{ success: false, error: "..." }` со статусом 200/500. `_perform_post` бросает `LifecycleSyncError` на любой non-2xx ответ и на network errors; retry-policy: `SERVICE_REQUEST_RETRIES` попыток с паузой `SERVICE_REQUEST_RETRY_DELAY_SECONDS`.
 
 ## 11. Django admin
 
@@ -1316,97 +1360,74 @@ List responses обычно имеют DRF-формат:
 
 Development settings добавляет Browsable API renderer. Base/production оставляют JSON renderer.
 
-## 17. Важные риски и технический долг
+## 17. Risks и known limitations
 
 ### 17.1. Plaintext exchange secrets
 
 `UserExchangeKeys` хранит secrets в обычных `CharField`. Это наиболее критичный риск.
 
-Возможные улучшения:
+Mitigations, которые уже на месте:
 
-- field-level encryption;
-- KMS/secret manager;
-- хранить только encrypted blob;
-- запретить вывод secrets в admin/API/logs;
-- audit trail доступа к ключам.
+- API endpoint `/api/auth/exchange-keys/` отдаёт только masked preview (`api_key_preview`, `secret_preview`), а POST/PATCH полей `write_only`.
+- Lifecycle payload содержит ключи только для тех двух бирж, которые реально использует bot (filtered `exchange_keys_for_user(user, exchanges=...)`).
+- `BotConfig.service_url` read-only через API, поэтому юзер не может перенаправить payload с ключами на свой host.
+
+Что желательно добавить дополнительно:
+
+- field-level encryption (например, `django-cryptography`) или KMS/secret manager;
+- audit trail доступа к ключам;
+- запретить вывод любых secret-полей в structured logs (сейчас обеспечивается тем, что engine логирует config без `keys`, но любое будущее логирование может нарушить).
 
 ### 17.2. Service-token write endpoints
 
-`EmulationTradeViewSet`, `TradeViewSet` и `TraderRuntimeConfigErrorViewSet` используют общий `X-Service-Token` для write methods.
+`EmulationTradeViewSet`, `TradeViewSet` и `TraderRuntimeConfigErrorViewSet` используют общий `X-Service-Token` для write methods. Если токен утечёт, атакующий с network access сможет писать/читать service-level данные.
 
-Если API доступен извне и общий service token скомпрометирован, клиент потенциально может:
+Mitigations, которые уже на месте:
 
-- создать сделку или runtime error;
-- изменить сделку или runtime error;
-- удалить сделку или runtime error;
-- читать service-level данные.
+- сравнение токена через `hmac.compare_digest` (timing-safe);
+- запрос с пустым/несовпадающим токеном получает `is_service_request=False` (write methods → 403).
 
-Если это нужно для локального engine, лучше:
+Что желательно добавить:
 
-- вынести engine API под отдельный prefix;
-- заменить общий service token на HMAC с подписью payload и timestamp;
-- ограничить на reverse proxy по network allowlist;
-- заменить публичные endpoints на narrow custom actions;
-- сделать public часть read-only, если запись не нужна.
+- HMAC-подпись payload + timestamp вместо bearer-токена для защиты от replay;
+- network allowlist на reverse proxy;
+- mTLS между Django и engine для confidentiality на untrusted сети.
 
-### 17.3. Bot-engine sync неатомарен
+### 17.3. Inline lifecycle sync
 
-Django сначала сохраняет изменения, затем пытается уведомить engine. Ошибка engine не откатывает транзакцию и не возвращается клиенту.
+Lifecycle команды для BotConfig (`POST`/`PATCH`/`DELETE`/`force-close`) выполняются inline в ViewSet через `sync_bot_lifecycle`. На failure возвращается 502 с заполненным `last_sync_error`, запись в БД сохраняется в `sync_status=FAILED` — юзер видит ошибку сразу и может ретраить. Это убирает класс ситуаций «Django сохранил, engine не получил, операционная команда висит в неопределённом состоянии».
 
-Результат: Django state и engine state могут разойтись.
+Side effects:
 
-Варианты улучшения:
+- POST/PATCH блокируется на время до `SERVICE_LIFECYCLE_TIMEOUT_SECONDS × SERVICE_REQUEST_RETRIES` (по умолчанию 30s × 3 = 90s максимум). Для downstream-операторов это норма, для UI желательно показывать spinner.
+- DELETE отказывается удалить row при недоступном engine — это умышленно, чтобы не оставить orphan-позиции.
 
-- хранить sync status/error на `BotConfig`;
-- использовать outbox pattern;
-- retry queue;
-- Celery/RQ background task;
-- вернуть warning клиенту;
-- логировать ошибки нормальным logger-ом.
+### 17.4. Нет тестов
 
-### 17.4. Engine URL захардкожен
+В проекте не найдено `tests.py`, `tests/`, pytest config или Django TestCase. При изменениях сейчас опора только на `manage.py check`, ручные проверки и engine-side build.
 
-`ENGINE_URL = "http://127.0.0.1:3001/engine/bot"` лежит в коде.
-
-Лучше вынести в env:
-
-```text
-BOT_ENGINE_URL=http://127.0.0.1:3001/engine/bot
-BOT_ENGINE_TIMEOUT_SECONDS=5
-```
-
-### 17.5. Нет тестов
-
-В проекте не найдено `tests.py`, `tests/`, pytest config или Django TestCase. При изменениях сейчас опора только на `manage.py check` и ручные проверки.
-
-Минимальный набор тестов:
+Минимальный набор тестов для production:
 
 - login по email;
 - `/api/auth/me/`;
 - logout blacklist behavior;
 - owner scoping для `BotConfigViewSet`;
-- create/update/delete bot вызывает нужный engine action;
+- inline lifecycle: create/update/delete вызывают нужный engine action; на mock engine failure возвращается 502;
+- restricted-field guard в BotConfigSerializer (запрет смены trade_mode/leverage/exchange когда бот активен);
+- coin format validator;
 - anonymous/auth queryset behavior для `EmulationTradeViewSet`;
-- status filters для trades;
+- bot_id фильтр для `TradeViewSet`;
 - serializer validation для choices/decimal fields.
 
-### 17.6. `UserExchangeKeys` без admin
+### 17.5. Multi-process duplication
 
-Модель есть, engine/trader payload ее использует, а пользовательское управление идет через `/api/auth/exchange-keys/`. Admin registration для ручного просмотра/поддержки не настроена.
+In-process Engine защищает от race в пределах одного процесса (`Set<starting>` + `Map<traders>`). Если у пользователя запущено два engine-процесса на один и тот же Django, оба могут получить `start` для одного `bot_id` и параллельно открывать позиции. Mitigation: deployment должен запускать один engine на один Django либо ввести distributed lock (Redis lease, DB row lock на `BotConfig.runtime_owner_node_id`).
 
-### 17.7. `Trade` без owner/bot relation
+### 17.6. `Trade.opened_at` поведение
 
-Реальные сделки не привязаны к пользователю или боту. Это усложняет:
+`Trade.opened_at` стало `default=timezone.now` (не `auto_now_add`). Engine передаёт фактический timestamp fill-а; если по какой-то причине не передал, Django использует время DB write. Это normal degradation, но `Trade.opened_at` тогда отстаёт от реальности на сетевой latency. В мониторинге проверять, что engine стабильно шлёт `opened_at` в payload.
 
-- multi-user isolation;
-- аудит;
-- фильтрацию в UI;
-- удаление данных пользователя;
-- расследование инцидентов.
-
-Если real trading становится пользовательской функцией, лучше добавить связь хотя бы с `BotConfig` или `owner`.
-
-### 17.8. README расходится с settings
+### 17.7. README расходится с settings
 
 README и `.env.example` намекают на default SQLite, но `development.py` требует `DATABASE_URL`. Нужно либо:
 
@@ -1417,9 +1438,13 @@ README и `.env.example` намекают на default SQLite, но `development
 env.db("DATABASE_URL", default=f"sqlite:///{BASE_DIR / 'db.sqlite3'}")
 ```
 
-### 17.9. Production secret warning
+### 17.8. Production secret warning
 
-`check --deploy` на текущем окружении выдает `security.W009`: текущий `SECRET_KEY` недостаточно сильный. Для production заменить.
+`check --deploy` на текущем окружении выдает `security.W009`: текущий `SECRET_KEY` недостаточно сильный. Для production заменить через secret manager / env.
+
+### 17.9. CORS и transport security между Django и engine
+
+`production.py` ставит `SECURE_SSL_REDIRECT=True`, `SECURE_HSTS_SECONDS`, и т.д. для входящего трафика. Канал Django → engine идёт по HTTP (`http://127.0.0.1:3001` по умолчанию). При деплое engine на отдельный хост payload с ключами летит по plaintext — защищён только `X-Service-Token` в заголовке. Production deployment должен либо держать engine на localhost (рекомендуется), либо терминировать TLS на reverse proxy между Django и engine.
 
 ## 18. Быстрый flow API-клиента
 

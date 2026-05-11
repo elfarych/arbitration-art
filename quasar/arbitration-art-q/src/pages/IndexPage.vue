@@ -9,39 +9,38 @@
       <q-spinner color="primary" size="lg" />
       <div class="text-text-color q-mt-md opacity-70">Загрузка ботов...</div>
     </div>
-    
+
     <div v-else-if="bots.length === 0" class="text-center q-my-xl border-radius-sm bg-surface q-pa-xl">
       <div class="text-text-color q-mb-md opacity-70">У вас пока нет настроенных ботов</div>
       <q-btn color="primary" outline no-caps label="Создать первого бота" @click="openCreateDialog" />
     </div>
 
     <div v-else class="bot-cards-grid">
-      <BotCard 
+      <BotCard
         v-for="bot in bots" :key="bot.id"
-        :bot="bot" 
-        @toggle="toggleBot" 
-        @edit="openEditDialog" 
-        @delete="deleteBot" 
+        :bot="bot"
+        @toggle="toggleBot"
+        @edit="openEditDialog"
+        @delete="deleteBot"
         @history="openHistory"
         @force-close="forceCloseBot"
       />
     </div>
 
-    <!-- Modals to be implemented next -->
-    <BotFormDialog 
-      v-model="isFormOpen" 
-      :bot="editingBot" 
+    <BotFormDialog
+      v-model="isFormOpen"
+      :bot="editingBot"
     />
-    
-    <SpreadHistoryDialog 
-      v-model="isHistoryOpen" 
-      :bot="historyBot" 
+
+    <SpreadHistoryDialog
+      v-model="isHistoryOpen"
+      :bot="historyBot"
     />
   </q-page>
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted } from 'vue';
+import { ref, onMounted, onUnmounted } from 'vue';
 import { useQuasar } from 'quasar';
 import type { BotConfig } from 'src/stores/bots/api/botConfig';
 import { useBotsStore } from 'src/stores/bots/bots.store';
@@ -49,6 +48,7 @@ import { storeToRefs } from 'pinia';
 import BotCard from 'src/components/bots/BotCard.vue';
 import BotFormDialog from 'src/components/bots/BotFormDialog.vue';
 import SpreadHistoryDialog from 'src/components/bots/SpreadHistoryDialog.vue';
+import { extractApiErrorMessage } from 'src/utils/apiError';
 
 const $q = useQuasar();
 const botsStore = useBotsStore();
@@ -60,8 +60,18 @@ const editingBot = ref<BotConfig | null>(null);
 const isHistoryOpen = ref(false);
 const historyBot = ref<BotConfig | null>(null);
 
+// Periodic refresh of the bot list. Each bot's engine sync_status,
+// last_sync_error and runtime status are server-side and the page must reflect
+// them even when no user action happens. BotCard handles its own trade polling.
+const BOT_LIST_POLL_MS = 15_000;
+let pollHandle: number | undefined;
+
 const loadBots = async () => {
-  await botsStore.fetchBots();
+  try {
+    await botsStore.fetchBots();
+  } catch (e) {
+    $q.notify({ color: 'negative', message: extractApiErrorMessage(e, 'Не удалось загрузить ботов') });
+  }
 };
 
 const openCreateDialog = () => {
@@ -83,23 +93,24 @@ const toggleBot = async (bot: BotConfig) => {
   try {
     await botsStore.toggleBot(bot);
   } catch (e) {
-    $q.notify({ color: 'negative', message: 'Ошибка обновления статуса' });
+    $q.notify({ color: 'negative', message: extractApiErrorMessage(e, 'Ошибка обновления статуса') });
   }
 };
 
 const deleteBot = (id: number) => {
   $q.dialog({
     title: 'Удалить',
-    message: 'Удалить карточку этого бота навсегда?',
+    message: 'Удалить карточку этого бота? Engine получит команду stop и закроет открытые позиции.',
     cancel: true,
     persistent: true,
     dark: true,
-    color: 'negative'
+    color: 'negative',
   }).onOk(async () => {
     try {
       await botsStore.deleteBot(id);
+      $q.notify({ color: 'positive', message: 'Бот удалён' });
     } catch (e) {
-      $q.notify({ color: 'negative', message: 'Не удалось удалить бота' });
+      $q.notify({ color: 'negative', message: extractApiErrorMessage(e, 'Не удалось удалить бота') });
     }
   });
 };
@@ -107,23 +118,28 @@ const deleteBot = (id: number) => {
 const forceCloseBot = (id: number) => {
   $q.dialog({
     title: 'Отмена сделок',
-    message: 'Принудительно закрыть все открытые сделки этого бота по рынку прямо сейчас?',
+    message: 'Принудительно закрыть открытые сделки этого бота по рынку прямо сейчас?',
     cancel: true,
     persistent: true,
     dark: true,
-    color: 'warning'
+    color: 'warning',
   }).onOk(async () => {
     try {
       await botsStore.forceCloseBot(id);
       $q.notify({ color: 'positive', message: 'Команда на экстренное закрытие отправлена' });
     } catch (e) {
-      $q.notify({ color: 'negative', message: 'Не удалось отправить команду на закрытие' });
+      $q.notify({ color: 'negative', message: extractApiErrorMessage(e, 'Не удалось отправить команду на закрытие') });
     }
   });
 };
 
-onMounted(() => {
-  loadBots();
+onMounted(async () => {
+  await loadBots();
+  pollHandle = window.setInterval(() => { void loadBots(); }, BOT_LIST_POLL_MS);
+});
+
+onUnmounted(() => {
+  if (pollHandle) window.clearInterval(pollHandle);
 });
 </script>
 

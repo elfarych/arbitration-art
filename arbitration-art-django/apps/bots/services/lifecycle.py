@@ -2,6 +2,7 @@ import time
 from typing import Any
 
 import requests
+from django.conf import settings
 from django.utils import timezone
 
 from apps.bots.models import (
@@ -24,8 +25,33 @@ class LifecycleSyncError(RuntimeError):
     """Raised when Django cannot synchronize lifecycle state with a runtime."""
 
 
-def _perform_post(url: str, payload: dict[str, Any]) -> None:
-    retries, timeout, retry_delay = request_settings()
+def _lifecycle_settings(action: str) -> tuple[int, float, float]:
+    """Return (retries, timeout_seconds, retry_delay_seconds) for an action.
+
+    SYNC operations are in-memory only on the engine side and must return in
+    milliseconds. START/STOP/FORCE-CLOSE may run loadMarkets / setLeverage /
+    position closes and need a longer budget. A single global timeout would
+    either be too short for START (blocking trades) or too long for SYNC
+    (blocking the Django worker on cosmetic edits).
+    """
+
+    retries = max(1, int(getattr(settings, "SERVICE_REQUEST_RETRIES", 3)))
+    retry_delay = float(getattr(settings, "SERVICE_REQUEST_RETRY_DELAY_SECONDS", 1))
+    if action == LifecycleCommand.SYNC:
+        timeout = float(getattr(settings, "SERVICE_SYNC_TIMEOUT_SECONDS", 5))
+    else:
+        # Fall back to the legacy SERVICE_REQUEST_TIMEOUT_SECONDS for backwards
+        # compatibility with existing deployments that have not split the env.
+        default = getattr(settings, "SERVICE_REQUEST_TIMEOUT_SECONDS", 30)
+        timeout = float(getattr(settings, "SERVICE_LIFECYCLE_TIMEOUT_SECONDS", default))
+    return retries, timeout, retry_delay
+
+
+def _perform_post(url: str, payload: dict[str, Any], action: str | None = None) -> None:
+    if action is None:
+        retries, timeout, retry_delay = request_settings()
+    else:
+        retries, timeout, retry_delay = _lifecycle_settings(action)
     last_error = "Unknown service sync error."
     try:
         headers = service_headers()
@@ -77,7 +103,12 @@ def _bot_runtime_payload(bot: BotConfig) -> dict[str, Any]:
             "max_leg_drawdown_percent": bot.max_leg_drawdown_percent,
             "is_active": bot.is_active,
         },
-        "keys": exchange_keys_for_user(bot.owner),
+        # Only the keys for the two exchanges this bot uses. Sending the full
+        # key set on every command needlessly increases the credential surface.
+        "keys": exchange_keys_for_user(
+            bot.owner,
+            exchanges=(bot.primary_exchange, bot.secondary_exchange),
+        ),
     }
 
 
@@ -104,6 +135,10 @@ def _update_sync_metadata(queryset, *, action: str, sync_status: str, error: str
         "last_command": action,
         "sync_status": sync_status,
         "last_sync_error": error,
+        # Bump updated_at manually because queryset.update() does not trigger
+        # auto_now on the field — without this the timestamp would only reflect
+        # user-driven edits and skew sync-side observability.
+        "updated_at": timezone.now(),
     }
 
     if sync_status in {SyncStatus.SUCCESS, SyncStatus.FAILED}:
@@ -134,10 +169,14 @@ def sync_bot_lifecycle(bot_id: int, action: str) -> None:
     )
 
     path = f"/engine/bot/{action}"
-    payload = {"bot_id": bot.id} if action in {LifecycleCommand.STOP, LifecycleCommand.FORCE_CLOSE} else _bot_runtime_payload(bot)
+    payload = (
+        {"bot_id": bot.id}
+        if action in {LifecycleCommand.STOP, LifecycleCommand.FORCE_CLOSE}
+        else _bot_runtime_payload(bot)
+    )
 
     try:
-        _perform_post(join_control_url(bot.service_url, path), payload)
+        _perform_post(join_control_url(bot.service_url, path), payload, action=action)
     except LifecycleSyncError as exc:
         _update_sync_metadata(
             BotConfig.objects.filter(pk=bot_id),
@@ -158,12 +197,49 @@ def sync_bot_lifecycle(bot_id: int, action: str) -> None:
 
 
 def stop_deleted_bot(service_url: str, bot_id: int) -> None:
-    """Send a best-effort stop command for a BotConfig being deleted."""
+    """Send a best-effort stop command for a BotConfig being deleted.
+
+    Used by the admin / cascade-deletion safety net signal. The primary
+    delete path in the API view calls sync_bot_lifecycle('stop') inline and
+    refuses to delete on engine failure, so this is only reached when a bot
+    is removed outside the regular API surface.
+    """
 
     _perform_post(
         join_control_url(service_url, "/engine/bot/stop"),
         {"bot_id": bot_id},
+        action=LifecycleCommand.STOP,
     )
+
+
+def check_bot_engine_health(service_url: str) -> dict[str, Any]:
+    """GET the engine /health endpoint. Raises LifecycleSyncError on failure."""
+
+    retries, _, _ = _lifecycle_settings(LifecycleCommand.SYNC)
+    timeout = float(getattr(settings, "SERVICE_SYNC_TIMEOUT_SECONDS", 5))
+    try:
+        headers = service_headers()
+    except RuntimeError as exc:
+        raise LifecycleSyncError(str(exc)) from exc
+
+    last_error = "Unknown engine health error."
+    url = join_control_url(service_url, "/health")
+    for attempt in range(1, retries + 1):
+        try:
+            response = requests.get(url, headers=headers, timeout=timeout)
+            response.raise_for_status()
+            if not response.content:
+                return {"ok": True}
+            return response.json()
+        except requests.RequestException as exc:
+            response_text = ""
+            if exc.response is not None and exc.response.text:
+                response_text = exc.response.text.strip()[:500]
+            last_error = response_text or str(exc)
+            if attempt < retries:
+                time.sleep(0.2)
+
+    raise LifecycleSyncError(last_error)
 
 
 def sync_trader_runtime_lifecycle(runtime_config_id: int, action: str) -> None:
@@ -194,7 +270,7 @@ def sync_trader_runtime_lifecycle(runtime_config_id: int, action: str) -> None:
     )
 
     try:
-        _perform_post(join_control_url(runtime_config.service_url, path), payload)
+        _perform_post(join_control_url(runtime_config.service_url, path), payload, action=action)
     except LifecycleSyncError as exc:
         _update_sync_metadata(
             TraderRuntimeConfig.objects.filter(pk=runtime_config_id),

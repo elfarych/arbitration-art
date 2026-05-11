@@ -8,15 +8,6 @@ import {
 import routes from './routes';
 import { useAuthStore } from 'stores/auth';
 
-/*
- * If not building with SSR mode, you can
- * directly export the Router instantiation;
- *
- * The function below can be async too; either use
- * async/await or return a Promise which resolves
- * with the Router instance.
- */
-
 export default defineRouter(function (/* { store, ssrContext } */) {
   const createHistory = process.env.SERVER
     ? createMemoryHistory
@@ -25,25 +16,34 @@ export default defineRouter(function (/* { store, ssrContext } */) {
   const Router = createRouter({
     scrollBehavior: () => ({ left: 0, top: 0 }),
     routes,
-
-    // Leave this as is and make changes in quasar.conf.js instead!
-    // quasar.conf.js -> build -> vueRouterMode
-    // quasar.conf.js -> build -> publicPath
     history: createHistory(process.env.VUE_ROUTER_BASE),
   });
 
-  Router.beforeEach((to, from) => {
+  Router.beforeEach(async (to) => {
     const authStore = useAuthStore();
-    const isAuthenticated = authStore.isAuthenticated || !!localStorage.getItem('access_token');
+    const hasAccessToken = !!authStore.accessToken || !!localStorage.getItem('access_token');
+
+    // If we have a token on hand but the user object has not been hydrated
+    // yet (e.g. cold app start after F5), fetch it before letting the route
+    // resolve. This avoids the brief window where router thinks the user is
+    // authenticated but components see `currentUser=null`.
+    if (hasAccessToken && !authStore.currentUser) {
+      try {
+        await authStore.fetchUser();
+      } catch {
+        // axios interceptor will have cleared the session if refresh failed.
+        // Fall through to the guard below which will redirect to /login.
+      }
+    }
+
+    const isAuthenticated = !!authStore.currentUser;
 
     if (to.path !== '/login' && !isAuthenticated) {
       return '/login';
-    } else if (to.path === '/login' && isAuthenticated) {
+    }
+    if (to.path === '/login' && isAuthenticated) {
       return '/';
     }
-    
-    // If nothing gets returned (or true/undefined),
-    // the navigation proceeds as normal.
   });
 
   return Router;

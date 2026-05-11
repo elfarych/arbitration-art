@@ -1,5 +1,6 @@
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
+from rest_framework.exceptions import APIException
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
@@ -13,12 +14,17 @@ from apps.bots.api.serializers import (
 from apps.bots.models import (
     BotConfig,
     EmulationTrade,
+    LifecycleCommand,
     Trade,
     TraderRuntimeConfig,
     TraderRuntimeConfigError,
 )
 from apps.bots.permissions import ServiceTokenOnly, ServiceTokenWriteOrAuthenticatedRead, is_service_request
-from apps.bots.services.lifecycle import LifecycleSyncError, sync_bot_lifecycle
+from apps.bots.services.lifecycle import (
+    LifecycleSyncError,
+    check_bot_engine_health,
+    sync_bot_lifecycle,
+)
 from apps.bots.services.trader_runtime_shared import build_trader_runtime_payload
 from apps.bots.services.trader_runtime_info import (
     TraderRuntimeInfoError,
@@ -31,6 +37,27 @@ from apps.bots.services.trader_runtime_info import (
 )
 
 
+class EngineSyncError(APIException):
+    """502 wrapper for engine-side lifecycle failures.
+
+    Raised inline from perform_create/perform_update so that a write succeeds
+    in Django only after the engine has acknowledged the lifecycle command.
+    The BotConfig record is still persisted with sync_status=FAILED and a
+    populated last_sync_error so operators can retry without losing config.
+    """
+
+    status_code = status.HTTP_502_BAD_GATEWAY
+    default_detail = "Engine lifecycle sync failed."
+    default_code = "engine_sync_failed"
+
+
+def _dispatch_bot_lifecycle(bot_id: int, action: str) -> None:
+    try:
+        sync_bot_lifecycle(bot_id, action)
+    except LifecycleSyncError as exc:
+        raise EngineSyncError(detail=str(exc))
+
+
 class BotConfigViewSet(viewsets.ModelViewSet):
     """CRUD ViewSet for bot configurations."""
 
@@ -41,19 +68,56 @@ class BotConfigViewSet(viewsets.ModelViewSet):
         return BotConfig.objects.filter(owner=self.request.user)
 
     def perform_create(self, serializer: BotConfigSerializer) -> None:
-        serializer.save(owner=self.request.user)
+        # Inline lifecycle sync: the Django row exists only after the engine has
+        # acknowledged the START command (or the bot was created inactive, in
+        # which case no engine call is needed). This guarantees the operator
+        # sees an immediate, accurate 2xx vs 502 instead of a silently
+        # half-synced state from the deferred-signal approach.
+        instance: BotConfig = serializer.save(owner=self.request.user)
+        if instance.is_active:
+            _dispatch_bot_lifecycle(instance.id, LifecycleCommand.START)
 
     def perform_update(self, serializer: BotConfigSerializer) -> None:
-        serializer.save()
+        previous_is_active = bool(serializer.instance.is_active)
+        instance: BotConfig = serializer.save()
+        # Engine.startBot is idempotent: it either starts a new trader or
+        # forwards the new config to the existing one. Therefore a single
+        # START suffices for every active-bot transition (newly active, still
+        # active, config-only change). STOP is sent only when the bot moves
+        # to inactive — Engine.stop closes positions gracefully.
+        if instance.is_active:
+            _dispatch_bot_lifecycle(instance.id, LifecycleCommand.START)
+        elif previous_is_active:
+            _dispatch_bot_lifecycle(instance.id, LifecycleCommand.STOP)
+        # If the bot was already inactive and stays inactive, no engine call
+        # is needed: no in-memory runtime exists to mutate.
 
-    def perform_destroy(self, instance: BotConfig) -> None:
+    def destroy(self, request, *args, **kwargs):
+        instance: BotConfig = self.get_object()
+        # Stop the bot synchronously before removing the row. If the engine
+        # cannot confirm shutdown we refuse to delete — otherwise positions
+        # on the exchange would be orphaned with no way for the engine to
+        # rediscover them (Trade.bot becomes NULL on cascade and the recovery
+        # query filters by bot_id).
+        if instance.is_active:
+            try:
+                sync_bot_lifecycle(instance.id, LifecycleCommand.STOP)
+            except LifecycleSyncError as exc:
+                return Response(
+                    {"detail": str(exc)},
+                    status=status.HTTP_502_BAD_GATEWAY,
+                )
+            # Mark the in-memory instance as inactive so the pre_delete signal
+            # (the cascade/admin safety net) does not fire a second stop.
+            instance.is_active = False
         instance.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
     @action(detail=True, methods=["post"], url_path="force-close")
     def force_close(self, request, pk=None):
         bot = self.get_object()
         try:
-            sync_bot_lifecycle(bot.id, "force-close")
+            sync_bot_lifecycle(bot.id, LifecycleCommand.FORCE_CLOSE)
         except LifecycleSyncError as exc:
             return Response(
                 {"detail": str(exc)},
@@ -61,6 +125,23 @@ class BotConfigViewSet(viewsets.ModelViewSet):
             )
 
         return Response({"status": "force-close triggered"})
+
+    @action(detail=True, methods=["get"], url_path="engine-health")
+    def engine_health(self, request, pk=None):
+        """Probe the engine /health endpoint for this bot's service_url.
+
+        Frontend uses this to verify the engine is reachable before triggering
+        lifecycle actions, without side effects on engine state.
+        """
+        bot = self.get_object()
+        try:
+            payload = check_bot_engine_health(bot.service_url)
+        except LifecycleSyncError as exc:
+            return Response(
+                {"detail": str(exc)},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+        return Response(payload)
 
 
 class TraderRuntimeConfigViewSet(viewsets.ModelViewSet):

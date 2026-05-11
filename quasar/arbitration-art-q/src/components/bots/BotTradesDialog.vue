@@ -54,12 +54,13 @@
 </template>
 
 <script setup lang="ts">
-import { ref, watch, onMounted } from 'vue';
-import { botTradesApi, type EmulationTrade } from 'src/stores/bots/api/botConfig';
+import { ref, watch } from 'vue';
+import { botTradesApi, realTradesApi, type EmulationTrade, type RealTrade } from 'src/stores/bots/api/botConfig';
 
 const props = defineProps<{
   modelValue: boolean;
   botId: number;
+  tradeMode?: 'emulator' | 'real';
 }>();
 
 const emit = defineEmits<{
@@ -67,7 +68,7 @@ const emit = defineEmits<{
 }>();
 
 const internalValue = ref(props.modelValue);
-const trades = ref<EmulationTrade[]>([]);
+const trades = ref<(EmulationTrade | RealTrade)[]>([]);
 const loading = ref(false);
 
 const columns = [
@@ -93,7 +94,11 @@ watch(internalValue, (val) => {
 const fetchTrades = async () => {
   loading.value = true;
   try {
-    const list = await botTradesApi.list(props.botId);
+    // Pick the correct endpoint by bot trade mode. Defaults to emulation so
+    // existing callers without the prop keep working.
+    const list = props.tradeMode === 'real'
+      ? await realTradesApi.list({ botId: props.botId })
+      : await botTradesApi.list({ botId: props.botId });
     trades.value = list.sort((a, b) => new Date(b.opened_at).getTime() - new Date(a.opened_at).getTime());
   } catch (e) {
     console.error(e);

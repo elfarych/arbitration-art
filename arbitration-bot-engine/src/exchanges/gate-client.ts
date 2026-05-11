@@ -66,6 +66,15 @@ export class GateClient implements IExchangeClient {
     get ccxtInstance(): any {
         return {
             fetchTime: async () => Date.now(),
+            fetchTicker: async (symbol: string) => {
+                const gateSymbol = ccxtToGate(symbol);
+                const data = await this.request('GET', '/futures/usdt/tickers', { contract: gateSymbol });
+                const t = Array.isArray(data) ? data[0] : data;
+                return {
+                    last: Number(t?.last ?? 0),
+                    quoteVolume: Number(t?.volume_24h_quote ?? 0),
+                };
+            },
             fetchTickers: async () => {
                 // Gate tickers are converted to ccxt symbols so they align with
                 // the commonSymbols list and market info cache keys.
@@ -164,9 +173,14 @@ export class GateClient implements IExchangeClient {
     async setLeverage(symbol: string, leverage: number): Promise<void> {
         const gateSymbol = ccxtToGate(symbol);
         try {
+            // Gate v4 expects exactly one of these to be non-zero. `leverage`
+            // configures isolated margin; `cross_leverage_limit` configures
+            // cross. The engine intends isolated mode so cross_leverage_limit
+            // must be "0" — otherwise Gate may either reject the request or
+            // silently switch the position into cross mode.
             await this.request('POST', `/futures/usdt/positions/${gateSymbol}/leverage`, {
                 leverage: leverage.toString(),
-                cross_leverage_limit: leverage.toString()
+                cross_leverage_limit: '0',
             });
             logger.debug(TAG, `Leverage set to ${leverage}x for ${symbol}`);
         } catch (e: any) {
@@ -200,7 +214,7 @@ export class GateClient implements IExchangeClient {
     ): Promise<OrderResult> {
         const gateSymbol = ccxtToGate(symbol);
         const market = this.markets.get(gateSymbol);
-        
+
         if (!market) {
             throw new Error(`Market not loaded for ${symbol}`);
         }
@@ -208,19 +222,19 @@ export class GateClient implements IExchangeClient {
         // Convert base currency amount (for example BTC) to Gate contract count.
         const quantoMultiplier = Number(market.quanto_multiplier);
         let sizeInContracts = Math.round(amount / quantoMultiplier);
-        
+
         // Gate uses positive size for buy/long and negative size for sell/short.
         if (side === 'sell') {
             sizeInContracts = -sizeInContracts;
         }
 
-        logger.info(TAG, `Creating ${side} order for ${symbol}, amount (base): ${amount}, size (contracts): ${sizeInContracts}`);
+        logger.debug(TAG, `Creating ${side} order for ${symbol}, amount (base): ${amount}, size (contracts): ${sizeInContracts}`);
 
         const payload: any = {
             contract: gateSymbol,
             size: sizeInContracts,
-            price: "0", 
-            tif: "ioc" 
+            price: "0",
+            tif: "ioc"
         };
 
         if (params.reduceOnly) {
@@ -236,40 +250,21 @@ export class GateClient implements IExchangeClient {
 
         let filled = orderData;
         const orderId = orderData.id;
-
-        // Poll for final execution details because the initial Gate order
-        // response can show fill_price=0 or status=open right after submission.
-        let retries = 0;
         let avgPrice = parseFloat(filled.fill_price || '0');
-        
-        while ((avgPrice === 0 || filled.status === 'open') && retries < 5) {
-            await new Promise(r => setTimeout(r, 1000));
-            retries++;
+
+        // Fast single retry: most Gate IOC market orders fill before the POST
+        // returns, but the matching engine sometimes lags by a few hundred ms.
+        if ((avgPrice === 0 || filled.status === 'open') && orderId) {
+            await new Promise(r => setTimeout(r, 150));
             try {
                 const checked = await this.request('GET', `/futures/usdt/orders/${orderId}`);
                 if (checked) {
                     filled = checked;
                     avgPrice = parseFloat(filled.fill_price || '0');
                 }
-                if (avgPrice > 0 && filled.status !== 'open') break;
             } catch (e) {
-                // Ignore fetch errors during polling
+                // Ignore fetch errors during the quick retry.
             }
-        }
-
-        // Commission is extracted from Gate's native response (negative for paid fees in USDT)
-        let commission = 0;
-        try {
-            // Wait 500ms to ensure trades are flushed to db
-            await new Promise(r => setTimeout(r, 500));
-            const trades = await this.request('GET', '/futures/usdt/my_trades', { contract: gateSymbol, order: orderId });
-            if (Array.isArray(trades)) {
-                for (const t of trades) {
-                    commission += Math.abs(parseFloat(t.fee || '0'));
-                }
-            }
-        } catch (e: any) {
-            logger.warn(TAG, `Failed to extract trades for order ${orderId}, fee left 0: ${e.message}`);
         }
 
         // Compute actual filled base currency quantity
@@ -280,14 +275,42 @@ export class GateClient implements IExchangeClient {
             orderId: String(filled.id),
             avgPrice: avgPrice,
             filledQty: filledQty,
-            commission,
+            // Commission is backfilled asynchronously to keep this path fast.
+            commission: 0,
             commissionAsset: 'USDT',
-            status: filled.status === 'finished' ? 'closed' : filled.status, 
+            status: filled.status === 'finished' ? 'closed' : filled.status,
             raw: filled,
         };
 
-        logger.info(TAG, `Order filled: ${symbol} ${side} @ ${result.avgPrice}, qty: ${result.filledQty}, commission: ${result.commission}`);
+        logger.info(TAG, `Order placed: ${symbol} ${side} @ ${result.avgPrice}, qty: ${result.filledQty}, id=${result.orderId}`);
         return result;
+    }
+
+    async fetchOrderCommission(symbol: string, orderId: string): Promise<number> {
+        const gateSymbol = ccxtToGate(symbol);
+        // Gate's my_trades endpoint flushes a few hundred ms after fill. Retry
+        // with backoff before giving up.
+        const delays = [200, 400, 800, 1500];
+        for (let i = 0; i < delays.length; i++) {
+            try {
+                const trades = await this.request('GET', '/futures/usdt/my_trades', {
+                    contract: gateSymbol,
+                    order: orderId,
+                });
+                if (Array.isArray(trades) && trades.length > 0) {
+                    let commission = 0;
+                    for (const t of trades) {
+                        commission += Math.abs(parseFloat(t.fee || '0'));
+                    }
+                    return commission;
+                }
+            } catch (e: any) {
+                // continue retrying
+            }
+            await new Promise(r => setTimeout(r, delays[i]));
+        }
+        logger.warn(TAG, `Could not fetch commission for order ${orderId} after retries`);
+        return 0;
     }
 
     getMarketInfo(symbol: string): SymbolMarketInfo | null {

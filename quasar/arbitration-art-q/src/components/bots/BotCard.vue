@@ -4,13 +4,13 @@
     <q-card-section class="q-pb-none">
       <div class="row items-center justify-between q-mb-sm">
         <div class="row items-center">
-          <q-badge color="primary" class="q-mr-sm text-weight-bold" style="font-size: 13px">{{ bot.coin }}</q-badge>
+          <q-badge color="primary" class="q-mr-sm text-weight-bold" style="font-size: 13px">{{ coinDisplay }}</q-badge>
           <q-badge :color="bot.order_type === 'buy' ? 'positive' : 'negative'" text-color="dark" class="text-weight-bold q-mr-md" style="font-size: 11px">
-            {{ bot.order_type === 'buy' ? 'LONG' : 'SHORT' }}
+            {{ orderTypeLabel }}
           </q-badge>
-          <q-badge :color="bot.trade_mode === 'real' ? 'negative' : 'info'" 
-                   text-color="white" 
-                   class="text-weight-bolder q-py-xs q-px-sm shadow-1" 
+          <q-badge :color="bot.trade_mode === 'real' ? 'negative' : 'info'"
+                   text-color="white"
+                   class="text-weight-bolder q-py-xs q-px-sm shadow-1"
                    :class="bot.trade_mode === 'real' ? 'negative-glow' : ''"
                    style="font-size: 11px; letter-spacing: 0.5px; border: 1px solid rgba(255,255,255,0.2);">
             <q-icon :name="bot.trade_mode === 'real' ? 'local_fire_department' : 'science'" size="14px" class="q-mr-xs" />
@@ -23,7 +23,23 @@
           <div class="status-dot" :class="{ 'active-dot': bot.is_active }"></div>
         </div>
       </div>
-      
+
+      <!-- Engine sync status — surfaces engine availability/last failure -->
+      <div v-if="bot.is_active" class="row items-center q-gutter-x-sm q-mb-xs" style="font-size: 10px">
+        <q-badge
+          :color="engineBadgeColor"
+          text-color="white"
+          class="text-weight-bold"
+          style="font-size: 10px"
+        >
+          <q-icon :name="engineBadgeIcon" size="12px" class="q-mr-xs" />
+          Engine: {{ engineBadgeLabel }}
+        </q-badge>
+        <q-tooltip v-if="bot.last_sync_error" class="bg-negative text-white" max-width="320px">
+          {{ bot.last_sync_error }}
+        </q-tooltip>
+      </div>
+
       <!-- Exchanges -> Actions Display -->
       <div class="row items-center text-caption text-weight-bold bg-surface q-pa-xs border-radius-sm q-mb-xs">
          <div class="col-5">
@@ -55,7 +71,7 @@
             <q-skeleton type="rect" width="110px" height="12px" class="bg-grey-9 q-ml-auto" />
           </div>
         </div>
-        
+
         <q-skeleton type="rect" width="100%" height="120px" class="q-my-sm border-radius-sm bg-grey-9" />
 
         <q-skeleton type="rect" width="100%" height="124px" class="q-mt-sm border-radius-sm bg-grey-9" />
@@ -64,8 +80,8 @@
         <div class="row q-col-gutter-sm q-mb-md q-mt-xs">
           <div class="col-6">
             <!-- Entry Block -->
-            <div class="bg-dark q-pa-sm full-height border-radius-sm relative-position column justify-between" 
-                 :style="{ borderLeft: spreadStats.current.openSpread >= bot.entry_spread ? '3px solid #21ba45' : '3px solid rgba(255,255,255,0.1)', borderTop: '1px solid rgba(255,255,255,0.05)', borderRight: '1px solid rgba(255,255,255,0.05)', borderBottom: '1px solid rgba(255,255,255,0.05)' }">
+            <div class="bg-dark q-pa-sm full-height border-radius-sm relative-position column justify-between"
+                 :style="{ borderLeft: spreadStats.current.openSpread >= entrySpreadNum ? '3px solid #21ba45' : '3px solid rgba(255,255,255,0.1)', borderTop: '1px solid rgba(255,255,255,0.05)', borderRight: '1px solid rgba(255,255,255,0.05)', borderBottom: '1px solid rgba(255,255,255,0.05)' }">
               <div>
                 <div class="row justify-between items-center q-mb-xs">
                   <span class="opacity-70 text-weight-bold" style="font-size: 10px">ОТКРЫТИЕ ТРЕЙДА</span>
@@ -73,7 +89,7 @@
                     <q-icon name="help_outline" class="cursor-pointer opacity-50 hover-opacity-100" size="14px" @click="showSpreadHelp = true" />
                   </div>
                 </div>
-                <div class="text-h6 text-weight-bold" :class="spreadStats.current.openSpread >= bot.entry_spread ? 'text-positive' : 'text-white'" style="line-height: 1.2">
+                <div class="text-h6 text-weight-bold" :class="spreadStats.current.openSpread >= entrySpreadNum ? 'text-positive' : 'text-white'" style="line-height: 1.2">
                   {{ spreadStats.current.openSpread.toFixed(3) }}%
                 </div>
               </div>
@@ -121,26 +137,27 @@
             </div>
           </div>
         </div>
-        
-        <!-- NEW TRADE INFO BLOCK -->
+
+        <!-- Active trade summary (read-only — engine is the source of truth) -->
         <div class="bg-dark q-pa-sm full-width border-radius-sm relative-position q-mt-xs"
-             :style="{ minHeight: '48px', border: tradeState === 'in_trade' ? '1px solid rgba(242,192,55,0.4)' : '1px solid rgba(255,255,255,0.05)' }">
+             :style="{ minHeight: '48px', border: hasActiveTrade ? '1px solid rgba(242,192,55,0.4)' : '1px solid rgba(255,255,255,0.05)' }">
           <div class="row justify-between items-center">
             <div class="row items-center q-gutter-x-sm">
-              <q-badge color="transparent" class="text-weight-bold" :class="tradeState === 'in_trade' ? 'text-warning' : 'text-grey-6'" :style="{ fontSize: '10px', padding: '4px 6px', boxShadow: tradeState === 'in_trade' ? '0 0 0 1px rgba(242,192,55,0.4) inset' : '0 0 0 1px rgba(255,255,255,0.15) inset' }">
-                Статус: {{ tradeState === 'in_trade' ? 'В сделке' : 'Ожидание' }}
+              <q-badge color="transparent" class="text-weight-bold" :class="hasActiveTrade ? 'text-warning' : 'text-grey-6'" :style="{ fontSize: '10px', padding: '4px 6px', boxShadow: hasActiveTrade ? '0 0 0 1px rgba(242,192,55,0.4) inset' : '0 0 0 1px rgba(255,255,255,0.15) inset' }">
+                Статус: {{ hasActiveTrade ? 'В сделке' : 'Ожидание' }}
               </q-badge>
-              <q-badge color="transparent" class="text-weight-bold cursor-pointer hover-opacity-100" :class="tradesCount > 0 ? 'text-positive' : 'text-grey-6'" :style="{ fontSize: '10px', padding: '4px 6px', boxShadow: tradesCount > 0 ? '0 0 0 1px rgba(33,186,69,0.3) inset' : '0 0 0 1px rgba(255,255,255,0.15) inset' }" @click="showTradesHistory = true">
-                Трейдов: {{ tradesCount }}
+              <q-badge color="transparent" class="text-weight-bold cursor-pointer hover-opacity-100" :class="closedTradesCount > 0 ? 'text-positive' : 'text-grey-6'" :style="{ fontSize: '10px', padding: '4px 6px', boxShadow: closedTradesCount > 0 ? '0 0 0 1px rgba(33,186,69,0.3) inset' : '0 0 0 1px rgba(255,255,255,0.15) inset' }" @click="showTradesHistory = true">
+                Трейдов: {{ closedTradesCount }}
               </q-badge>
+              <q-spinner v-if="tradesLoading" color="primary" size="14px" />
             </div>
-            
-            <div v-if="tradeState === 'in_trade' && activeTrade && spreadStats?.current" class="row items-center q-gutter-x-md">
+
+            <div v-if="hasActiveTrade && spreadStats?.current" class="row items-center q-gutter-x-md">
               <div class="text-caption text-weight-bold" :class="currentPnL > 0 ? 'text-positive' : 'text-negative'" style="font-size: 11px">
                 PnL: {{ currentPnL > 0 ? '+' : '' }}{{ currentPnL.toFixed(3) }}%
               </div>
-              <q-btn flat round color="negative" size="sm" icon="close" @click="closeManual">
-                <q-tooltip class="bg-dark text-white border-radius-sm">Закрыть сделку вручную</q-tooltip>
+              <q-btn flat round color="negative" size="sm" icon="close" :loading="forceClosing" @click="confirmForceClose">
+                <q-tooltip class="bg-dark text-white border-radius-sm">Отправить engine команду force-close</q-tooltip>
               </q-btn>
             </div>
             <div v-else class="opacity-50" style="font-size: 11px">
@@ -148,7 +165,7 @@
             </div>
           </div>
         </div>
-        
+
         <SpreadChart :history="spreadStats.history" class="q-my-sm" />
 
         <!-- Info Table -->
@@ -158,7 +175,7 @@
             <div class="col-4 text-center" :class="spreadStats.insufficientExchanges?.includes(bot.primary_exchange) ? 'warning-glow' : 'opacity-50'">{{ formatExchange(bot.primary_exchange) }}</div>
             <div class="col-4 text-center" :class="spreadStats.insufficientExchanges?.includes(bot.secondary_exchange) ? 'warning-glow' : 'opacity-50'">{{ formatExchange(bot.secondary_exchange) }}</div>
           </div>
-          
+
           <!-- Открытие -->
           <div class="row q-mb-sm items-center">
             <div class="col-4 opacity-70" style="line-height: 1.1">Открытие<br><span style="font-size: 10px" class="opacity-50">Текущие цены</span></div>
@@ -194,7 +211,7 @@
           </div>
 
           <q-separator dark class="q-my-sm opacity-30" />
-          
+
           <template v-if="info?.primary && info?.secondary">
             <div class="row q-mb-xs">
               <div class="col-4 opacity-70">Funding</div>
@@ -228,18 +245,18 @@
       </div>
     </q-card-section>
 
-    <!-- Bot Config Stats -->
+    <!-- Amount input — read/display only; PATCH is debounced + locked while saving -->
     <q-card-section class="q-pt-none text-caption q-mt-sm">
-      <!-- Spread target stats moved to the top graph header -->
-
       <div class="q-mb-md">
-        <q-input 
-          v-model="displayAmount" 
-          type="text" 
-          dense 
-          outlined 
-          dark 
+        <q-input
+          v-model="displayAmount"
+          type="text"
+          dense
+          outlined
+          dark
           label="Количество"
+          :loading="amountSaving"
+          :disable="amountSaving"
           @focus="onFocusAmount"
           @blur="onBlurAmount"
           @update:model-value="amountInputChanged"
@@ -252,13 +269,6 @@
           </template>
         </q-input>
       </div>
-
-      <!-- <div class="row items-center justify-between">
-        <div class="text-weight-bold opacity-50">Направление сделки</div>
-        <div class="text-weight-bold" :class="bot.order_type === 'buy' ? 'text-positive' : 'text-negative'">
-          {{ bot.order_type === 'buy' ? 'LONG на Осн. бирже' : 'SHORT на Осн. бирже' }}
-        </div>
-      </div> -->
     </q-card-section>
 
     <!-- Actions -->
@@ -283,10 +293,10 @@
             Этот бот реализует <strong>межбиржевой арбитраж</strong>. Он <strong>одновременно открывает две встречные сделки</strong> на разных биржах: покупает монету там, где она дешевле, и тут же продает (шортит) там, где она дороже. Заработок формируется, когда цены на биржах "сближаются" (спред сужается).
           </p>
           <p class="q-mb-sm">
-            <strong class="text-positive">СПРЕД ВХОДА</strong> — прибыль (или разница), которую мы технически фиксируем при немедленном ударе в рынок (направление: "{{ bot.order_type === 'buy' ? 'LONG на основной бирже' : 'SHORT на основной бирже' }}"). Вы задали Цель в <strong>{{ bot.entry_spread }}%</strong>. Как только этот показатель достигнет или превысит вашу цель, бот отправит ордера на открытие позиций.
+            <strong class="text-positive">СПРЕД ВХОДА</strong> — прибыль (или разница), которую мы технически фиксируем при немедленном ударе в рынок (направление: "{{ bot.order_type === 'buy' ? 'LONG на основной бирже' : 'SHORT на основной бирже' }}"). Вы задали Цель в <strong>{{ entrySpreadNum }}%</strong>. Как только этот показатель достигнет или превысит вашу цель, бот отправит ордера на открытие позиций.
           </p>
           <p>
-            <strong class="text-negative">СПРЕД ВЫХОДА</strong> — текущее "отставание" или разница цен для обратного закрытия сделки. Изначально этот процент всегда отрицательный из-за комиссий и разницы между Ask и Bid (ведь мы покупаем дороже, а продаем дешевле). Бот ждет, пока цены сойдутся и спред выхода достигнет вашей Цели (<strong>{{ bot.exit_spread }}%</strong>), чтобы закрыть обе сделки в совокупный плюс.
+            <strong class="text-negative">СПРЕД ВЫХОДА</strong> — текущее "отставание" или разница цен для обратного закрытия сделки. Изначально этот процент всегда отрицательный из-за комиссий и разницы между Ask и Bid (ведь мы покупаем дороже, а продаем дешевле). Бот ждет, пока цены сойдутся и спред выхода достигнет вашей Цели (<strong>{{ exitSpreadNum }}%</strong>), чтобы закрыть обе сделки в совокупный плюс.
           </p>
           <p class="text-caption text-warning q-mt-md">
             * <strong>Важно про Объем:</strong> Данные графики — это не просто абстрактные идеальные цены лучших ордеров с биржи. Наша формула выгребает весь стакан заявок ("съедает" объемы) вплоть до достижения указанного вами <strong>Количества монет</strong>. Это дает вам кристально точный расчет спреда, уже включающий весь проскальзывающий убыток (slippage)!
@@ -295,14 +305,14 @@
       </q-card>
     </q-dialog>
 
-    <BotTradesDialog v-model="showTradesHistory" :botId="bot.id" />
+    <BotTradesDialog v-model="showTradesHistory" :botId="bot.id" :tradeMode="bot.trade_mode" />
   </q-card>
 </template>
 
 <script setup lang="ts">
 import { ref, watch, onMounted, onUnmounted, computed } from 'vue';
-import type { BotConfig, EmulationTrade } from 'src/stores/bots/api/botConfig';
-import { botTradesApi } from 'src/stores/bots/api/botConfig';
+import type { BotConfig, EmulationTrade, RealTrade } from 'src/stores/bots/api/botConfig';
+import { botTradesApi, realTradesApi } from 'src/stores/bots/api/botConfig';
 import { useSpreadMonitor, type SpreadStats } from 'src/stores/exchanges/spreadMonitor';
 import type { BotExchangeInfo } from 'src/stores/exchanges/api/exchangeInfo';
 import { useExchangesStore } from 'src/stores/exchanges/exchanges.store';
@@ -310,6 +320,7 @@ import { useBotsStore } from 'src/stores/bots/bots.store';
 import SpreadChart from './SpreadChart.vue';
 import BotTradesDialog from './BotTradesDialog.vue';
 import { useQuasar } from 'quasar';
+import { extractApiErrorMessage } from 'src/utils/apiError';
 
 const props = defineProps<{ bot: BotConfig }>();
 const emit = defineEmits<{
@@ -329,21 +340,65 @@ const spreadStats = ref<SpreadStats | undefined>();
 const info = ref<BotExchangeInfo | null>(null);
 const showSpreadHelp = ref(false);
 const showTradesHistory = ref(false);
+const forceClosing = ref(false);
 
-const tradesCount = ref(0);
-const tradeState = ref<'idle' | 'in_trade'>('idle');
-const activeTrade = ref<EmulationTrade | null>(null);
+// Trade state mirrored from Django — engine is the source of truth. Frontend
+// only displays what Django reports; it never opens or closes trades itself.
+type AnyTrade = EmulationTrade | RealTrade;
+const activeTrade = ref<AnyTrade | null>(null);
+const closedTradesCount = ref(0);
+const tradesLoading = ref(false);
+let tradesPollHandle: number | undefined;
+
 const maxOpenSpread = ref(-Infinity);
 const minCloseSpread = ref(Infinity);
 
 const exchangeLabels: Record<string, string> = {
   binance_futures: 'Binance Futures',
-  binance_spot: 'Binance Spot',
   bybit_futures: 'Bybit Futures',
+  gate_futures: 'Gate Futures',
   mexc_futures: 'Mexc Futures',
 };
-
 const formatExchange = (ex: string) => exchangeLabels[ex] || ex;
+
+const coinDisplay = computed(() => {
+  // BotConfig.coin is stored as ccxt format "BTC/USDT:USDT"; show the base
+  // ticker for compact card headers.
+  const match = /^([A-Z0-9]+)\/USDT:USDT$/i.exec(props.bot.coin);
+  return match?.[1] ?? props.bot.coin;
+});
+
+const orderTypeLabel = computed(() => {
+  if (props.bot.order_type === 'buy') return 'LONG';
+  if (props.bot.order_type === 'sell') return 'SHORT';
+  return 'AUTO';
+});
+
+const entrySpreadNum = computed(() => Number(props.bot.entry_spread));
+const exitSpreadNum = computed(() => Number(props.bot.exit_spread));
+
+const engineBadgeColor = computed(() => {
+  if (props.bot.sync_status === 'success' && props.bot.status === 'running') return 'positive';
+  if (props.bot.sync_status === 'pending') return 'info';
+  if (props.bot.sync_status === 'failed') return 'negative';
+  return 'grey';
+});
+const engineBadgeIcon = computed(() => {
+  if (props.bot.sync_status === 'success' && props.bot.status === 'running') return 'check_circle';
+  if (props.bot.sync_status === 'pending') return 'sync';
+  if (props.bot.sync_status === 'failed') return 'error';
+  return 'help_outline';
+});
+const engineBadgeLabel = computed(() => {
+  if (props.bot.sync_status === 'failed') return 'не отвечает';
+  if (props.bot.sync_status === 'pending') return 'синхронизация…';
+  if (props.bot.status === 'running') return 'работает';
+  if (props.bot.status === 'starting') return 'старт…';
+  if (props.bot.status === 'stopping') return 'остановка…';
+  if (props.bot.status === 'stopped') return 'остановлен';
+  if (props.bot.status === 'error') return 'ошибка';
+  return props.bot.status || 'неизвестно';
+});
 
 const formatCountdown = (timestamp: number) => {
   const diff = timestamp - Date.now();
@@ -354,28 +409,22 @@ const formatCountdown = (timestamp: number) => {
   return `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
 };
 
-let countdownInterval: number;
+let countdownInterval: number | undefined;
 const nextFundingTimePrimary = ref('00:00:00');
 const nextFundingTimeSecondary = ref('00:00:00');
 
-const localAmount = ref(props.bot.coin_amount);
+const localAmount = ref(Number(props.bot.coin_amount));
 const isAmountFocused = ref(false);
 
-const formatNum = (val: number) => {
-  return new Intl.NumberFormat('ru-RU', { maximumFractionDigits: 5 }).format(val);
-};
+const formatNum = (val: number) => new Intl.NumberFormat('ru-RU', { maximumFractionDigits: 8 }).format(val);
+const formatUsdt = (val: number) => new Intl.NumberFormat('ru-RU', { maximumFractionDigits: 0 }).format(val);
 
-const formatUsdt = (val: number) => {
-  return new Intl.NumberFormat('ru-RU', { maximumFractionDigits: 0 }).format(val);
-};
-
-const displayAmount = ref(formatNum(props.bot.coin_amount));
+const displayAmount = ref(formatNum(Number(props.bot.coin_amount)));
 
 const onFocusAmount = () => {
   isAmountFocused.value = true;
-  displayAmount.value = localAmount.value.toString();
+  displayAmount.value = String(localAmount.value);
 };
-
 const onBlurAmount = () => {
   isAmountFocused.value = false;
   displayAmount.value = formatNum(localAmount.value);
@@ -384,192 +433,184 @@ const onBlurAmount = () => {
 const amountInputChanged = (val: string | number | null) => {
   if (val === null) return;
   const parsed = parseFloat(val.toString().replace(/\s/g, '').replace(',', '.'));
-  if (!isNaN(parsed)) {
+  if (!isNaN(parsed) && parsed > 0) {
     localAmount.value = parsed;
     setAmount(props.bot.id, parsed);
     debouncedSaveAmount();
   }
 };
 
-let saveTimeout: number | undefined;
+const amountSaving = ref(false);
+let amountSaveTimeout: number | undefined;
+// Longer debounce for active bots: each PATCH triggers an inline engine sync
+// (up to SERVICE_LIFECYCLE_TIMEOUT_SECONDS × retries), so saving on every
+// keystroke is wasteful and slow.
+const AMOUNT_DEBOUNCE_MS = 4000;
 
 const debouncedSaveAmount = () => {
-  if (saveTimeout) clearTimeout(saveTimeout);
-  saveTimeout = window.setTimeout(async () => {
-    if (localAmount.value !== props.bot.coin_amount) {
-      const original = props.bot.coin_amount;
-      try {
-        await botsStore.updateBot(props.bot.id, { coin_amount: localAmount.value });
-        $q.notify({ color: 'positive', message: 'Количество сохранено', position: 'top-right', timeout: 1500 });
-      } catch (e) {
-        $q.notify({ color: 'negative', message: 'Ошибка при сохранении количества' });
-        localAmount.value = original;
-      }
+  if (amountSaveTimeout) clearTimeout(amountSaveTimeout);
+  amountSaveTimeout = window.setTimeout(async () => {
+    if (localAmount.value === Number(props.bot.coin_amount)) return;
+    const original = Number(props.bot.coin_amount);
+    amountSaving.value = true;
+    try {
+      await botsStore.updateBot(props.bot.id, { coin_amount: localAmount.value });
+      $q.notify({ color: 'positive', message: 'Количество сохранено', position: 'top-right', timeout: 1500 });
+    } catch (e) {
+      const message = extractApiErrorMessage(e, 'Ошибка при сохранении количества');
+      $q.notify({ color: 'negative', message });
+      localAmount.value = original;
+      displayAmount.value = formatNum(original);
+    } finally {
+      amountSaving.value = false;
     }
-  }, 2000);
+  }, AMOUNT_DEBOUNCE_MS);
 };
 
 watch(() => props.bot.coin_amount, (val) => {
-  localAmount.value = val;
+  const numeric = Number(val);
+  localAmount.value = numeric;
   if (!isAmountFocused.value) {
-    displayAmount.value = formatNum(val);
+    displayAmount.value = formatNum(numeric);
   }
 });
 
-const localEntrySpread = ref(Number(props.bot.entry_spread));
-const localExitSpread = ref(Number(props.bot.exit_spread));
+const localEntrySpread = ref(entrySpreadNum.value);
+const localExitSpread = ref(exitSpreadNum.value);
 
 let saveSettingsTimeout: number | undefined;
 const debouncedSaveSettings = () => {
   if (saveSettingsTimeout) clearTimeout(saveSettingsTimeout);
   saveSettingsTimeout = window.setTimeout(async () => {
-    if (localEntrySpread.value !== Number(props.bot.entry_spread) || localExitSpread.value !== Number(props.bot.exit_spread)) {
-      try {
-        await botsStore.updateBot(props.bot.id, { 
-          entry_spread: localEntrySpread.value, 
-          exit_spread: localExitSpread.value 
-        });
-        $q.notify({ color: 'positive', message: 'Спреды сохранены', position: 'top-right', timeout: 1500 });
-      } catch (e) {
-        $q.notify({ color: 'negative', message: 'Ошибка при сохранении спредов' });
-        localEntrySpread.value = Number(props.bot.entry_spread);
-        localExitSpread.value = Number(props.bot.exit_spread);
-      }
+    if (localEntrySpread.value === entrySpreadNum.value && localExitSpread.value === exitSpreadNum.value) return;
+    try {
+      await botsStore.updateBot(props.bot.id, {
+        entry_spread: localEntrySpread.value,
+        exit_spread: localExitSpread.value,
+      });
+      $q.notify({ color: 'positive', message: 'Спреды сохранены', position: 'top-right', timeout: 1500 });
+    } catch (e) {
+      const message = extractApiErrorMessage(e, 'Ошибка при сохранении спредов');
+      $q.notify({ color: 'negative', message });
+      localEntrySpread.value = entrySpreadNum.value;
+      localExitSpread.value = exitSpreadNum.value;
     }
   }, 1500);
 };
 
-watch(() => props.bot.entry_spread, (val) => localEntrySpread.value = Number(val));
-watch(() => props.bot.exit_spread, (val) => localExitSpread.value = Number(val));
+watch(entrySpreadNum, (val) => { localEntrySpread.value = val; });
+watch(exitSpreadNum, (val) => { localExitSpread.value = val; });
 
 watch(() => props.bot.order_type, (val) => {
   setOrderType(props.bot.id, val);
 });
 
-watch(() => spreadStats.value?.current?.openSpread, async (newVal) => {
+watch(() => spreadStats.value?.current?.openSpread, (newVal) => {
   if (newVal === undefined) return;
-  if (newVal > maxOpenSpread.value) {
-    maxOpenSpread.value = newVal;
-  }
-  if (props.bot.is_active && tradeState.value === 'idle' && newVal >= props.bot.entry_spread && !activeTrade.value) {
-    tradeState.value = 'in_trade';
-    try {
-      if (spreadStats.value?.current) {
-        activeTrade.value = await botTradesApi.create({
-          bot: props.bot.id,
-          amount: Number(Number(props.bot.coin_amount).toFixed(8)),
-          primary_open_price: Number(spreadStats.value.current.primaryExecPrice.toFixed(8)),
-          secondary_open_price: Number(spreadStats.value.current.secondaryExecPrice.toFixed(8)),
-          open_spread: Number(newVal.toFixed(4))
-        });
-      }
-    } catch (e) {
-      console.error(e);
-      tradeState.value = 'idle';
-    }
-  }
+  if (newVal > maxOpenSpread.value) maxOpenSpread.value = newVal;
 });
+
+watch(() => spreadStats.value?.current?.closeSpread, (newVal) => {
+  if (newVal === undefined) return;
+  if (newVal < minCloseSpread.value) minCloseSpread.value = newVal;
+});
+
+watch(() => [props.bot.entry_spread, props.bot.exit_spread, props.bot.coin], () => {
+  // Reset rolling stats when the bot config materially changes.
+  maxOpenSpread.value = -Infinity;
+  minCloseSpread.value = Infinity;
+});
+
+const hasActiveTrade = computed(() => activeTrade.value !== null && (activeTrade.value as AnyTrade).status === 'open');
 
 const currentPnL = computed(() => {
   if (!activeTrade.value || !spreadStats.value?.current) return 0;
+  const pOpen = Number(activeTrade.value.primary_open_price);
+  const sOpen = Number(activeTrade.value.secondary_open_price);
+  if (!pOpen || !sOpen) return 0;
   if (props.bot.order_type === 'buy') {
-    const profitUsdt = 
-      (activeTrade.value.secondary_open_price - activeTrade.value.primary_open_price) + 
+    const profitUsdt =
+      (sOpen - pOpen) +
       (spreadStats.value.primaryBid - spreadStats.value.secondaryAsk);
-    return (profitUsdt / activeTrade.value.primary_open_price) * 100;
-  } else {
-    const profitUsdt = 
-      (activeTrade.value.primary_open_price - activeTrade.value.secondary_open_price) + 
-      (spreadStats.value.secondaryBid - spreadStats.value.primaryAsk);
-    return (profitUsdt / activeTrade.value.secondary_open_price) * 100;
+    return (profitUsdt / pOpen) * 100;
   }
+  const profitUsdt =
+    (pOpen - sOpen) +
+    (spreadStats.value.secondaryBid - spreadStats.value.primaryAsk);
+  return (profitUsdt / sOpen) * 100;
 });
 
-watch(() => spreadStats.value?.current?.closeSpread, async (newVal) => {
-  if (newVal === undefined) return;
-  if (newVal < minCloseSpread.value) {
-    minCloseSpread.value = newVal;
-  }
-  if (tradeState.value === 'in_trade' && newVal <= props.bot.exit_spread && activeTrade.value) {
-    const profit = currentPnL.value;
-    const currentId = activeTrade.value.id;
-    
-    tradeState.value = 'idle';
-    activeTrade.value = null;
+// Polling configuration: Django returns lists by bot_id+status, so each card
+// makes two cheap queries every TRADE_POLL_MS. Engine writes trades into Django
+// asynchronously via api.openTrade / api.openEmulationTrade, so polling is
+// what the UI uses to mirror engine state. Lower bound keeps it responsive
+// without saturating the Django worker pool.
+const TRADE_POLL_MS = 5000;
 
-    try {
-      if (spreadStats.value?.current) {
-        const pClose = props.bot.order_type === 'buy' ? spreadStats.value.primaryBid : spreadStats.value.primaryAsk;
-        const sClose = props.bot.order_type === 'buy' ? spreadStats.value.secondaryAsk : spreadStats.value.secondaryBid;
-
-        await botTradesApi.close(currentId, {
-          status: 'closed',
-          primary_close_price: Number(pClose.toFixed(8)),
-          secondary_close_price: Number(sClose.toFixed(8)),
-          close_spread: Number(newVal.toFixed(4)),
-          profit_percentage: Number(profit.toFixed(4)),
-          closed_at: new Date().toISOString()
-        });
-        tradesCount.value++;
-      }
-    } catch (e) {
-      console.error(e);
-      // fallback or retry ideally, but for now log
-    }
-  }
-});
-
-const closeManual = async () => {
-  if (!activeTrade.value || tradeState.value !== 'in_trade' || !spreadStats.value?.current) return;
-  
-  const currentSpread = spreadStats.value.current.closeSpread;
-  const profit = currentPnL.value;
-  const currentId = activeTrade.value.id;
-  
-  tradeState.value = 'idle';
-  activeTrade.value = null;
-
+async function refreshTradeState(initial = false) {
+  if (initial) tradesLoading.value = true;
   try {
-    const pClose = props.bot.order_type === 'buy' ? spreadStats.value.primaryBid : spreadStats.value.primaryAsk;
-    const sClose = props.bot.order_type === 'buy' ? spreadStats.value.secondaryAsk : spreadStats.value.secondaryBid;
-
-    await botTradesApi.close(currentId, {
-      status: 'closed',
-      primary_close_price: Number(pClose.toFixed(8)),
-      secondary_close_price: Number(sClose.toFixed(8)),
-      close_spread: Number(currentSpread.toFixed(4)),
-      profit_percentage: Number(profit.toFixed(4)),
-      closed_at: new Date().toISOString()
-    });
-    tradesCount.value++;
-  } catch(e) {
-    console.error(e);
+    const params = { botId: props.bot.id } as const;
+    if (props.bot.trade_mode === 'real') {
+      const [openTrades, closedTrades] = await Promise.all([
+        realTradesApi.list({ ...params, status: 'open' }),
+        realTradesApi.list({ ...params, status: 'closed' }),
+      ]);
+      activeTrade.value = openTrades[0] ?? null;
+      closedTradesCount.value = closedTrades.length;
+    } else {
+      const [openTrades, closedTrades] = await Promise.all([
+        botTradesApi.list({ ...params, status: 'open' }),
+        botTradesApi.list({ ...params, status: 'closed' }),
+      ]);
+      activeTrade.value = openTrades[0] ?? null;
+      closedTradesCount.value = closedTrades.length;
+    }
+  } catch (e) {
+    if (initial) {
+      console.error('Failed to load trades for bot', props.bot.id, e);
+    }
+  } finally {
+    if (initial) tradesLoading.value = false;
   }
-};
+}
 
-watch(() => [props.bot.entry_spread, props.bot.exit_spread], () => {
-  tradesCount.value = 0;
-  tradeState.value = 'idle';
-  maxOpenSpread.value = -Infinity;
-  minCloseSpread.value = Infinity;
-  activeTrade.value = null;
-});
+function confirmForceClose() {
+  $q.dialog({
+    title: 'Закрыть сделку',
+    message: 'Отправить engine команду на закрытие текущей сделки?',
+    cancel: true,
+    persistent: true,
+    dark: true,
+    color: 'warning',
+  }).onOk(async () => {
+    forceClosing.value = true;
+    try {
+      await botsStore.forceCloseBot(props.bot.id);
+      $q.notify({ color: 'positive', message: 'Команда force-close отправлена' });
+      // Refresh shortly: engine close is async, give it a few seconds.
+      window.setTimeout(() => { void refreshTradeState(); }, 2000);
+    } catch (e) {
+      $q.notify({ color: 'negative', message: extractApiErrorMessage(e, 'Не удалось отправить команду') });
+    } finally {
+      forceClosing.value = false;
+    }
+  });
+}
 
 onMounted(async () => {
-  try {
-    const list = await botTradesApi.list(props.bot.id);
-    const openTrade = list.find(t => t.status === 'open');
-    if (openTrade) {
-      activeTrade.value = openTrade;
-      tradeState.value = 'in_trade';
-    }
-    tradesCount.value = list.filter(t => t.status === 'closed').length;
-  } catch (e) {
-    console.error('Failed to load emulation trades', e);
-  }
+  spreadStats.value = start(
+    props.bot.id,
+    coinDisplay.value,
+    props.bot.primary_exchange,
+    props.bot.secondary_exchange,
+    Number(props.bot.coin_amount),
+    props.bot.order_type,
+  );
+  info.value = await exchangesStore.fetchExchangeInfo(coinDisplay.value, props.bot.primary_exchange, props.bot.secondary_exchange);
 
-  spreadStats.value = start(props.bot.id, props.bot.coin, props.bot.primary_exchange, props.bot.secondary_exchange, props.bot.coin_amount, props.bot.order_type);
-  info.value = await exchangesStore.fetchExchangeInfo(props.bot.coin, props.bot.primary_exchange, props.bot.secondary_exchange);
+  await refreshTradeState(true);
+  tradesPollHandle = window.setInterval(() => { void refreshTradeState(); }, TRADE_POLL_MS);
 
   countdownInterval = window.setInterval(() => {
     if (info.value?.primary) nextFundingTimePrimary.value = formatCountdown(info.value.primary.nextFundingTimestamp);
@@ -579,7 +620,10 @@ onMounted(async () => {
 
 onUnmounted(() => {
   stop(props.bot.id);
-  window.clearInterval(countdownInterval);
+  if (countdownInterval) window.clearInterval(countdownInterval);
+  if (tradesPollHandle) window.clearInterval(tradesPollHandle);
+  if (amountSaveTimeout) window.clearTimeout(amountSaveTimeout);
+  if (saveSettingsTimeout) window.clearTimeout(saveSettingsTimeout);
 });
 </script>
 
@@ -621,7 +665,7 @@ onUnmounted(() => {
 .negative-glow
   box-shadow: 0 0 8px rgba(193, 0, 21, 0.6), 0 0 15px rgba(193, 0, 21, 0.4) !important
   animation: pulse-red 2s infinite
-  
+
 @keyframes pulse-red
   0%
     box-shadow: 0 0 0 0 rgba(193, 0, 21, 0.7)

@@ -7,46 +7,56 @@
       </q-card-section>
 
       <q-card-section class="q-pt-md">
+        <q-banner v-if="restrictedNotice" dense rounded class="bg-warning text-dark q-mb-md text-caption">
+          <q-icon name="warning" class="q-mr-xs" />
+          {{ restrictedNotice }}
+        </q-banner>
+
         <q-form @submit.prevent="onSubmit" class="bot-form">
-          
+
           <div class="grid-cols-2">
             <div>
-              <q-select 
-                v-model="form.primary_exchange" 
-                :options="exchangeOptions" 
-                label="Биржа основная" 
+              <q-select
+                v-model="form.primary_exchange"
+                :options="exchangeOptions"
+                label="Биржа основная"
                 outlined dense dark emit-value map-options
+                :disable="lockRestrictedFields"
                 :rules="[val => !!val || 'Обязательное поле']"
               />
             </div>
             <div>
-              <q-select 
-                v-model="form.secondary_exchange" 
-                :options="exchangeOptions" 
-                label="Биржа вторая" 
+              <q-select
+                v-model="form.secondary_exchange"
+                :options="exchangeOptions"
+                label="Биржа вторая"
                 outlined dense dark emit-value map-options
-                :rules="[val => !!val || 'Обязательное поле']"
+                :disable="lockRestrictedFields"
+                :rules="[val => !!val || 'Обязательное поле', val => val !== form.primary_exchange || 'Биржа должна отличаться от основной']"
               />
             </div>
           </div>
 
-          <!-- Валидация монеты -->
+          <!-- Coin (ccxt format: BTC/USDT:USDT) -->
           <div class="grid-cols-coin">
             <div>
-              <q-input 
-                v-model="form.coin" 
-                label="Монета (напр. BTC)" 
+              <q-input
+                v-model="coinBase"
+                label="Монета (напр. BTC)"
                 outlined dense dark
-                :rules="[val => !!val || 'Укажите монету']"
+                :disable="isEdit"
+                hint="Будет преобразовано в формат BTC/USDT:USDT"
+                :rules="[val => !!val || 'Укажите монету', val => /^[A-Z0-9]{1,15}$/.test((val || '').toString().toUpperCase()) || 'Только латиница и цифры, до 15 символов']"
+                @update:model-value="onCoinInput"
               />
             </div>
             <div>
-              <q-btn 
+              <q-btn
                 color="info" text-color="white" no-caps
-                label="Проверить" 
+                label="Проверить"
                 class="full-width q-mt-xs"
                 :loading="validating"
-                :disable="!form.coin || !form.primary_exchange || !form.secondary_exchange"
+                :disable="!coinBase || !form.primary_exchange || !form.secondary_exchange"
                 @click="validateCoin"
               />
             </div>
@@ -55,22 +65,30 @@
           <div v-if="validationResults.length > 0" class="validation-box q-pa-sm bg-surface border-radius-sm">
             <div v-for="(v, i) in validationResults" :key="i" class="validation-item q-mb-xs">
               <q-icon :name="v.exists ? 'check_circle' : 'cancel'" :color="v.exists ? 'positive' : 'negative'" class="q-mr-sm" size="xs" />
-              <span class="text-caption">{{ exchangeLabels[v.exchange] }}: <span class="text-weight-bold">{{ form.coin }}</span></span>
+              <span class="text-caption">{{ exchangeLabels[v.exchange] }}: <span class="text-weight-bold">{{ coinBase }}</span></span>
             </div>
           </div>
 
           <div class="grid-cols-2">
             <div>
-              <q-input v-model.number="form.entry_spread" type="number" step="0.001" label="Спред входа (%)" outlined dense dark :rules="[val => val !== null || 'Обязательно']" />
+              <q-input v-model.number="form.entry_spread" type="number" step="0.001" label="Спред входа (%)" outlined dense dark :rules="[val => val !== null && val !== '' || 'Обязательно']" />
             </div>
             <div>
-               <q-input v-model.number="form.exit_spread" type="number" step="0.001" label="Спред выхода (%)" outlined dense dark :rules="[val => val !== null || 'Обязательно']" />
+               <q-input v-model.number="form.exit_spread" type="number" step="0.001" label="Спред выхода (%)" outlined dense dark :rules="[val => val !== null && val !== '' || 'Обязательно']" />
             </div>
           </div>
 
           <div class="grid-cols-2">
             <div>
-              <q-input v-model.number="form.coin_amount" type="number" step="0.001" label="Кол-во монет (шт)" outlined dense dark :rules="[val => !!val || 'Обязательно']" @update:model-value="updateEstimated" autocomplete="off" />
+              <q-input
+                v-model.number="form.coin_amount"
+                type="number" step="0.00000001" min="0"
+                label="Кол-во монет (шт)"
+                outlined dense dark
+                :rules="[val => (val !== null && val > 0) || 'Должно быть больше 0']"
+                @update:model-value="updateEstimated"
+                autocomplete="off"
+              />
               <div v-if="estimatedUsdt > 0" class="text-caption text-positive q-mt-xs text-right">≈ {{ estimatedUsdt.toFixed(2) }} USDT margin</div>
             </div>
             <div>
@@ -80,10 +98,22 @@
 
           <div class="grid-cols-2">
             <div>
-              <q-input v-model.number="form.primary_leverage" type="number" :label="`Плечо ${exchangeLabels[form.primary_exchange] || '(осн)'}`" outlined dense dark />
+              <q-input
+                v-model.number="form.primary_leverage"
+                type="number"
+                :label="`Плечо ${exchangeLabels[form.primary_exchange] || '(осн)'}`"
+                outlined dense dark
+                :disable="lockRestrictedFields"
+              />
             </div>
              <div>
-              <q-input v-model.number="form.secondary_leverage" type="number" :label="`Плечо ${exchangeLabels[form.secondary_exchange] || '(вт)'}`" outlined dense dark />
+              <q-input
+                v-model.number="form.secondary_leverage"
+                type="number"
+                :label="`Плечо ${exchangeLabels[form.secondary_exchange] || '(вт)'}`"
+                outlined dense dark
+                :disable="lockRestrictedFields"
+              />
             </div>
           </div>
 
@@ -107,7 +137,7 @@
                 color="dark"
                 text-color="grey"
                 toggle-text-color="dark"
-                :disable="isEdit"
+                :disable="lockRestrictedFields"
                 :options="[
                   {label: 'Эмулятор', value: 'emulator'},
                   {label: 'Торговля', value: 'real'}
@@ -126,7 +156,8 @@
                 toggle-text-color="dark"
                 :options="[
                   {label: 'Покупка', value: 'buy'},
-                  {label: 'Продажа', value: 'sell'}
+                  {label: 'Продажа', value: 'sell'},
+                  {label: 'Авто', value: 'auto'}
                 ]"
               />
             </div>
@@ -145,9 +176,13 @@
 
           <q-toggle v-if="isEdit" v-model="form.is_active" label="Активен" color="primary" dark class="q-mt-md" />
 
+          <div v-if="serverError" class="text-negative q-mt-md text-caption">
+            <q-icon name="error_outline" class="q-mr-xs" /> {{ serverError }}
+          </div>
+
           <div class="dialog-actions border-top-dark">
             <q-btn flat no-caps label="Отмена" v-close-popup color="grey-3" />
-            <q-btn type="submit" no-caps :loading="saving" color="primary" text-color="white" label="Сохранить" :disable="!isCoinValid" />
+            <q-btn type="submit" no-caps :loading="saving" color="primary" text-color="white" label="Сохранить" :disable="!canSubmit" />
           </div>
 
         </q-form>
@@ -162,6 +197,7 @@ import type { BotConfig, BotConfigPayload } from 'src/stores/bots/api/botConfig'
 import { useBotsStore } from 'src/stores/bots/bots.store';
 import { useExchangesStore } from 'src/stores/exchanges/exchanges.store';
 import { useQuasar } from 'quasar';
+import { extractApiErrorMessage } from 'src/utils/apiError';
 
 const props = defineProps<{
   modelValue: boolean;
@@ -179,23 +215,37 @@ const exchangesStore = useExchangesStore();
 
 const isEdit = computed(() => !!props.bot);
 
+// Lock infrastructure-level fields while the bot is active. Django serializer
+// rejects in-place mutations to these fields when is_active=true; mirroring the
+// rule in the UI prevents 400 errors and gives the operator a clear instruction.
+const lockRestrictedFields = computed(() =>
+  isEdit.value && !!props.bot?.is_active && form.value.is_active !== false,
+);
+
+const restrictedNotice = computed(() => {
+  if (!lockRestrictedFields.value) return '';
+  return 'Остановите бота (Активен = выкл), чтобы менять биржу, режим или плечо. После сохранения активируйте снова.';
+});
+
+// Django BOT_EXCHANGE_CHOICES — engine has no spot client, so spot is not a
+// valid choice here.
 const exchangeOptions = [
   { label: 'Binance Futures', value: 'binance_futures' },
-  { label: 'Binance Spot', value: 'binance_spot' },
   { label: 'Bybit Futures', value: 'bybit_futures' },
-  { label: 'Mexc Futures', value: 'mexc_futures' }
+  { label: 'Gate Futures', value: 'gate_futures' },
+  { label: 'Mexc Futures', value: 'mexc_futures' },
 ];
 
 const exchangeLabels: Record<string, string> = {
   binance_futures: 'Binance Futures',
-  binance_spot: 'Binance Spot',
   bybit_futures: 'Bybit Futures',
-  mexc_futures: 'Mexc Futures'
+  gate_futures: 'Gate Futures',
+  mexc_futures: 'Mexc Futures',
 };
 
 const defaultForm: BotConfigPayload = {
   primary_exchange: 'binance_futures',
-  secondary_exchange: 'mexc_futures',
+  secondary_exchange: 'bybit_futures',
   coin: '',
   coin_amount: 0,
   entry_spread: 0,
@@ -209,36 +259,61 @@ const defaultForm: BotConfigPayload = {
   trade_on_secondary_exchange: true,
   max_trade_duration_minutes: 60,
   max_leg_drawdown_percent: 80.0,
-  is_active: true
+  is_active: true,
 };
 
 const form = ref<BotConfigPayload>({ ...defaultForm });
+// Coin is edited as a bare ticker ("BTC") and serialised to ccxt format
+// ("BTC/USDT:USDT") on submit to match Django's validate_coin regex.
+const coinBase = ref('');
+
+function ccxtSymbol(base: string): string {
+  return `${base.trim().toUpperCase()}/USDT:USDT`;
+}
+
+function baseFromCcxt(value: string): string {
+  const match = /^([A-Z0-9]{1,15})\/USDT:USDT$/i.exec(value || '');
+  return match?.[1]?.toUpperCase() ?? '';
+}
+
+const onCoinInput = (val: string | number | null) => {
+  const raw = (val ?? '').toString().toUpperCase();
+  coinBase.value = raw;
+  validationResults.value = [];
+};
 
 const validating = ref(false);
-const validationResults = ref<{exchange: string, exists: boolean}[]>([]);
-const isCoinValid = computed(() => {
-  // If not validated via button yet, assume true if edit, false if not?
-  // User should press Validate. Or we can just allow it if we are editing.
+const validationResults = ref<{ exchange: string; exists: boolean }[]>([]);
+const serverError = ref('');
+
+const isCoinValidated = computed(() => {
+  // Edits without re-running the validator can submit because Django will
+  // re-validate on the server side; for new bots we require the validation
+  // step so the operator notices typos early.
   if (isEdit.value && validationResults.value.length === 0) return true;
   return validationResults.value.length === 2 && validationResults.value.every(v => v.exists);
+});
+
+const canSubmit = computed(() => {
+  if (!coinBase.value) return false;
+  if (form.value.primary_exchange === form.value.secondary_exchange) return false;
+  return isCoinValidated.value;
 });
 
 const estimatedUsdt = ref(0);
 let priceCache = 0;
 
 const validateCoin = async () => {
-  if (!form.value.coin) return;
+  if (!coinBase.value) return;
   validating.value = true;
   validationResults.value = [];
-  
-  try {
-    const res = await exchangesStore.validateSymbol(form.value.coin, form.value.primary_exchange, form.value.secondary_exchange);
 
+  try {
+    const res = await exchangesStore.validateSymbol(coinBase.value, form.value.primary_exchange, form.value.secondary_exchange);
     validationResults.value = [
       { exchange: form.value.primary_exchange, exists: res.primaryExists },
-      { exchange: form.value.secondary_exchange, exists: res.secondaryExists }
+      { exchange: form.value.secondary_exchange, exists: res.secondaryExists },
     ];
-
     if (res.primaryExists && res.price) {
       priceCache = res.price;
       updateEstimated();
@@ -251,8 +326,9 @@ const validateCoin = async () => {
 };
 
 const updateEstimated = () => {
-  if (priceCache && form.value.coin_amount) {
-    estimatedUsdt.value = priceCache * form.value.coin_amount;
+  const amount = Number(form.value.coin_amount);
+  if (priceCache && amount) {
+    estimatedUsdt.value = priceCache * amount;
   } else {
     estimatedUsdt.value = 0;
   }
@@ -262,19 +338,25 @@ const saving = ref(false);
 
 const onSubmit = async () => {
   saving.value = true;
+  serverError.value = '';
   try {
+    const payload: BotConfigPayload = {
+      ...form.value,
+      coin: ccxtSymbol(coinBase.value),
+    };
     if (isEdit.value && props.bot) {
-      await botsStore.updateBot(props.bot.id, form.value);
+      await botsStore.updateBot(props.bot.id, payload);
       $q.notify({ color: 'positive', message: 'Бот успешно обновлен!' });
     } else {
-      form.value.coin = form.value.coin.toUpperCase();
-      await botsStore.createBot(form.value);
+      await botsStore.createBot(payload);
       $q.notify({ color: 'positive', message: 'Бот успешно создан!' });
     }
     emit('saved');
     emit('update:modelValue', false);
   } catch (e) {
-    $q.notify({ color: 'negative', message: 'Ошибка при сохранении' });
+    const message = extractApiErrorMessage(e, 'Ошибка при сохранении');
+    serverError.value = message;
+    $q.notify({ color: 'negative', message });
   } finally {
     saving.value = false;
   }
@@ -282,16 +364,35 @@ const onSubmit = async () => {
 
 // Sync form on open
 watch(() => props.modelValue, (isOpen) => {
-  if (isOpen) {
-    validationResults.value = [];
-    estimatedUsdt.value = 0;
-    priceCache = 0;
-    
-    if (props.bot) {
-      form.value = { ...props.bot };
-    } else {
-      form.value = { ...defaultForm };
-    }
+  if (!isOpen) return;
+  validationResults.value = [];
+  estimatedUsdt.value = 0;
+  priceCache = 0;
+  serverError.value = '';
+
+  if (props.bot) {
+    form.value = {
+      primary_exchange: props.bot.primary_exchange,
+      secondary_exchange: props.bot.secondary_exchange,
+      entry_spread: props.bot.entry_spread,
+      exit_spread: props.bot.exit_spread,
+      coin: props.bot.coin,
+      coin_amount: props.bot.coin_amount,
+      order_type: props.bot.order_type,
+      trade_mode: props.bot.trade_mode,
+      max_trades: props.bot.max_trades,
+      primary_leverage: props.bot.primary_leverage,
+      secondary_leverage: props.bot.secondary_leverage,
+      trade_on_primary_exchange: props.bot.trade_on_primary_exchange,
+      trade_on_secondary_exchange: props.bot.trade_on_secondary_exchange,
+      max_trade_duration_minutes: props.bot.max_trade_duration_minutes,
+      max_leg_drawdown_percent: props.bot.max_leg_drawdown_percent,
+      is_active: props.bot.is_active,
+    };
+    coinBase.value = baseFromCcxt(props.bot.coin) || props.bot.coin.toUpperCase();
+  } else {
+    form.value = { ...defaultForm };
+    coinBase.value = '';
   }
 });
 </script>

@@ -32,13 +32,18 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue';
+import { computed } from 'vue';
 import { useRouter } from 'vue-router';
 import { useAuthStore } from 'stores/auth';
 
 const router = useRouter();
 const authStore = useAuthStore();
-const loadingUser = ref(true);
+
+// Router guard already hydrates currentUser before navigation resolves, so by
+// the time MainLayout renders we either have the user or the guard has
+// redirected to /login. The spinner branch stays only as defensive UI for
+// transient post-login navigation.
+const loadingUser = computed(() => !authStore.currentUser);
 
 const userInitials = computed(() => {
   const email = authStore.currentUser?.email;
@@ -48,18 +53,6 @@ const userInitials = computed(() => {
 const goToProfile = () => {
   router.push('/profile');
 };
-
-onMounted(async () => {
-  if (!authStore.currentUser) {
-    try {
-      await authStore.fetchUser();
-    } catch (e) {
-      // If fetching fails, interceptors will likely handle 401 redirect
-      console.warn('Failed to load user profile');
-    }
-  }
-  loadingUser.value = false;
-});
 </script>
 
 <style lang="sass" scoped>

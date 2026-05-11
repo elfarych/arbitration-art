@@ -45,6 +45,14 @@ export const api = {
         }
     },
 
+    async updateTrade(id: number, payload: Record<string, any>): Promise<TradeRecord> {
+        // Partial PATCH used by the engine to backfill open/close commission and
+        // recomputed PnL after the synchronous trade write. Failures are surfaced
+        // to the caller so background tasks can log and move on.
+        const { data } = await client.patch(`/bots/real-trades/${id}/`, payload);
+        return data;
+    },
+
     async getOpenTrades(botId: number): Promise<TradeRecord[]> {
         try {
             const { data } = await client.get('/bots/real-trades/', {
@@ -78,6 +86,12 @@ export const api = {
             logger.error(TAG, `closeEmulationTrade failed: ${e.message}`);
             throw e;
         }
+    },
+
+    async updateEmulationTrade(id: number, payload: Record<string, any>): Promise<TradeRecord> {
+        // Symmetric to updateTrade for emulation trades.
+        const { data } = await client.patch(`/bots/trades/${id}/`, payload);
+        return data;
     },
 
     async getOpenEmulationTrades(botId: number): Promise<TradeRecord[]> {

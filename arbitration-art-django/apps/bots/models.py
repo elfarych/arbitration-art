@@ -151,6 +151,16 @@ class BotConfig(models.Model):
         verbose_name = "bot configuration"
         verbose_name_plural = "bot configurations"
         ordering = ["-created_at"]
+        constraints = [
+            # Both legs of an arbitrage pair must be on different exchanges.
+            # Without this constraint an operator could accidentally configure a
+            # bot watching the same orderbook twice (spread always 0, no trades)
+            # — a silent misconfiguration in a real-money product.
+            models.CheckConstraint(
+                condition=~Q(primary_exchange=F("secondary_exchange")),
+                name="bot_config_distinct_exchanges",
+            ),
+        ]
 
     def __str__(self) -> str:
         return f"{self.coin} | {self.primary_exchange} → {self.secondary_exchange}"
@@ -472,11 +482,15 @@ class Trade(models.Model):
     open_spread = models.DecimalField("open spread", max_digits=10, decimal_places=4)
     open_commission = models.DecimalField(
         "total open commission (USDT)",
-        max_digits=12,
+        max_digits=18,
         decimal_places=6,
         default=0,
     )
-    opened_at = models.DateTimeField("opened at", auto_now_add=True)
+    # opened_at is not auto_now_add: the engine fixes the timestamp at the moment
+    # both legs are confirmed filled, before the DB write completes. Letting the
+    # client supply it keeps Django's record aligned with on-exchange reality and
+    # with the timeout window the engine enforces in-memory.
+    opened_at = models.DateTimeField("opened at", default=timezone.now)
 
     # Close details — actual data from exchange responses
     primary_close_price = models.DecimalField(
@@ -504,13 +518,13 @@ class Trade(models.Model):
     )
     close_commission = models.DecimalField(
         "total close commission (USDT)",
-        max_digits=12,
+        max_digits=18,
         decimal_places=6,
         null=True,
         blank=True,
     )
     profit_usdt = models.DecimalField(
-        "profit (USDT)", max_digits=12, decimal_places=6, null=True, blank=True
+        "profit (USDT)", max_digits=18, decimal_places=6, null=True, blank=True
     )
     profit_percentage = models.DecimalField(
         "profit (%)", max_digits=10, decimal_places=4, null=True, blank=True

@@ -95,10 +95,10 @@ export interface TradeOpenPayload {
 
 export interface TradeClosePayload {
     status: 'closed' | 'force_closed';
-    // This should stay aligned with Django Trade.CloseReason choices. At the
-    // moment BotTrader can produce some engine-only reasons and then map them
-    // before sending real-trade payloads.
-    close_reason: 'profit' | 'timeout' | 'shutdown' | 'error' | 'liquidation';
+    // Must match Django's Trade.CloseReason TextChoices exactly. BotTrader
+    // produces a wider set of internal reasons (liquidation, force_close) and
+    // maps them down to this set before sending the payload.
+    close_reason: 'profit' | 'timeout' | 'manual' | 'shutdown' | 'error';
     primary_close_price: number;
     secondary_close_price: number;
     primary_close_order_id: string;

@@ -71,6 +71,15 @@ export class BinanceClient implements IExchangeClient {
                 const res = await this.request('GET', '/fapi/v1/time', {}, false);
                 return res.serverTime;
             },
+            fetchTicker: async (symbol: string) => {
+                // Used for single-symbol bootstrap to avoid fetching all tickers.
+                const binanceSymbol = ccxtToBinance(symbol);
+                const data = await this.request('GET', '/fapi/v1/ticker/24hr', { symbol: binanceSymbol }, false);
+                return {
+                    last: Number(data?.lastPrice ?? 0),
+                    quoteVolume: Number(data?.quoteVolume ?? 0),
+                };
+            },
             fetchTickers: async () => {
                 // MarketInfoService uses last prices to size trades and detect
                 // ticker collisions across exchanges.
@@ -234,13 +243,13 @@ export class BinanceClient implements IExchangeClient {
         params: any = {},
     ): Promise<OrderResult> {
         const binanceSymbol = ccxtToBinance(symbol);
-        
-        logger.info(TAG, `Creating ${side} order for ${symbol}, amount: ${amount}`);
+
+        logger.debug(TAG, `Creating ${side} order for ${symbol}, amount: ${amount}`);
 
         // Construct formatting for Binance (usually accepts up to 5-6 digits or raw number strings)
         // precision truncating is handled by Trader.ts before being passed here
         const quantityStr = Number(amount).toFixed(10).replace(/\.?0+$/, '');
-        
+
         const orderParams: any = {
             symbol: binanceSymbol,
             side: side.toUpperCase(),
@@ -252,6 +261,11 @@ export class BinanceClient implements IExchangeClient {
             orderParams.reduceOnly = 'true';
         }
 
+        // newOrderRespType=RESULT makes Binance compute avgPrice / executedQty
+        // synchronously before responding, which eliminates the 500ms followup
+        // poll in the common case.
+        orderParams.newOrderRespType = 'RESULT';
+
         let orderData;
         try {
             orderData = await this.request('POST', '/fapi/v1/order', orderParams);
@@ -262,11 +276,15 @@ export class BinanceClient implements IExchangeClient {
         let filled = orderData;
         const orderId = orderData.orderId;
 
-        // DB Lag fallback: give exchange matching engine 500ms to calculate fills before fetching
         let avgPrice = parseFloat(filled.avgPrice || filled.price || '0');
-        
-        if (avgPrice === 0 || filled.status !== 'FILLED') {
-            await new Promise(r => setTimeout(r, 500));
+        const isTerminal = (s: string | undefined) => s === 'FILLED' || s === 'PARTIALLY_FILLED' || s === 'EXPIRED' || s === 'REJECTED' || s === 'CANCELED';
+
+        // Fast single retry: market orders are usually filled by the time the
+        // POST returns, but newly-submitted orders can briefly report status NEW
+        // with avgPrice=0. A short 100ms retry covers exchange matching-engine
+        // lag without adding significant latency to the hot path.
+        if (avgPrice === 0 || !isTerminal(filled.status)) {
+            await new Promise(r => setTimeout(r, 100));
             try {
                 const checked = await this.request('GET', '/fapi/v1/order', {
                     symbol: binanceSymbol,
@@ -281,50 +299,58 @@ export class BinanceClient implements IExchangeClient {
             }
         }
 
-        // Commission extraction using User Trades. The initial order response can
-        // omit final fee details, especially immediately after a market fill.
-        let commission = 0;
-        try {
-            // Wait 500ms to ensure trades are flushed to db
-            await new Promise(r => setTimeout(r, 500));
-            
-            const trades = await this.request('GET', '/fapi/v1/userTrades', {
-                symbol: binanceSymbol,
-                orderId: orderId
-            });
-
-            if (Array.isArray(trades)) {
-                for (const t of trades) {
-                    const fee = parseFloat(t.commission || '0');
-                    if (t.commissionAsset === 'BNB') {
-                        // Calculate USD equivalent fallback at the time of trade
-                        // (Usually the bot wants to report strictly in USDT, CCXT applied a hardcoded BNB rate factor)
-                        // If they pay in BNB, the discount fee is usually calculated based on the trade volume
-                        const notional = parseFloat(t.price || '0') * parseFloat(t.qty || '0');
-                        commission += (notional * 0.00045); // Approximate 0.045% VIP0 taker rate with BNB discount
-                    } else {
-                        // USDT, BUSD or USDC fees are treated as quote-currency
-                        // equivalents for Django reporting.
-                        commission += Math.abs(fee);
-                    }
-                }
-            }
-        } catch (e: any) {
-            logger.warn(TAG, `Failed to extract trades for order ${orderId}, fee left 0: ${e.message}`);
-        }
-
         const result: OrderResult = {
             orderId: String(filled.orderId),
             avgPrice: avgPrice,
             filledQty: parseFloat(filled.executedQty || '0') || amount,
-            commission: commission,
+            // Commission is intentionally not fetched here. Use
+            // fetchOrderCommission off the hot path to backfill it in Django.
+            commission: 0,
             commissionAsset: 'USDT',
-            status: filled.status === 'FILLED' ? 'closed' : filled.status?.toLowerCase(),
+            status: filled.status === 'FILLED' ? 'closed' : (filled.status?.toLowerCase() || 'unknown'),
             raw: filled,
         };
 
-        logger.info(TAG, `Order filled: ${symbol} ${side} @ ${result.avgPrice}, qty: ${result.filledQty}, commission: ${result.commission} USDT`);
+        logger.info(TAG, `Order placed: ${symbol} ${side} @ ${result.avgPrice}, qty: ${result.filledQty}, id=${result.orderId}`);
         return result;
+    }
+
+    async fetchOrderCommission(symbol: string, orderId: string): Promise<number> {
+        // Binance flushes userTrades a few hundred ms after the order completes.
+        // Retry with backoff so a temporarily missing trade list does not lose
+        // commission data.
+        const binanceSymbol = ccxtToBinance(symbol);
+        const delays = [200, 400, 800, 1500];
+        for (let i = 0; i < delays.length; i++) {
+            try {
+                const trades = await this.request('GET', '/fapi/v1/userTrades', {
+                    symbol: binanceSymbol,
+                    orderId: orderId,
+                });
+                if (Array.isArray(trades) && trades.length > 0) {
+                    let commission = 0;
+                    for (const t of trades) {
+                        const fee = parseFloat(t.commission || '0');
+                        if (t.commissionAsset === 'BNB') {
+                            // Approximate BNB-fee USDT equivalent without a separate
+                            // price call. Real users should ideally report USDT-margin
+                            // fees instead; this estimate keeps Django totals close
+                            // enough for PnL accounting.
+                            const notional = parseFloat(t.price || '0') * parseFloat(t.qty || '0');
+                            commission += notional * 0.00045;
+                        } else {
+                            commission += Math.abs(fee);
+                        }
+                    }
+                    return commission;
+                }
+            } catch (e: any) {
+                // continue retrying
+            }
+            await new Promise(r => setTimeout(r, delays[i]));
+        }
+        logger.warn(TAG, `Could not fetch commission for order ${orderId} after retries`);
+        return 0;
     }
 
     getMarketInfo(symbol: string): SymbolMarketInfo | null {

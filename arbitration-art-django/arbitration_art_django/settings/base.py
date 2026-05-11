@@ -21,7 +21,14 @@ env = environ.Env(
     TIME_ZONE=(str, "Asia/Almaty"),
     BOT_ENGINE_SERVICE_URL_DEFAULT=(str, "http://127.0.0.1:3001"),
     SERVICE_SHARED_TOKEN=(str, ""),
-    SERVICE_REQUEST_TIMEOUT_SECONDS=(int, 90),
+    # SERVICE_REQUEST_TIMEOUT_SECONDS is kept as a fallback used by the
+    # standalone trader runtime info client. Lifecycle commands now use
+    # action-specific timeouts below so cosmetic edits (SYNC) cannot block a
+    # worker as long as a START/STOP that has to load markets and configure
+    # leverage on the engine side.
+    SERVICE_REQUEST_TIMEOUT_SECONDS=(int, 30),
+    SERVICE_LIFECYCLE_TIMEOUT_SECONDS=(int, 30),
+    SERVICE_SYNC_TIMEOUT_SECONDS=(int, 5),
     SERVICE_REQUEST_RETRIES=(int, 3),
     SERVICE_REQUEST_RETRY_DELAY_SECONDS=(int, 1),
 )
@@ -133,7 +140,7 @@ REST_FRAMEWORK = {
     "DEFAULT_PERMISSION_CLASSES": [
         "rest_framework.permissions.IsAuthenticated",
     ],
-    "DEFAULT_PAGINATION_CLASS": "rest_framework.pagination.PageNumberPagination",
+    "DEFAULT_PAGINATION_CLASS": "apps.bots.api.pagination.StandardPagination",
     "PAGE_SIZE": 20,
     "DEFAULT_RENDERER_CLASSES": [
         "rest_framework.renderers.JSONRenderer",
@@ -155,5 +162,7 @@ SIMPLE_JWT = {
 BOT_ENGINE_SERVICE_URL_DEFAULT = env("BOT_ENGINE_SERVICE_URL_DEFAULT")
 SERVICE_SHARED_TOKEN = env("SERVICE_SHARED_TOKEN")
 SERVICE_REQUEST_TIMEOUT_SECONDS = env("SERVICE_REQUEST_TIMEOUT_SECONDS")
+SERVICE_LIFECYCLE_TIMEOUT_SECONDS = env("SERVICE_LIFECYCLE_TIMEOUT_SECONDS")
+SERVICE_SYNC_TIMEOUT_SECONDS = env("SERVICE_SYNC_TIMEOUT_SECONDS")
 SERVICE_REQUEST_RETRIES = env("SERVICE_REQUEST_RETRIES")
 SERVICE_REQUEST_RETRY_DELAY_SECONDS = env("SERVICE_REQUEST_RETRY_DELAY_SECONDS")

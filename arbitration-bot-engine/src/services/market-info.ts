@@ -29,20 +29,41 @@ export class MarketInfoService {
     ): Promise<string[]> {
         logger.info(TAG, `Initializing market info for ${commonSymbols.length} symbols...`);
 
-        // Fetch current prices to calculate static trade amounts and protect from ticker collisions
-        let currentPrices: Record<string, number> = {};
-        let secondaryPrices: Record<string, number> = {};
+        // Fetch current prices to calculate static trade amounts and protect from ticker collisions.
+        // For a single-symbol bot we use fetchTicker(symbol) which is one cheap REST call per
+        // exchange; the previous fetchTickers() pulled thousands of tickers and added several
+        // seconds to bot startup.
+        const currentPrices: Record<string, number> = {};
+        const secondaryPrices: Record<string, number> = {};
         try {
             logger.info(TAG, `Fetching current prices for amount calculation and collision protection...`);
-            const [pTickers, sTickers] = await Promise.all([
-                primaryClient.ccxtInstance.fetchTickers(),
-                secondaryClient.ccxtInstance.fetchTickers()
-            ]);
-            for (const sym of commonSymbols) {
-                // ccxt symbols are used as stable keys throughout the engine,
-                // even when a REST client internally uses native exchange IDs.
-                if (pTickers[sym]?.last) currentPrices[sym] = pTickers[sym].last;
-                if (sTickers[sym]?.last) secondaryPrices[sym] = sTickers[sym].last;
+            if (commonSymbols.length === 1) {
+                const symbol = commonSymbols[0];
+                const fetchOne = async (client: IExchangeClient): Promise<{ last?: number } | null> => {
+                    const inst = client.ccxtInstance as any;
+                    if (typeof inst.fetchTicker === 'function') {
+                        return await inst.fetchTicker(symbol);
+                    }
+                    const all = await inst.fetchTickers();
+                    return all?.[symbol] ?? null;
+                };
+                const [pTicker, sTicker] = await Promise.all([
+                    fetchOne(primaryClient),
+                    fetchOne(secondaryClient),
+                ]);
+                if (pTicker?.last) currentPrices[symbol] = Number(pTicker.last);
+                if (sTicker?.last) secondaryPrices[symbol] = Number(sTicker.last);
+            } else {
+                const [pTickers, sTickers] = await Promise.all([
+                    primaryClient.ccxtInstance.fetchTickers(),
+                    secondaryClient.ccxtInstance.fetchTickers(),
+                ]);
+                for (const sym of commonSymbols) {
+                    // ccxt symbols are used as stable keys throughout the engine,
+                    // even when a REST client internally uses native exchange IDs.
+                    if (pTickers[sym]?.last) currentPrices[sym] = pTickers[sym].last;
+                    if (sTickers[sym]?.last) secondaryPrices[sym] = sTickers[sym].last;
+                }
             }
         } catch (e: any) {
             logger.warn(TAG, `Could not fetch tickers for exact amounts/collisions: ${e.message}`);
@@ -84,9 +105,11 @@ export class MarketInfoService {
             }
 
             if (currentPrice) {
-                // tradeAmountUsdt is intended to be a fixed notional budget per
-                // trade. The current config.ts does not define it yet, which is
-                // one reason the project currently fails TypeScript compilation.
+                // tradeAmountUsdt is a per-bot fallback notional budget used only
+                // when the bot config does not provide an explicit coin_amount.
+                // BotTrader.checkSpreads still recomputes the amount per-tick from
+                // the live orderbook price, so this value mainly drives the
+                // tradeable/minimum-size pre-check.
                 const rawAmount = config.tradeAmountUsdt / currentPrice;
                 // Round DOWN to step size
                 tradeAmount = Math.floor(rawAmount / stepSize) * stepSize;

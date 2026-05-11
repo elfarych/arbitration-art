@@ -23,13 +23,26 @@ export interface IExchangeClient {
     /** Set margin mode to isolated for a specific symbol */
     setIsolatedMargin(symbol: string): Promise<void>;
 
-    /** Place a market order */
+    /**
+     * Place a market order. Returns as soon as the exchange acknowledges the
+     * fill with orderId + avgPrice + filledQty. Commission is NOT fetched here
+     * because that would block the latency-critical execution path; use
+     * fetchOrderCommission afterwards (typically as a background task).
+     */
     createMarketOrder(
         symbol: string,
         side: 'buy' | 'sell',
         amount: number,
         params?: any,
     ): Promise<OrderResult>;
+
+    /**
+     * Fetch the realized commission (in USDT equivalent) for a previously placed
+     * order. Implementations should retry briefly because exchange fee endpoints
+     * may lag behind the order itself by hundreds of milliseconds. Returns 0 if
+     * the commission cannot be determined.
+     */
+    fetchOrderCommission(symbol: string, orderId: string): Promise<number>;
 
     /** Get market info (lot sizes, precision, etc.) for a symbol */
     getMarketInfo(symbol: string): SymbolMarketInfo | null;
