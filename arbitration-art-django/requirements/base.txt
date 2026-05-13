@@ -7,3 +7,7 @@ requests>=2.32,<3.0
 
 # PostgreSQL
 psycopg[binary]>=3.2,<4.0
+
+# Static files served directly from gunicorn/wsgi process (no nginx in front).
+# brotli extra adds the optional Brotli wheel for better compression than gzip.
+whitenoise[brotli]>=6.7,<7.0

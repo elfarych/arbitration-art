@@ -58,6 +58,10 @@ INSTALLED_APPS = [
 
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
+    # WhiteNoise serves /static/ directly from the WSGI/gunicorn process so we
+    # don't need an external nginx in front of Django just for static assets.
+    # Must sit immediately after SecurityMiddleware per WhiteNoise docs.
+    "whitenoise.middleware.WhiteNoiseMiddleware",
     "corsheaders.middleware.CorsMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
@@ -122,6 +126,18 @@ STATIC_ROOT = BASE_DIR / "staticfiles"
 
 MEDIA_URL = "media/"
 MEDIA_ROOT = BASE_DIR / "media"
+
+# Use WhiteNoise's manifest+compressed backend so collectstatic emits hashed,
+# pre-gzipped/brotlied copies that WhiteNoise can stream with long-cache
+# headers. Hashed filenames give us cache busting on every release.
+STORAGES = {
+    "default": {
+        "BACKEND": "django.core.files.storage.FileSystemStorage",
+    },
+    "staticfiles": {
+        "BACKEND": "whitenoise.storage.CompressedManifestStaticFilesStorage",
+    },
+}
 
 
 # Default primary key field type
