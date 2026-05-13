@@ -22,6 +22,37 @@ export type ExchangeKeysPayload = Partial<{
   mexc_secret: string;
 }>;
 
+export interface ExchangeCheckResult {
+  name: string;
+  ok: boolean;
+  detail: string;
+}
+
+export interface ExchangeConnectionTestResult {
+  ok: boolean;
+  exchange: ExchangeId;
+  checks: ExchangeCheckResult[];
+  error: string;
+}
+
+export interface ExchangeTradeTestResult {
+  success: boolean;
+  exchange: ExchangeId;
+  symbol: string;
+  margin_usd: number;
+  leverage: number;
+  quantity: number;
+  open_price: number;
+  close_price: number;
+  open_latency_ms: number;
+  close_latency_ms: number;
+  realized_pnl_usdt: number;
+  open_order_id: string;
+  close_order_id: string;
+  error: string;
+  steps: ExchangeCheckResult[];
+}
+
 export const exchangeKeysApi = {
   async get(): Promise<ExchangeKeysState> {
     const { data } = await api.get<ExchangeKeysState>('/auth/exchange-keys/');
@@ -30,6 +61,20 @@ export const exchangeKeysApi = {
 
   async update(payload: ExchangeKeysPayload): Promise<ExchangeKeysState> {
     const { data } = await api.patch<ExchangeKeysState>('/auth/exchange-keys/', payload);
+    return data;
+  },
+
+  async testConnection(exchange: ExchangeId): Promise<ExchangeConnectionTestResult> {
+    const { data } = await api.post<ExchangeConnectionTestResult>(
+      `/auth/exchange-keys/${exchange}/test-connection/`,
+    );
+    return data;
+  },
+
+  async testTrade(exchange: ExchangeId): Promise<ExchangeTradeTestResult> {
+    const { data } = await api.post<ExchangeTradeTestResult>(
+      `/auth/exchange-keys/${exchange}/test-trade/`,
+    );
     return data;
   },
 };

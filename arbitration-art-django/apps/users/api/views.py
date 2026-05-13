@@ -5,6 +5,13 @@ from rest_framework_simplejwt.tokens import RefreshToken
 
 from apps.users.api.serializers import UserExchangeKeysSerializer, UserSerializer
 from apps.users.models import UserExchangeKeys
+from apps.users.services.exchange_tester import (
+    SUPPORTED_EXCHANGES,
+    ExchangeKeysMissing,
+    ExchangeTestError,
+    request_test_connection,
+    request_test_trade,
+)
 
 
 class MeView(generics.RetrieveAPIView):
@@ -26,6 +33,53 @@ class ExchangeKeysView(generics.RetrieveUpdateAPIView):
     def get_object(self):
         exchange_keys, _ = UserExchangeKeys.objects.get_or_create(user=self.request.user)
         return exchange_keys
+
+
+class _ExchangeKeyTestMixin:
+    """Shared validation for per-exchange test endpoints."""
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def _resolve(self, request, exchange: str):
+        if exchange not in SUPPORTED_EXCHANGES:
+            return None, Response(
+                {"detail": f"Unsupported exchange: {exchange}"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        keys, _ = UserExchangeKeys.objects.get_or_create(user=request.user)
+        return keys, None
+
+
+class ExchangeKeyTestConnectionView(_ExchangeKeyTestMixin, APIView):
+    """Proxy a read-only key probe to the bot engine."""
+
+    def post(self, request, exchange: str) -> Response:
+        keys, error_response = self._resolve(request, exchange)
+        if error_response is not None:
+            return error_response
+        try:
+            payload = request_test_connection(keys, exchange)
+        except ExchangeKeysMissing as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        except ExchangeTestError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
+        return Response(payload)
+
+
+class ExchangeKeyTestTradeView(_ExchangeKeyTestMixin, APIView):
+    """Proxy a round-trip SOL/USDT futures test trade to the bot engine."""
+
+    def post(self, request, exchange: str) -> Response:
+        keys, error_response = self._resolve(request, exchange)
+        if error_response is not None:
+            return error_response
+        try:
+            payload = request_test_trade(keys, exchange)
+        except ExchangeKeysMissing as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        except ExchangeTestError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
+        return Response(payload)
 
 
 class LogoutView(APIView):

@@ -1,0 +1,28 @@
+name: arbitration-art-django
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: arbitration_art_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-arbitration_art}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-arbitration_art_dev_pass}
+      POSTGRES_DB: ${POSTGRES_DB:-arbitration_art}
+    ports:
+      # Host port 5434 to avoid clashing with any local PostgreSQL or other dev containers.
+      - "${POSTGRES_HOST_PORT:-5434}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 5s
+
+volumes:
+  postgres_data:
+    name: arbitration_art_postgres_data

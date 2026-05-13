@@ -11,6 +11,79 @@
       </q-btn>
     </div>
 
+    <q-dialog v-model="resultDialog.open" dark>
+      <q-card dark flat bordered class="bg-dark exchange-result-card">
+        <q-card-section class="row items-center q-pb-none">
+          <div class="text-subtitle1 text-title-color text-weight-bold">
+            {{ resultDialog.title }}
+          </div>
+          <q-space />
+          <q-badge
+            :color="resultDialog.ok ? 'positive' : 'negative'"
+            :label="resultDialog.ok ? 'OK' : 'FAIL'"
+          />
+          <q-btn v-close-popup flat dense round icon="close" class="q-ml-sm" />
+        </q-card-section>
+
+        <q-card-section v-if="resultDialog.kind === 'trade' && resultDialog.tradeResult">
+          <div class="trade-stats q-mb-md">
+            <div class="stat">
+              <div class="stat-label">Открытие</div>
+              <div class="stat-value">{{ resultDialog.tradeResult.open_latency_ms }} ms</div>
+            </div>
+            <div class="stat">
+              <div class="stat-label">Закрытие</div>
+              <div class="stat-value">{{ resultDialog.tradeResult.close_latency_ms }} ms</div>
+            </div>
+            <div class="stat">
+              <div class="stat-label">Quantity</div>
+              <div class="stat-value">{{ resultDialog.tradeResult.quantity }}</div>
+            </div>
+            <div class="stat">
+              <div class="stat-label">Open / Close</div>
+              <div class="stat-value">
+                {{ formatPrice(resultDialog.tradeResult.open_price) }} →
+                {{ formatPrice(resultDialog.tradeResult.close_price) }}
+              </div>
+            </div>
+            <div class="stat">
+              <div class="stat-label">PnL (USDT)</div>
+              <div
+                class="stat-value"
+                :class="pnlColorClass(resultDialog.tradeResult.realized_pnl_usdt)"
+              >
+                {{ formatPnl(resultDialog.tradeResult.realized_pnl_usdt) }}
+              </div>
+            </div>
+            <div class="stat">
+              <div class="stat-label">Маржа / Плечо</div>
+              <div class="stat-value">
+                ${{ resultDialog.tradeResult.margin_usd }} ×{{ resultDialog.tradeResult.leverage }}
+              </div>
+            </div>
+          </div>
+        </q-card-section>
+
+        <q-card-section v-if="resultDialog.error" class="text-negative text-body2">
+          {{ resultDialog.error }}
+        </q-card-section>
+
+        <q-card-section>
+          <div class="text-caption text-grey-5 q-mb-xs">Шаги</div>
+          <div v-for="(step, idx) in resultDialog.steps" :key="idx" class="step-row">
+            <q-icon
+              :name="step.ok ? 'check_circle' : 'cancel'"
+              :color="step.ok ? 'positive' : 'negative'"
+              size="16px"
+              class="q-mr-sm"
+            />
+            <span class="step-name">{{ step.name }}</span>
+            <span v-if="step.detail" class="step-detail">{{ step.detail }}</span>
+          </div>
+        </q-card-section>
+      </q-card>
+    </q-dialog>
+
     <div class="profile-grid">
       <q-card dark flat bordered class="bg-dark account-panel">
         <q-card-section>
@@ -57,16 +130,40 @@
                   <div class="exchange-title">{{ item.label }}</div>
                   <q-badge :color="isConfigured(item.id) ? 'positive' : 'grey-7'" :label="isConfigured(item.id) ? 'Настроено' : 'Не задано'" />
                 </div>
-                <q-btn
-                  flat
-                  dense
-                  no-caps
-                  color="negative"
-                  icon="delete"
-                  label="Очистить"
-                  :disable="!isConfigured(item.id)"
-                  @click="confirmClear(item.id)"
-                />
+                <div class="row q-gutter-sm">
+                  <q-btn
+                    flat
+                    dense
+                    no-caps
+                    color="primary"
+                    icon="wifi_tethering"
+                    label="Тест подключения"
+                    :disable="!isConfigured(item.id) || profileStore.testing[item.id] !== null"
+                    :loading="profileStore.testing[item.id] === 'connection'"
+                    @click="runTestConnection(item.id)"
+                  />
+                  <q-btn
+                    flat
+                    dense
+                    no-caps
+                    color="warning"
+                    icon="science"
+                    :label="`Тест сделки $${tradeMarginUsd} ×${tradeLeverage}`"
+                    :disable="!isConfigured(item.id) || profileStore.testing[item.id] !== null"
+                    :loading="profileStore.testing[item.id] === 'trade'"
+                    @click="confirmTestTrade(item.id)"
+                  />
+                  <q-btn
+                    flat
+                    dense
+                    no-caps
+                    color="negative"
+                    icon="delete"
+                    label="Очистить"
+                    :disable="!isConfigured(item.id)"
+                    @click="confirmClear(item.id)"
+                  />
+                </div>
               </div>
 
               <div v-if="stateFor(item.id).api_key_preview || stateFor(item.id).secret_preview" class="preview-row q-mb-sm">
@@ -118,13 +215,19 @@
 </template>
 
 <script setup lang="ts">
-import { onMounted, reactive } from 'vue';
+import { onMounted, reactive, ref } from 'vue';
 import { storeToRefs } from 'pinia';
 import { useQuasar } from 'quasar';
 import { useRouter } from 'vue-router';
 import { useAuthStore } from 'stores/auth';
 import { useProfileStore } from 'stores/profile/profile.store';
-import type { ExchangeId, ExchangeKeysPayload } from 'stores/profile/api/exchangeKeys';
+import type {
+  ExchangeCheckResult,
+  ExchangeConnectionTestResult,
+  ExchangeId,
+  ExchangeKeysPayload,
+  ExchangeTradeTestResult,
+} from 'stores/profile/api/exchangeKeys';
 
 type ExchangeFormConfig = {
   id: ExchangeId;
@@ -202,8 +305,124 @@ async function saveKeys() {
   }
 }
 
+type ResultDialogState = {
+  open: boolean;
+  kind: 'connection' | 'trade' | null;
+  title: string;
+  ok: boolean;
+  error: string;
+  steps: ExchangeCheckResult[];
+  tradeResult: ExchangeTradeTestResult | null;
+};
+
+const tradeMarginUsd = 15;
+const tradeLeverage = 10;
+
+const resultDialog = ref<ResultDialogState>({
+  open: false,
+  kind: null,
+  title: '',
+  ok: false,
+  error: '',
+  steps: [],
+  tradeResult: null,
+});
+
+function labelFor(exchange: ExchangeId) {
+  return exchangeForms.find((item) => item.id === exchange)?.label ?? exchange;
+}
+
+function showConnectionResult(exchange: ExchangeId, response: ExchangeConnectionTestResult) {
+  resultDialog.value = {
+    open: true,
+    kind: 'connection',
+    title: `${labelFor(exchange)} · Тест подключения`,
+    ok: response.ok,
+    error: response.error || '',
+    steps: response.checks || [],
+    tradeResult: null,
+  };
+}
+
+function showTradeResult(exchange: ExchangeId, response: ExchangeTradeTestResult) {
+  resultDialog.value = {
+    open: true,
+    kind: 'trade',
+    title: `${labelFor(exchange)} · Тест сделки ${response.symbol}`,
+    ok: response.success,
+    error: response.error || '',
+    steps: response.steps || [],
+    tradeResult: response,
+  };
+}
+
+async function runTestConnection(exchange: ExchangeId) {
+  try {
+    const result = await profileStore.testConnection(exchange);
+    showConnectionResult(exchange, result);
+    $q.notify({
+      color: result.ok ? 'positive' : 'negative',
+      message: result.ok
+        ? `${labelFor(exchange)}: подключение в порядке`
+        : `${labelFor(exchange)}: подключение не прошло`,
+    });
+  } catch (error) {
+    console.error(error);
+    $q.notify({
+      color: 'negative',
+      message: `Не удалось проверить подключение ${labelFor(exchange)}`,
+    });
+  }
+}
+
+function confirmTestTrade(exchange: ExchangeId) {
+  const label = labelFor(exchange);
+  $q.dialog({
+    title: `Тестовая сделка на ${label}`,
+    message: `Будет открыт реальный market-long по SOL/USDT с маржей $${tradeMarginUsd} и плечом ${tradeLeverage}x, а затем сразу закрыт reduceOnly. Это реальные средства на ${label}. Продолжить?`,
+    persistent: true,
+    dark: true,
+    color: 'warning',
+    ok: { label: 'Запустить', color: 'warning', noCaps: true },
+    cancel: { label: 'Отмена', flat: true, noCaps: true },
+  }).onOk(async () => {
+    try {
+      const result = await profileStore.testTrade(exchange);
+      showTradeResult(exchange, result);
+      $q.notify({
+        color: result.success ? 'positive' : 'negative',
+        message: result.success
+          ? `${label}: сделка прошла за ${result.open_latency_ms + result.close_latency_ms} ms`
+          : `${label}: сделка не прошла`,
+      });
+    } catch (error) {
+      console.error(error);
+      $q.notify({
+        color: 'negative',
+        message: `Не удалось выполнить тестовую сделку ${label}`,
+      });
+    }
+  });
+}
+
+function formatPrice(value: number): string {
+  if (!value) return '—';
+  return value.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 6 });
+}
+
+function formatPnl(value: number): string {
+  const sign = value > 0 ? '+' : '';
+  return `${sign}${value.toFixed(4)}`;
+}
+
+function pnlColorClass(value: number): string {
+  if (value > 0) return 'text-positive';
+  if (value < 0) return 'text-negative';
+  return '';
+}
+
 function confirmClear(exchange: ExchangeId) {
-  const label = exchangeForms.find((item) => item.id === exchange)?.label ?? exchange;
+  const label = labelFor(exchange);
   $q.dialog({
     title: `Очистить ${label}`,
     message: 'Удалить сохраненные API key и secret для этой биржи?',
@@ -306,8 +525,52 @@ onMounted(() => {
 .text-title-color
   color: $title-color !important
 
+.exchange-result-card
+  min-width: 480px
+  max-width: 720px
+  border-color: $blue-dark
+
+.trade-stats
+  display: grid
+  grid-template-columns: repeat(3, minmax(0, 1fr))
+  gap: 12px
+
+.stat
+  padding: 10px 12px
+  border-radius: $generic-border-radius
+  background: rgba(255, 255, 255, 0.04)
+  border: 1px solid rgba(255, 255, 255, 0.06)
+
+.stat-label
+  color: rgba(255, 255, 255, 0.55)
+  font-size: 11px
+  text-transform: uppercase
+  letter-spacing: 0.04em
+
+.stat-value
+  color: $title-color
+  font-weight: 600
+  font-size: 14px
+
+.step-row
+  display: flex
+  align-items: baseline
+  padding: 4px 0
+  font-size: 12px
+  color: $text-color
+
+.step-name
+  font-weight: 600
+  margin-right: 8px
+
+.step-detail
+  color: rgba(255, 255, 255, 0.65)
+  word-break: break-word
+
 @media (max-width: 900px)
   .profile-grid,
   .exchange-fields
     grid-template-columns: 1fr
+  .trade-stats
+    grid-template-columns: repeat(2, minmax(0, 1fr))
 </style>

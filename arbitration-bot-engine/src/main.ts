@@ -3,6 +3,11 @@ import cors from '@fastify/cors';
 import { config } from './config.js';
 import { logger } from './utils/logger.js';
 import { Engine } from './classes/Engine.js';
+import {
+    isSupportedExchange,
+    testConnection,
+    testTrade,
+} from './exchanges/exchange-tester.js';
 
 // Fastify is used only as a thin control plane. The actual trading lifecycle is
 // owned by Engine/BotTrader; HTTP handlers should translate requests into engine
@@ -99,6 +104,56 @@ fastify.post('/engine/bot/force-close', async (request, reply) => {
         await engine.forceClose(body.bot_id);
         return { success: true };
     } catch (e: any) {
+        return reply.status(500).send({ success: false, error: e.message });
+    }
+});
+
+// On-demand probes invoked from Django's user profile. They take user-supplied
+// credentials directly in the request body so the engine does not need a
+// persistent registry of keys; Django reads them from UserExchangeKeys and
+// forwards them per request.
+fastify.post('/engine/exchange/test-connection', async (request, reply) => {
+    const body = request.body as any;
+    const err = requireFields(body, ['exchange', 'api_key', 'secret']);
+    if (err) return reply.status(400).send({ success: false, error: err });
+    if (!isSupportedExchange(body.exchange)) {
+        return reply
+            .status(400)
+            .send({ success: false, error: `Unsupported exchange: ${body.exchange}` });
+    }
+    if (typeof body.api_key !== 'string' || typeof body.secret !== 'string') {
+        return reply
+            .status(400)
+            .send({ success: false, error: 'api_key and secret must be strings' });
+    }
+    try {
+        const result = await testConnection(body.exchange, body.api_key, body.secret);
+        return result;
+    } catch (e: any) {
+        logger.error('API', `test-connection failed for ${body.exchange}: ${e.message}`);
+        return reply.status(500).send({ success: false, error: e.message });
+    }
+});
+
+fastify.post('/engine/exchange/test-trade', async (request, reply) => {
+    const body = request.body as any;
+    const err = requireFields(body, ['exchange', 'api_key', 'secret']);
+    if (err) return reply.status(400).send({ success: false, error: err });
+    if (!isSupportedExchange(body.exchange)) {
+        return reply
+            .status(400)
+            .send({ success: false, error: `Unsupported exchange: ${body.exchange}` });
+    }
+    if (typeof body.api_key !== 'string' || typeof body.secret !== 'string') {
+        return reply
+            .status(400)
+            .send({ success: false, error: 'api_key and secret must be strings' });
+    }
+    try {
+        const result = await testTrade(body.exchange, body.api_key, body.secret);
+        return result;
+    } catch (e: any) {
+        logger.error('API', `test-trade failed for ${body.exchange}: ${e.message}`);
         return reply.status(500).send({ success: false, error: e.message });
     }
 });

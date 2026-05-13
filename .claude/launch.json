@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "quasar",
+      "runtimeExecutable": "sleep",
+      "runtimeArgs": ["infinity"],
+      "port": 9000
+    }
+  ]
+}

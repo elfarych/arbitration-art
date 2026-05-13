@@ -25,11 +25,27 @@
 
 ## 3. Обязательный workflow перед работой
 
+### 3.0 Scope активных приложений
+
+В задачах работаем **только** с тремя приложениями:
+
+- `arbitration-bot-engine` (engine);
+- `arbitration-art-django` (django);
+- `quasar/arbitration-art-q` (frontend).
+
+Все остальные сервисы (`arbitration-trader`, `arbitration-ws-futures-trader`, `arbitration-scanner` и любые будущие out-of-scope-сервисы) **полностью игнорируем**: не читаем их код и `DOCS.md`, не предлагаем правки, не учитываем их контракты, не упоминаем в ответах. Считаем, что их в репозитории нет.
+
+Если пользователь явно просит работу по такому сервису, действуй как обычно. Без явной просьбы — не трогай.
+
+Это правило перекрывает любые соседние пункты этого документа, где упоминаются эти сервисы.
+
+### 3.1 Порядок работы
+
 Не читай всю документацию подряд. Сначала определи, в каком приложении или слое будет работа.
 
 1. Определи область изменений по пути, команде пользователя или затронутым файлам.
 2. Прочитай только релевантный `DOCS.md` для этой области.
-3. Если задача затрагивает несколько приложений, прочитай `DOCS.md` каждого затронутого приложения.
+3. Если задача затрагивает несколько приложений (в рамках scope §3.0), прочитай `DOCS.md` каждого затронутого приложения.
 4. Если меняется контракт между приложениями, дополнительно проверь обе стороны контракта в коде.
 5. После изменений обнови соответствующий `DOCS.md`, если изменились архитектура, API, модели, env, команды, потоки данных, риски или поведение.
 
@@ -39,11 +55,9 @@
 |---|---|---|
 | Django backend | `arbitration-art-django/DOCS.md` | Модели, API, auth, settings, Django admin, bot-engine sync |
 | Bot engine | `arbitration-bot-engine/DOCS.md` | Fastify engine, runtime bot lifecycle, exchange execution, integration with Django |
-| Standalone trader | `arbitration-trader/DOCS.md` | Standalone real-trading scanner/trader, exchange clients, deployment |
-| WS futures trader | `arbitration-ws-futures-trader/DOCS.md` | Low-latency Fastify trader, Binance USD-M/Bybit WS execution, async Django sync |
 | Quasar frontend | `quasar/arbitration-art-q/DOCS.md` | Quasar/Vue UI, Pinia stores, frontend API, exchange WebSockets |
 
-Если создается новое приложение, добавь в него `DOCS.md` и обнови эту таблицу.
+Если создается новое приложение в scope §3.0, добавь в него `DOCS.md` и обнови эту таблицу.
 
 ## 4. Документация обязательна
 
@@ -77,22 +91,26 @@
 
 ## 5. Репозиторий и приложения
 
-Текущая структура:
+Активная структура (в scope §3.0):
 
 ```text
 arbitration-art/
 ├── arbitration-art-django/       # Django REST backend
 ├── arbitration-bot-engine/       # Fastify runtime engine for bot configs
-├── arbitration-trader/           # Standalone real arbitrage trader/scanner
-├── arbitration-ws-futures-trader/ # Low-latency WS trader for Binance USD-M and Bybit Futures
-├── quasar/arbitration-art-q/     # Quasar/Vue frontend
-└── arbitration-scanner/          # Отдельный scanner-проект, документировать при работе с ним
+└── quasar/arbitration-art-q/     # Quasar/Vue frontend
 ```
 
-Не путай `arbitration-bot-engine` и `arbitration-trader`:
+В репозитории физически присутствуют и другие директории (`arbitration-trader`, `arbitration-ws-futures-trader`, `arbitration-scanner`), но по правилу §3.0 они вне scope и не учитываются ни в чтении, ни в правках, ни в анализе контрактов.
 
-- `arbitration-bot-engine` принимает lifecycle-команды от Django (`start`, `sync`, `stop`, `force-close`) и запускает runtime traders по bot config.
-- `arbitration-trader` сам сканирует множество пар и торгует по глобальной `.env` конфигурации.
+### 5.1 Сокращения и алиасы пользователя
+
+Когда пользователь использует сокращенные названия приложений, понимай их так:
+
+- **engine** → `arbitration-bot-engine`
+- **фронтенд** / **frontend** / **ui** → `quasar/arbitration-art-q`
+- **django** → `arbitration-art-django`
+
+Эти алиасы применяй автоматически: «правки в engine» = работа в `arbitration-bot-engine/`, «добавь в ui» = работа в `quasar/arbitration-art-q/`. Слово «trader» в scope §3.0 **не используется** — если пользователь его произнёс, по умолчанию считай, что речь про `arbitration-bot-engine` (runtime trader внутри engine), и уточни только если контекст явно указывает на out-of-scope сервис.
 
 ## 6. Backend: Django правила
 
@@ -167,13 +185,9 @@ pnpm build
 
 ## 8. TypeScript trading services
 
-Приложения:
+В scope §3.0 единственный TS trading-сервис — `arbitration-bot-engine`.
 
-- `arbitration-bot-engine`
-- `arbitration-trader`
-- `arbitration-ws-futures-trader`
-
-Перед работой читать соответствующий `DOCS.md`.
+Перед работой читать `arbitration-bot-engine/DOCS.md`.
 
 Правила:
 
@@ -184,21 +198,37 @@ pnpm build
 - После изменений в exchange clients обязательно проверь build.
 - Комментарии в коде только на английском.
 
+### 8.1 Запрет ccxt
+
+В engine **запрещено** использовать библиотеку `ccxt` и `ccxt.pro` (включая `ccxt`, `ccxt-pro`, `ccxt.pro`, любые re-export wrapper-ы, типы из `ccxt`).
+
+Любое взаимодействие с биржей реализуется **нативно**:
+
+- REST — прямые HTTP-запросы (axios/undici/fetch) к официальным endpoint-ам биржи; signing, nonce, recvWindow, time-sync, recv-error-маппинг — руками в коде клиента.
+- WebSocket — нативные `ws`-клиенты к официальным public/private WS-эндпоинтам биржи; auth, subscribe payload, ping/pong/heartbeat, reconnect, snapshot+diff merge — в коде клиента.
+- Symbol/precision/limits/leverage tiers — тянуть с публичных REST-эндпоинтов биржи (`exchangeInfo`, `instruments-info`, `contracts` и т.п.) и кэшировать локально.
+
+Что нельзя:
+
+- добавлять `ccxt` / `ccxt.pro` в `dependencies` или `devDependencies`;
+- использовать `import ... from 'ccxt'` или `pro.<exchange>(...)` в новом коде;
+- расширять старые ccxt-клиенты новыми операциями — новые операции пишем сразу нативно;
+- использовать ccxt как "временный workaround" — сразу пишем нативный путь.
+
+Текущее состояние (tech debt, требует миграции): `BinanceClient`, `BybitClient`, `MexcClient` и все WS-клиенты сейчас построены на `ccxt` / `ccxt.pro`. `GateClient` уже нативный — его архитектура (signed REST с собственным signing) — образец для миграции остальных. Существующий ccxt-код можно править ради bugfix-ов, но любое функциональное расширение начинать **с миграции на нативный клиент**, а не с правки ccxt-обёртки. Доступ к raw `ccxtInstance` (например, `BotTrader` использует `(client as any).ccxtInstance.fetchPositions(...)`) — отдельный пункт миграции: после перехода на нативные клиенты соответствующая операция должна стать методом интерфейса `IExchangeClient` (`fetchPositions(symbol)`).
+
+Если задача требует новую биржевую операцию на ccxt-клиенте, а полная миграция клиента не помещается в задачу — отдельно проговори tradeoff с пользователем, не делай молчаливое расширение ccxt-поверхности.
+
 Latency-critical paths:
 
-- `arbitration-bot-engine` и `arbitration-ws-futures-trader` — это hot paths: между сигналом и отправкой order-а на биржу должно быть как можно меньше работы. На горячем пути избегай: лишних `await`, не нужных REST-запросов, синхронных I/O, тяжёлых JSON.stringify в логах, создания exchange-клиентов на каждый тик, последовательных `await` там, где возможен `Promise.all` для двух ног.
+- `arbitration-bot-engine` — это hot path: между сигналом и отправкой order-а на биржу должно быть как можно меньше работы. На горячем пути избегай: лишних `await`, не нужных REST-запросов, синхронных I/O, тяжёлых JSON.stringify в логах, создания exchange-клиентов на каждый тик, последовательных `await` там, где возможен `Promise.all` для двух ног.
 - Любые сетевые вызовы перед отправкой market order-а должны быть либо закешированы, либо вынесены из горячего пути в фоновое предзагрузочное состояние.
 - Логирование на hot path должно быть минимальным; debug-логи прячь за уровнем или сэмплингом.
 
-Проверки:
+Проверка:
 
 ```bash
 cd arbitration-bot-engine
-pnpm build
-```
-
-```bash
-cd arbitration-trader
 pnpm build
 ```
 
@@ -206,13 +236,13 @@ pnpm build
 
 ## 9. API и межсервисные контракты
 
-Если меняешь одну сторону контракта, проверь вторую:
+Контракты учитываются только между приложениями в scope §3.0. Если меняешь одну сторону контракта, проверь вторую:
 
 - Django auth API -> Quasar `auth.ts` и `boot/axios.ts`.
 - Django bots API -> Quasar `bots.store.ts` / `botConfig.ts`.
 - Django bot-engine sync payload -> `arbitration-bot-engine/src/classes/Engine.ts`.
-- Django real/emulation trades -> frontend dialogs, bot-engine, trader.
-- Exchange enum/choices -> frontend exchange options and engine/trader mappings.
+- Django real/emulation trades -> frontend dialogs, bot-engine.
+- Exchange enum/choices -> frontend exchange options and engine mappings.
 
 Контрактные изменения всегда документировать в `DOCS.md` всех затронутых приложений.
 
@@ -238,7 +268,7 @@ pnpm build
 
 ### 10.1 Работа с `.env`-файлами
 
-Пользователь явно разрешает создавать и править `.env`-файлы в директориях сервисов (`arbitration-art-django/.env`, `arbitration-bot-engine/.env`, `arbitration-trader/.env`, `arbitration-ws-futures-trader/.env`, `quasar/arbitration-art-q/.env*`), если это нужно для того, чтобы сервисы работали в связке без ручной настройки с его стороны. Это исключение из общего правила «не трогать `.env`» и распространяется **только** на этот репозиторий.
+Пользователь явно разрешает создавать и править `.env`-файлы в директориях сервисов в scope §3.0 (`arbitration-art-django/.env`, `arbitration-bot-engine/.env`, `quasar/arbitration-art-q/.env*`), если это нужно для того, чтобы сервисы работали в связке без ручной настройки с его стороны. Это исключение из общего правила «не трогать `.env`» и распространяется **только** на этот репозиторий и **только** на сервисы в scope.
 
 Что можно менять без отдельного подтверждения:
 

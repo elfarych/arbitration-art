@@ -506,19 +506,24 @@ UI:
 - masked previews returned by backend;
 - password-style secret inputs with visibility toggle;
 - per-exchange clear button;
-- save button that sends only non-empty fields.
+- save button that sends only non-empty fields;
+- per-exchange кнопки **Тест подключения** и **Тест сделки $15 ×10** в шапке каждой биржевой секции; обе отключены пока ключи не сохранены и пока другой тест по этой бирже ещё идёт;
+- результирующий `q-dialog` с шагами и (для тестовой сделки) сеткой метрик: `open_latency_ms`, `close_latency_ms`, quantity, open/close prices, realized PnL.
 
 Backend endpoints:
 
 - `GET /auth/exchange-keys/`
 - `PATCH /auth/exchange-keys/`
+- `POST /auth/exchange-keys/<exchange>/test-connection/`
+- `POST /auth/exchange-keys/<exchange>/test-trade/`
 - `POST /auth/logout/`
 
 Важно:
 
 - raw saved secrets are not returned by backend;
 - empty fields in the form do not overwrite saved values;
-- clear action sends empty strings for selected exchange key and secret.
+- clear action sends empty strings for selected exchange key and secret;
+- тестовая сделка реальная, исполняется engine'ом на live-бирже (`SOL/USDT` perpetual, маржа $15, плечо 10x, open + reduceOnly close); перед отправкой пользователю показывается confirmation-диалог.
 
 ### 12.3. IndexPage
 
@@ -695,6 +700,10 @@ Actions:
 | `fetchExchangeKeys` | получает masked состояние ключей текущего пользователя |
 | `updateExchangeKeys` | PATCH переданных key/secret полей |
 | `clearExchangeKeys` | очищает API key и secret одной биржи |
+| `testConnection` | POST `exchange-keys/<id>/test-connection/`, выставляет `testing[id] = 'connection'` пока запрос идёт |
+| `testTrade` | POST `exchange-keys/<id>/test-trade/`, выставляет `testing[id] = 'trade'` пока запрос идёт |
+
+`state.testing` хранит для каждой биржи текущий запущенный тест (`'connection' | 'trade' | null`); компонент `ProfilePage` использует его для loading-спиннеров и блокировки кнопок.
 
 ### 14.2. API client
 
@@ -706,6 +715,8 @@ Endpoints:
 |---|---|---|
 | `GET` | `/auth/exchange-keys/` | `exchangeKeysApi.get` |
 | `PATCH` | `/auth/exchange-keys/` | `exchangeKeysApi.update` |
+| `POST` | `/auth/exchange-keys/<exchange>/test-connection/` | `exchangeKeysApi.testConnection` |
+| `POST` | `/auth/exchange-keys/<exchange>/test-trade/` | `exchangeKeysApi.testTrade` |
 
 GET response shape:
 
@@ -1495,6 +1506,8 @@ Auth:
 - `GET /auth/me/`
 - `GET /auth/exchange-keys/`
 - `PATCH /auth/exchange-keys/`
+- `POST /auth/exchange-keys/<exchange>/test-connection/`
+- `POST /auth/exchange-keys/<exchange>/test-trade/`
 
 Bots:
 

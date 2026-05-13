@@ -46,7 +46,7 @@
 - `requirements/production.txt` - базовые + gunicorn.
 - `requirements.txt` - pinned freeze текущего окружения.
 
-Важно: README говорит о дефолтном SQLite, но в текущем `development.py` база задается строго через `env.db("DATABASE_URL")`. Если `DATABASE_URL` не задан, Django не получит рабочую БД из settings.
+Важно: `development.py` задает БД строго через `env.db("DATABASE_URL")`. Дефолтная dev-БД — dockerized PostgreSQL из `docker-compose.yml` (`make db-up`); `.env` и `.env.example` указывают `DATABASE_URL` на этот контейнер.
 
 ## 3. Структура проекта
 
@@ -200,19 +200,29 @@ Production overrides:
 SECRET_KEY=...
 DEBUG=True
 ALLOWED_HOSTS=localhost,127.0.0.1
-# DATABASE_URL=postgres://user:password@localhost:5432/arbitration_art
+POSTGRES_USER=arbitration_art
+POSTGRES_PASSWORD=arbitration_art_dev_pass
+POSTGRES_DB=arbitration_art
+POSTGRES_HOST_PORT=5434
+DATABASE_URL=postgres://arbitration_art:arbitration_art_dev_pass@localhost:5434/arbitration_art
 LANGUAGE_CODE=ru
 TIME_ZONE=Asia/Almaty
 # CORS_ALLOWED_ORIGINS=https://your-frontend-domain.com
 # SECURE_SSL_REDIRECT=True
 ```
 
+Переменные `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB`, `POSTGRES_HOST_PORT` читаются `docker-compose.yml` для контейнера БД. `DATABASE_URL` должен указывать на тот же кластер. Если меняешь креды/порт — синхронизируй обе части.
+
 Фактически важные переменные:
 
 | Переменная | Где используется | Обязательность | Комментарий |
 |---|---|---:|---|
 | `SECRET_KEY` | base settings | да | Не должен попадать в git. Для prod нужен сильный случайный ключ. |
-| `DATABASE_URL` | development/production | да | Сейчас без дефолта в settings. Локально используется PostgreSQL. |
+| `DATABASE_URL` | development/production | да | Сейчас без дефолта в settings. В dev указывает на dockerized PostgreSQL (по умолчанию `localhost:5434`). |
+| `POSTGRES_USER` | docker-compose | да для dev | Пользователь PostgreSQL для dockerized БД. |
+| `POSTGRES_PASSWORD` | docker-compose | да для dev | Пароль PostgreSQL для dockerized БД. |
+| `POSTGRES_DB` | docker-compose | да для dev | Имя БД для dockerized PostgreSQL. |
+| `POSTGRES_HOST_PORT` | docker-compose | нет | Host port для проброса PostgreSQL. Дефолт `5434`. |
 | `ALLOWED_HOSTS` | production | да для prod | В development захардкожен список localhost. |
 | `LANGUAGE_CODE` | base | нет | Дефолт env-схемы: `ru`. |
 | `TIME_ZONE` | base | нет | Дефолт env-схемы: `Asia/Almaty`. |
@@ -282,6 +292,8 @@ Root URL config: `arbitration_art_django/urls.py`.
 
 Модель сейчас не зарегистрирована в `apps/users/admin.py`. Authenticated user управляет своими ключами через `/api/auth/exchange-keys/`. API не возвращает сырые значения ключей и secrets: GET возвращает только флаги наличия и masked previews. PATCH принимает новые значения и обновляет только переданные поля; пустая строка очищает конкретное поле.
 
+Профильные тест-эндпоинты (`/api/auth/exchange-keys/<exchange>/test-connection/` и `/test-trade/`) реализованы как тонкий прокси: `apps/users/services/exchange_tester.py` достаёт сырые ключи из `UserExchangeKeys`, добавляет `X-Service-Token` через `apps/bots/services/trader_runtime_shared.service_headers` и POST'ит на `BOT_ENGINE_SERVICE_URL_DEFAULT + /engine/exchange/...`. Это гарантирует, что валидация ключей проходит через тот же exchange-клиент, который engine использует в живой торговле. Read-only `test-connection` ретраится по политике `SERVICE_REQUEST_RETRIES`; `test-trade` отправляется **без ретраев**, потому что повтор может привести ко второй реальной сделке при сетевой ошибке после фактической отправки ордера.
+
 ### 7.3. User serializer
 
 `UserSerializer` возвращает только read-only профиль:
@@ -316,6 +328,8 @@ Prefix: `/api/auth/`.
 | `GET` | `/api/auth/me/` | `MeView` | authenticated | Получить профиль текущего пользователя. |
 | `GET` | `/api/auth/exchange-keys/` | `ExchangeKeysView` | authenticated | Получить masked состояние API-ключей текущего пользователя. |
 | `PATCH` | `/api/auth/exchange-keys/` | `ExchangeKeysView` | authenticated | Обновить или очистить API-ключи текущего пользователя. |
+| `POST` | `/api/auth/exchange-keys/<exchange>/test-connection/` | `ExchangeKeyTestConnectionView` | authenticated | Прокси на `engine /engine/exchange/test-connection`. Проверяет ключи через `loadMarkets` + `fetchPositions(['SOL/USDT:USDT'])`. |
+| `POST` | `/api/auth/exchange-keys/<exchange>/test-trade/` | `ExchangeKeyTestTradeView` | authenticated | Прокси на `engine /engine/exchange/test-trade`. Запускает round-trip SOL/USDT futures-сделку с $15 маржей и плечом 10x и возвращает per-leg latency в ms. |
 
 Login использует стандартный Simple JWT serializer. Так как `USERNAME_FIELD = "email"`, ожидаемый credential field - `email`.
 
@@ -1214,6 +1228,49 @@ Fieldsets:
 
 ## 13. Рабочие команды
 
+### 13.0. Запуск одной командой (Docker + Makefile)
+
+Локальная PostgreSQL поднимается через `docker-compose.yml`, остальной workflow — через `Makefile`.
+
+Структура файлов:
+
+- `docker-compose.yml` — сервис `postgres` (image `postgres:16-alpine`), named volume `arbitration_art_postgres_data`, healthcheck по `pg_isready`. Host port читается из `POSTGRES_HOST_PORT` (дефолт `5434`, чтобы не конфликтовать с локальной БД на `5432` и другими dev-контейнерами на `5433`).
+- `Makefile` — оркестрирует Docker, venv, deps, миграции и dev server.
+
+Поднять всё одной командой (БД + venv + deps + миграции + dev server):
+
+```bash
+cd /Users/eldar/dev/Projects/arbitration-art/arbitration-art-django
+make start
+```
+
+Полезные таргеты:
+
+| Команда | Назначение |
+|---|---|
+| `make start` | Поднять Postgres, поставить deps, накатить миграции, запустить runserver. |
+| `make up` | То же, что `make start`, но без runserver (полезно для CI/scripted setup). |
+| `make db-up` | Поднять только Postgres и дождаться healthcheck. |
+| `make db-down` | Остановить контейнер. Данные в volume сохраняются. |
+| `make db-reset` | **Destructive.** Снести контейнер вместе с volume — БД обнулится. Запускать только по явной задаче. |
+| `make db-logs` | `docker compose logs -f postgres`. |
+| `make db-shell` | `psql` в контейнер от имени `POSTGRES_USER`. |
+| `make migrate` | `manage.py migrate`. |
+| `make makemigrations` | `manage.py makemigrations`. |
+| `make check` | `manage.py check`. |
+| `make superuser` | `manage.py createsuperuser` (interactive). |
+| `make runserver` | Только dev server (без подъёма БД). |
+
+Makefile подтягивает `./.env`, поэтому `POSTGRES_USER`/`POSTGRES_PASSWORD`/`POSTGRES_DB`/`POSTGRES_HOST_PORT` и `DATABASE_URL` живут в одном месте.
+
+Ограничения:
+
+- Требуется Docker Desktop запущенный. Если daemon не поднят, `make db-up` упадёт с понятной ошибкой.
+- Если host port уже занят (например другим dev-контейнером Postgres), переопределить через `POSTGRES_HOST_PORT` в `.env` и не забыть синхронно поправить порт в `DATABASE_URL`.
+- Makefile создаёт `venv` только если его нет; существующий venv не пересоздаётся.
+
+### 13.1. Ручные команды
+
 Из корня проекта:
 
 ```bash
@@ -1427,16 +1484,9 @@ In-process Engine защищает от race в пределах одного п
 
 `Trade.opened_at` стало `default=timezone.now` (не `auto_now_add`). Engine передаёт фактический timestamp fill-а; если по какой-то причине не передал, Django использует время DB write. Это normal degradation, но `Trade.opened_at` тогда отстаёт от реальности на сетевой latency. В мониторинге проверять, что engine стабильно шлёт `opened_at` в payload.
 
-### 17.7. README расходится с settings
+### 17.7. README может расходиться с фактическим dev-flow
 
-README и `.env.example` намекают на default SQLite, но `development.py` требует `DATABASE_URL`. Нужно либо:
-
-- обновить README;
-- либо добавить default:
-
-```python
-env.db("DATABASE_URL", default=f"sqlite:///{BASE_DIR / 'db.sqlite3'}")
-```
+`.env.example` и `docker-compose.yml` описывают dockerized PostgreSQL как dev-БД, а `development.py` требует `DATABASE_URL` без дефолта. Если в репозитории сохранился старый README с упоминанием SQLite — обновить под актуальный flow (`make start`).
 
 ### 17.8. Production secret warning
 

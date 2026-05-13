@@ -1,9 +1,11 @@
 import { defineStore } from 'pinia';
 import {
   exchangeKeysApi,
+  type ExchangeConnectionTestResult,
   type ExchangeId,
   type ExchangeKeysPayload,
   type ExchangeKeysState,
+  type ExchangeTradeTestResult,
 } from './api/exchangeKeys';
 
 const emptyExchangeState = {
@@ -12,6 +14,8 @@ const emptyExchangeState = {
   api_key_preview: '',
   secret_preview: '',
 };
+
+export type ExchangeTestKind = 'connection' | 'trade';
 
 export const useProfileStore = defineStore('profile', {
   state: () => ({
@@ -23,6 +27,12 @@ export const useProfileStore = defineStore('profile', {
     } as ExchangeKeysState,
     loading: false,
     saving: false,
+    testing: {
+      binance: null,
+      bybit: null,
+      gate: null,
+      mexc: null,
+    } as Record<ExchangeId, ExchangeTestKind | null>,
   }),
   actions: {
     async fetchExchangeKeys() {
@@ -50,6 +60,24 @@ export const useProfileStore = defineStore('profile', {
       } as ExchangeKeysPayload;
 
       await this.updateExchangeKeys(payload);
+    },
+
+    async testConnection(exchange: ExchangeId): Promise<ExchangeConnectionTestResult> {
+      this.testing[exchange] = 'connection';
+      try {
+        return await exchangeKeysApi.testConnection(exchange);
+      } finally {
+        this.testing[exchange] = null;
+      }
+    },
+
+    async testTrade(exchange: ExchangeId): Promise<ExchangeTradeTestResult> {
+      this.testing[exchange] = 'trade';
+      try {
+        return await exchangeKeysApi.testTrade(exchange);
+      } finally {
+        this.testing[exchange] = null;
+      }
     },
   },
 });

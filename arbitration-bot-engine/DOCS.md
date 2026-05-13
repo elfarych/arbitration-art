@@ -334,6 +334,45 @@ Security note:
 
 - Все control-plane endpoints проверяют `X-Service-Token` через `addHook('preHandler', ...)`. CORS остаётся открытым по умолчанию, поэтому процесс должен быть изолирован на localhost / private network / firewall.
 
+### 6.5. `POST /engine/exchange/test-connection`
+
+Файл: `src/exchanges/exchange-tester.ts` (`testConnection`).
+
+Payload:
+
+```json
+{
+  "exchange": "binance|bybit|gate|mexc",
+  "api_key": "<api key>",
+  "secret": "<secret>"
+}
+```
+
+Behavior:
+
+- Создаёт короткоживущий REST-клиент (`BinanceClient` / `BybitClient` / `GateClient` / `MexcClient`) и не регистрирует его ни в `Engine.traders`, ни в `Engine.starting`.
+- Выполняет `loadMarkets()`, затем `ccxtInstance.fetchPositions(['SOL/USDT:USDT'])` для проверки auth и futures read-permissions.
+- Возвращает структуру вида `{ ok, exchange, checks: [{name, ok, detail}], error }`. HTTP 200 при любых exchange-ошибках, чтобы Django мог отдать пользователю причину без дополнительной интерпретации.
+
+### 6.6. `POST /engine/exchange/test-trade`
+
+Файл: `src/exchanges/exchange-tester.ts` (`testTrade`).
+
+Payload идентичен `test-connection` (`exchange`, `api_key`, `secret`).
+
+Behavior:
+
+- Берёт фиксированные параметры: `SOL/USDT:USDT`, margin = $15, leverage = 10.
+- Последовательно вызывает `setIsolatedMargin`, `setLeverage`, `ccxtInstance.fetchTicker`, считает количество как `(margin * leverage) / lastPrice` и округляет через `getMarketInfo().stepSize`.
+- Открывает `createMarketOrder(symbol, 'buy', qty)` и сразу закрывает `createMarketOrder(symbol, 'sell', qty, { reduceOnly: true })`.
+- Замеряет latency каждой ноги через `Date.now()` непосредственно вокруг вызова `createMarketOrder` и возвращает `open_latency_ms` и `close_latency_ms` — это чистая длительность HTTP-сделки на бирже без overhead Fastify/Django.
+- При ошибке close-ноги выставляет `error` с указанием, что позиция, скорее всего, осталась открытой; пользователь должен закрыть её вручную.
+- HTTP 200 при любых exchange-ошибках; HTTP 400 — только при отсутствии полей или неподдерживаемой бирже.
+
+Risk note:
+
+- Endpoint выполняет реальную сделку с реальных средств пользователя на live-бирже (testnet включается только глобальным `USE_TESTNET=true`). Django оборачивает вызов confirmation-диалогом во фронтенде и не повторяет запрос при сетевой ошибке, потому что повтор может привести к второй сделке.
+
 ## 7. `Engine`
 
 Файл: `src/classes/Engine.ts`.
