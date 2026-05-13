@@ -1581,11 +1581,11 @@ Production-образ строится из каталога `quasar/arbitration
 Quasar/Vite инжектят `process.env.API_URL` в JS-бандл на этапе `pnpm run build`. Менять адрес API на уже собранном образе нельзя — нужен пересбор. Поэтому `API_URL` передаётся как **build ARG**, а не env переменная контейнера. В `Dockerfile` объявлен:
 
 ```dockerfile
-ARG API_URL=http://127.0.0.1:8000/api
+ARG API_URL=https://art-api.jscode.kz/api
 ENV API_URL=${API_URL}
 ```
 
-Дефолт оставлен для smoke-build. В Dokploy установить **Build Arguments → `API_URL`** в реальный публичный URL Django (например `https://api.example.com/api`). На каждую новую среду (staging/prod) — отдельный билд с своим `API_URL`.
+Дефолт указывает на production-домен Django, чтобы билд без явных аргументов сразу был рабочим. В Dokploy можно установить **Build Arguments → `API_URL`** для staging/других сред — на каждую новую среду собирается отдельный образ с своим `API_URL`. Если дефолт устраивает (prod-сборка на prod-Django), build args в Dokploy не задавать.
 
 Build context для Dokploy:
 
@@ -1606,6 +1606,8 @@ Runtime env vars в Dokploy для контейнера не требуются 
 
 ```bash
 cd /Users/eldar/dev/Projects/arbitration-art/quasar/arbitration-art-q
+# Без --build-arg уйдёт prod-дефолт https://art-api.jscode.kz/api.
+# Для локального Django передать свой API_URL:
 docker build --build-arg API_URL=http://127.0.0.1:8000/api -t arbitration-art-q:local .
 ```
 

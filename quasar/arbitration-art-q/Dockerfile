@@ -12,8 +12,9 @@ ENV CI=1
 ENV NODE_ENV=development
 
 # API_URL is baked into the bundle. Override per-deployment via Dokploy
-# "Build Arguments". Falls back to the dev default so a smoke build works.
-ARG API_URL=http://127.0.0.1:8000/api
+# "Build Arguments". The default points at the production Django host so a
+# build without explicit arguments still produces a working bundle.
+ARG API_URL=https://art-api.jscode.kz/api
 ENV API_URL=${API_URL}
 
 # Enable pnpm via corepack (project pins pnpm >= 9).
