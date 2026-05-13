@@ -9,7 +9,11 @@ declare module 'vue' {
   }
 }
 
-const api = axios.create({ baseURL: process.env.API_URL });
+// Fallback to the production Django host so a bundle built without an
+// explicit API_URL (no .env, no build arg) still points at a real backend.
+// Override per environment via .env / build arg.
+const DEFAULT_API_URL = 'https://art-api.jscode.kz/api';
+const api = axios.create({ baseURL: process.env.API_URL ?? DEFAULT_API_URL });
 
 export default defineBoot(({ app, router }) => {
   api.interceptors.request.use(
