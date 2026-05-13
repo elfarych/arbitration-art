@@ -1567,6 +1567,48 @@ API_URL=http://127.0.0.1:8000/api
 
 Quasar для browser-side env инжектит через `quasar.config.ts build.env`. Сейчас build.env не настроен явно, переменная попадает через стандартный dotenv pipeline Quasar (`.env` + `process.env.*`).
 
+### 28.1. Production-сборка (Docker / Dokploy)
+
+Production-образ строится из каталога `quasar/arbitration-art-q/`. Артефакты:
+
+- `Dockerfile` — multi-stage:
+  - Stage 1 (`builder`) на `node:22-slim`. Включает `corepack` (pnpm ≥ 9 из engines в `package.json`), `pnpm install --frozen-lockfile`, затем `pnpm run build` → `dist/spa/`.
+  - Stage 2 (`runtime`) на `nginx:1.27-alpine`. Копирует `dist/spa` в `/usr/share/nginx/html`, подменяет дефолтный server-блок: SPA fallback `try_files $uri $uri/ /index.html`, длинный `Cache-Control` для `/assets/`, `no-store` для `index.html`, gzip для text/JS/CSS/SVG.
+- `.dockerignore` — режет `node_modules/`, `dist/`, `.quasar/`, `.env*` (кроме `.env.example`), cordova/capacitor артефакты, `.git/`, `DOCS.md`.
+
+**Важно: `API_URL` — build-time, не runtime.**
+
+Quasar/Vite инжектят `process.env.API_URL` в JS-бандл на этапе `pnpm run build`. Менять адрес API на уже собранном образе нельзя — нужен пересбор. Поэтому `API_URL` передаётся как **build ARG**, а не env переменная контейнера. В `Dockerfile` объявлен:
+
+```dockerfile
+ARG API_URL=http://127.0.0.1:8000/api
+ENV API_URL=${API_URL}
+```
+
+Дефолт оставлен для smoke-build. В Dokploy установить **Build Arguments → `API_URL`** в реальный публичный URL Django (например `https://api.example.com/api`). На каждую новую среду (staging/prod) — отдельный билд с своим `API_URL`.
+
+Build context для Dokploy:
+
+- **Build Path** = корень репозитория, **Dockerfile Path** = `quasar/arbitration-art-q/Dockerfile`, **Build Context** = `quasar/arbitration-art-q/`. Альтернатива — подключать в Dokploy только подкаталог как отдельный source.
+- Контейнер слушает порт `80`. Пробрасывать через Traefik/прокси Dokploy с HTTPS-терминацией снаружи.
+
+Runtime env vars в Dokploy для контейнера не требуются (это статический SPA за nginx). Все нужные значения уже зашиты в бандл на build-стадии.
+
+Риски и подводные камни:
+
+- **CORS.** Django `arbitration-art-django` должен иметь домен фронта в `CORS_ALLOWED_ORIGINS`, иначе все API-запросы из браузера упадут. См. также §30.4.
+- **Mixed content.** Если фронт под `https://`, а `API_URL` указан с `http://` — браузер заблокирует запросы. Проверить, что `API_URL` идёт через HTTPS при production deploy.
+- **Прямые WS к биржам.** Бандл подключается к public WS биржевых endpoint-ов напрямую из браузера (см. §30.3). Это требует, чтобы фронт раздавался по HTTPS (биржевые WSS не работают с http origin в части браузеров на http://). Nginx сам HTTPS не делает — терминация TLS на Traefik/прокси Dokploy.
+- **Router mode.** Сейчас в `quasar.config.ts` стоит `vueRouterMode: 'hash'` — SPA fallback не критичен (всё после `#` обрабатывается клиентом). Конфиг nginx уже совместим с обоими режимами, переключение на `history` не потребует менять Dockerfile.
+- **Старый кеш у пользователей.** Хешированные ассеты в `/assets/` лежат с `Cache-Control: immutable` (год). Если приходится экстренно откатывать prod, проверить, что `index.html` отдается без кеша (уже сделано через `Cache-Control: no-store`).
+
+Локальный smoke build (опционально):
+
+```bash
+cd /Users/eldar/dev/Projects/arbitration-art/quasar/arbitration-art-q
+docker build --build-arg API_URL=http://127.0.0.1:8000/api -t arbitration-art-q:local .
+```
+
 ## 29. Known issues and risks
 
 ### 29.1. Exchange secrets are stored by backend

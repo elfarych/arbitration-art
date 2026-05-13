@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Env files (never bake secrets into images)
+.env
+*.env
+.env.*
+!.env.example
+
+# Local dev artifacts
+*.log
+*.sqlite3
+*.sqlite3-journal
+db.sqlite3
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+
+# Django collected output (rebuilt inside the image)
+staticfiles/
+media/
+
+# Tooling / IDE
+.git/
+.gitignore
+.gitattributes
+.github/
+.idea/
+.vscode/
+.DS_Store
+
+# Local-only compose / docs not needed at runtime
+docker-compose.yml
+Makefile
+DOCS.md

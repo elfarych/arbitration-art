@@ -982,6 +982,49 @@ pnpm start  # node dist/main.js
 
 Expected server URL: `http://127.0.0.1:3001`.
 
+### 23.1. Production-сборка (Docker / Dokploy)
+
+Production-образ строится из самого каталога `arbitration-bot-engine/`. Артефакты:
+
+- `Dockerfile` — multi-stage:
+  - Stage 1 (`builder`) на `node:22-slim`, ставит **все** зависимости через `pnpm install --frozen-lockfile`, компилирует TypeScript (`pnpm run build` → `tsc` → `./dist`).
+  - Stage 2 (`runtime`) на `node:22-slim`, ставит **только** `--prod` зависимости (нет `tsc`/`tsx`/`@types/*` в финальном слое), копирует `dist/` из builder. PID 1 — `tini` для корректного SIGTERM от Dokploy/Docker → Fastify успевает закрыть HTTP-сервер. Запуск от non-root `node` user.
+- `.dockerignore` — режет `node_modules/`, `dist/`, `.env*` (кроме `.env.example`), `.git/`, `DOCS.md`. Это критично, чтобы локальный `.env` со `SERVICE_SHARED_TOKEN` не попадал в образ.
+
+Build context для Dokploy:
+
+- В Dokploy указать **Build Path** = корень репозитория, **Dockerfile Path** = `arbitration-bot-engine/Dockerfile`, **Build Context** = `arbitration-bot-engine/`. Альтернатива — подключать в Dokploy только подкаталог как отдельный source.
+- Контейнер слушает порт `3001` (control plane). Пробрасывать через Traefik/прокси Dokploy.
+
+Обязательные env vars в Dokploy:
+
+- `SERVICE_SHARED_TOKEN` — обязан **посимвольно** совпадать со значением в Django (`arbitration-art-django` env). Любое расхождение → engine отбрасывает lifecycle-запросы от Django с 401, Django отбрасывает write-запросы от engine.
+- `DJANGO_API_URL` — публичный URL Django API без trailing slash (например `https://api.example.com/api`). Engine использует его для записи trades, fetch активных ботов на bootstrap.
+- `ENGINE_SERVICE_URL` — URL, под которым engine виден из Django. Должен **посимвольно** совпадать с `BotConfig.service_url` в БД, иначе `engine-bootstrap` вернёт пустой список и engine стартанёт «холодным» (без восстановленных ботов).
+- `PORT` — внутренний порт контейнера (дефолт `3001`). Меняем только если в инфре нужен другой.
+
+Опциональные (есть дефолты в `config.ts`):
+
+- `USE_TESTNET` — `true` для Binance/Bybit/Gate sandbox. Для production реальных денег держать `false`. MEXC contract sandbox не поддерживает — флаг no-op.
+- `TRADE_AMOUNT_USDT` — fallback notional, если у `BotConfig` нет `coin_amount`.
+- `LOG_LEVEL` — `DEBUG|INFO|WARN|ERROR`. На hot path debug-логи дают заметный overhead, на prod держать `INFO`/`WARN`.
+- `ORDERBOOK_MAX_AGE_MS` (дефолт 15000), `ORDERBOOK_MAX_SKEW_MS` (дефолт 20000 — зафиксированный лимит) — guards для cross-leg snapshot freshness.
+
+Риски и подводные камни при деплое:
+
+- **Latency.** Engine — hot path: сетевые hop-ы между engine и биржей напрямую влияют на slippage. Размещать engine **географически близко** к биржевым endpoint-ам, не за лишними VPN/прокси. Канал engine ↔ Django (REST) — холодный, его можно держать дальше.
+- **Биржевые ключи в plaintext.** Engine получает API keys в lifecycle payload от Django по HTTP. Если Django и engine на разных хостах, использовать private network или TLS-терминацию на прокси между ними. См. также §25.1.
+- **`.env` в образ не кладём.** Все env vars приходят через Dokploy env injection; `.dockerignore` страхует от случайного попадания локального `.env` с реальным токеном.
+- **Multi-instance.** Engine не имеет distributed lock (см. §25.2). Запускать **один** контейнер engine на один Django, либо изолировать каждую инстанцию engine своим набором `BotConfig.service_url`. Dokploy replica scaling > 1 для engine — небезопасно.
+- **Graceful shutdown.** `tini` доставляет SIGTERM в Node; Fastify сам по себе не закрывает live-WS к биржам — при rolling deploy открытые позиции остаются на бирже, engine при перезапуске восстановит их через Django bootstrap. Не делать deploy в момент активной торговли без необходимости.
+
+Локальный smoke build (опционально):
+
+```bash
+cd /Users/eldar/dev/Projects/arbitration-art/arbitration-bot-engine
+docker build -t arbitration-bot-engine:local .
+```
+
 Control endpoints:
 
 ```text

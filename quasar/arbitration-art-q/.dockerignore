@@ -1,0 +1,42 @@
+# Local build artifacts and deps — rebuilt inside the image.
+node_modules/
+dist/
+.quasar/
+quasar.config.*.temporary.compiled*
+
+# Env files (never bake real secrets into images; API_URL comes via build ARG).
+.env
+*.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+
+# Cordova / Capacitor outputs (not used in web deploy).
+src-cordova/node_modules/
+src-cordova/platforms/
+src-cordova/plugins/
+src-cordova/www/
+src-capacitor/node_modules/
+src-capacitor/www/
+
+# Tooling / IDE
+.git/
+.gitignore
+.gitattributes
+.github/
+.idea/
+.vscode/
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+
+# Docs not needed at runtime.
+DOCS.md
+README.md

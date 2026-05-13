@@ -1356,6 +1356,47 @@ python manage.py runserver
 
 В текущем shell вне venv команда `python` отсутствовала, поэтому без активации использовать `venv/bin/python`.
 
+### 13.2. Production-сборка (Docker / Dokploy)
+
+Production-образ строится из самого каталога `arbitration-art-django/`. Артефакты:
+
+- `Dockerfile` — `python:3.13-slim` + `libpq5` (psycopg[binary] свою libpq везёт сам, build toolchain не нужен). Ставит `requirements/production.txt` (включает `gunicorn`). `ENV DJANGO_SETTINGS_MODULE=arbitration_art_django.settings.production` зашит в образе, чтобы `manage.py` и WSGI читали одни и те же settings без флагов.
+- `entrypoint.sh` — порядок старта: `migrate --noinput` → `collectstatic --noinput` → `gunicorn`. Bind на `0.0.0.0:8000`, число воркеров через `GUNICORN_WORKERS` (дефолт `3`), access/error логи в stdout/stderr.
+- `.dockerignore` — режет `venv/`, `.env*` (кроме `.env.example`), `staticfiles/`, `media/`, `.git/`, `DOCS.md`, `docker-compose.yml` и кеши. Это нужно, чтобы dev `.env` и venv не попадали в образ.
+
+Build context для Dokploy:
+
+- В Dokploy указать **Build Path** = корень репозитория, **Dockerfile Path** = `arbitration-art-django/Dockerfile`, **Build Context** = `arbitration-art-django/`. Альтернатива — подключать к Dokploy только подкаталог `arbitration-art-django/` как отдельный source.
+- Контейнер слушает порт `8000` — пробрасывать через Traefik/обратный прокси Dokploy.
+
+Обязательные env vars в Dokploy (без них контейнер не стартует):
+
+- `SECRET_KEY` — production-секрет, длинный и случайный (`openssl rand -hex 32`). Не переиспользовать dev-значение.
+- `ALLOWED_HOSTS` — список доменов через запятую (`django-environ` парсит как list).
+- `DATABASE_URL` — `postgres://user:pass@host:5432/dbname`. БД должна быть доступна из сети Dokploy (managed Postgres или соседний сервис в том же проекте).
+- `SERVICE_SHARED_TOKEN` — должен совпадать с тем же значением в `arbitration-bot-engine`.
+- `BOT_ENGINE_SERVICE_URL_DEFAULT` — URL engine-сервиса для новых `BotConfig`.
+
+Опциональные (есть дефолты в `base.py`):
+
+- `CORS_ALLOWED_ORIGINS` — origin фронтенда (`https://...`); без него API недоступен из браузера.
+- `SECURE_SSL_REDIRECT` — дефолт `True`. См. риски ниже.
+- `LANGUAGE_CODE`, `TIME_ZONE`, `SERVICE_*_TIMEOUT_SECONDS`, `GUNICORN_WORKERS`.
+
+Риски и подводные камни при деплое за reverse proxy:
+
+- **Static files.** `gunicorn` сам по себе статику не отдаёт. После `collectstatic` файлы лежат в `/app/staticfiles` внутри контейнера. В продакшене статику обслуживает Traefik/Nginx перед контейнером либо добавляется WhiteNoise (сейчас не подключён). До этого `/static/...` отдавать через прокси (volume mount) или принять, что admin не получит CSS.
+- **HTTPS redirect loop.** `production.py` задаёт `SECURE_SSL_REDIRECT=True`, `SESSION_COOKIE_SECURE`, `CSRF_COOKIE_SECURE`. Если TLS терминируется на Traefik (Dokploy default), Django увидит запрос как HTTP и уйдёт в бесконечный редирект. Решения: 1) выставить `SECURE_PROXY_SSL_HEADER=('HTTP_X_FORWARDED_PROTO','https')` в settings и убедиться, что прокси добавляет этот заголовок, 2) на время отладки выключить через `SECURE_SSL_REDIRECT=False`. Сейчас `SECURE_PROXY_SSL_HEADER` в settings не задан — это known issue для Dokploy-деплоя.
+- **Биржевые ключи и `.env`.** В образе должно быть пусто по части `.env` — секреты приходят через Dokploy env vars. Биржевые ключи в `.env` не кладём в любом случае (§10.1) — они живут в БД через `UserExchangeKeys`.
+- **Engine на отдельном хосте.** Канал Django → engine по умолчанию HTTP с `X-Service-Token`. Если engine разворачивается на другом узле, держать его на private сети или терминировать TLS на прокси между сервисами.
+
+Локальный smoke build (опционально):
+
+```bash
+cd /Users/eldar/dev/Projects/arbitration-art/arbitration-art-django
+docker build -t arbitration-art-django:local .
+```
+
 ## 14. Проверки, выполненные во время анализа
 
 Команды:
