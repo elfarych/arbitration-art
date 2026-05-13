@@ -1,78 +1,155 @@
-import * as ccxt from 'ccxt';
+import { createHmac } from 'node:crypto';
 import type { IExchangeClient } from './exchange-client.js';
 import type { OrderResult, SymbolMarketInfo } from '../types/index.js';
+import type { ExchangePosition, ExchangeTicker, MarketWsClient } from './market-ws.js';
+import type { OrderBookStore } from '../market-data/orderbook-store.js';
+import { BybitMarketWs } from './bybit-market-ws.js';
+import { bybitToUnified, unifiedToBybit } from './symbols.js';
+import { buildQuery, requestJson, sleep } from '../utils/http.js';
 import { logger } from '../utils/logger.js';
 import { config } from '../config.js';
 
 const TAG = 'BybitClient';
+const REQUEST_TIMEOUT_MS = 10_000;
+const RECV_WINDOW_MS = 15_000;
+const TIME_OFFSET_TTL_MS = 60_000;
+const FAST_RETRY_MS = 150;
+const COMMISSION_DELAYS_MS = [200, 400, 800, 1500];
+
+interface BybitResponse<T> {
+    retCode: number;
+    retMsg: string;
+    result: T;
+}
+
+interface BybitList<T> {
+    list?: T[];
+    nextPageCursor?: string;
+}
+
+interface BybitInstrument {
+    symbol?: string;
+    status?: string;
+    quoteCoin?: string;
+    settleCoin?: string;
+    priceFilter?: { tickSize?: string };
+    lotSizeFilter?: {
+        minOrderQty?: string;
+        qtyStep?: string;
+        minNotionalValue?: string;
+    };
+}
+
+interface BybitTickerRaw {
+    symbol?: string;
+    lastPrice?: string;
+    turnover24h?: string;
+}
+
+interface BybitPositionRaw {
+    symbol?: string;
+    side?: 'Buy' | 'Sell' | '';
+    size?: string;
+    avgPrice?: string;
+}
+
+interface BybitOrderRaw {
+    orderId?: string;
+    avgPrice?: string;
+    cumExecQty?: string;
+    cumExecFee?: string;
+    orderStatus?: string;
+    feeCurrency?: string;
+}
+
+interface BybitTimeRaw {
+    timeNano?: string;
+    timeSecond?: string;
+}
+
+type ApiErrorPredicate = (retCode: number, retMsg: string) => boolean;
 
 /**
- * Bybit USDT perpetual REST adapter built on ccxt.
+ * Bybit V5 linear-futures native REST adapter.
  *
- * Unlike Binance/Gate, Bybit can use ccxt directly for market loading, order
- * placement and position queries. The adapter still normalizes results into the
- * engine-wide OrderResult shape.
+ * The client signs every private request with HMAC-SHA256 over
+ * `timestamp + apiKey + recvWindow + (query or body)` exactly as Bybit
+ * documents. A cached server-time offset prevents clock-skew rejections
+ * without paying for `/v5/market/time` on every signed call.
  */
 export class BybitClient implements IExchangeClient {
-    public readonly name = 'Bybit';
-    private exchange: ccxt.bybit;
+    readonly name = 'Bybit';
+    readonly exchangeKey = 'bybit';
 
-    constructor(apiKey: string, secret: string) {
-        // defaultType=swap makes ccxt target perpetual contracts rather than spot.
-        this.exchange = new ccxt.bybit({
-            apiKey,
-            secret,
-            enableRateLimit: true,
-            ...(config.useTestnet && {
-                sandbox: true,
-            }),
-            options: {
-                defaultType: 'swap',
-            },
-        });
-    }
+    private readonly baseUrl: string;
+    private readonly markets = new Map<string, BybitInstrument>();
+    private timeOffsetMs: number | null = null;
+    private timeOffsetExpiresAt = 0;
 
-    /** Expose the underlying ccxt instance for WebSocket subscriptions */
-    get ccxtInstance(): ccxt.bybit {
-        return this.exchange;
+    constructor(private readonly apiKey: string, private readonly secret: string) {
+        this.baseUrl = config.useTestnet
+            ? 'https://api-testnet.bybit.com'
+            : 'https://api.bybit.com';
     }
 
     async loadMarkets(): Promise<void> {
-        // ccxt stores loaded market metadata on exchange.markets.
-        await this.exchange.loadMarkets();
-        logger.info(TAG, `Markets loaded: ${Object.keys(this.exchange.markets).length} symbols`);
+        const instruments = await this.fetchPublicPaginated<BybitInstrument>(
+            '/v5/market/instruments-info',
+            { category: 'linear', settleCoin: 'USDT', limit: 1000 },
+        );
+        this.markets.clear();
+        for (const instrument of instruments) {
+            if (
+                instrument.status === 'Trading'
+                && instrument.quoteCoin === 'USDT'
+                && instrument.settleCoin === 'USDT'
+                && instrument.symbol
+            ) {
+                this.markets.set(instrument.symbol, instrument);
+            }
+        }
+        logger.info(TAG, `Markets loaded: ${this.markets.size} symbols`);
     }
 
     async setLeverage(symbol: string, leverage: number): Promise<void> {
         try {
-            await this.exchange.setLeverage(leverage, symbol);
-            logger.debug(TAG, `Leverage set to ${leverage}x for ${symbol}`);
-        } catch (e: any) {
-            // Bybit may throw if leverage is already at the target value
-            if (e.message?.includes('leverage not modified') || e.message?.includes('110043')) {
-                logger.debug(TAG, `Leverage already ${leverage}x for ${symbol}`);
-            } else {
-                throw new Error(`Failed to set leverage to ${leverage}x on Bybit: ${e.message}`);
-            }
+            await this.privateRequest<unknown>(
+                'POST',
+                '/v5/position/set-leverage',
+                {
+                    category: 'linear',
+                    symbol: unifiedToBybit(symbol),
+                    buyLeverage: String(leverage),
+                    sellLeverage: String(leverage),
+                },
+                isAlreadyConfigured,
+            );
+        } catch (e: unknown) {
+            const message = errorMessage(e);
+            throw new Error(`Failed to set leverage to ${leverage}x on Bybit: ${message}`);
         }
     }
 
     async setIsolatedMargin(symbol: string): Promise<void> {
         try {
-            await this.exchange.setMarginMode('isolated', symbol);
-            logger.debug(TAG, `Isolated margin set for ${symbol}`);
-        } catch (e: any) {
-            // Bybit Unified Trading Accounts (UTA) do not support per-symbol
-            // margin mode; the API returns codes 110026/110027/110028/3400045
-            // or text including "isolated", "not modified", or "unified account".
-            // For those cases the call is a no-op and must not abort engine start.
-            const msg = e?.message || '';
-            const benign = /isolated|110026|110027|110028|3400045|unified|not modified/i.test(msg);
-            if (benign) {
-                logger.debug(TAG, `Margin mode call skipped for ${symbol}: ${msg}`);
-            } else {
-                throw new Error(`Failed to set isolated margin on Bybit: ${msg}`);
-            }
+            await this.privateRequest<unknown>(
+                'POST',
+                '/v5/position/switch-isolated',
+                {
+                    category: 'linear',
+                    symbol: unifiedToBybit(symbol),
+                    tradeMode: 1,
+                    buyLeverage: '1',
+                    sellLeverage: '1',
+                },
+                isIgnorableMarginModeResponse,
+            );
+        } catch (e: unknown) {
+            // Bybit Unified Trading Accounts cannot switch per-symbol margin
+            // modes; the `isIgnorableMarginModeResponse` predicate covers the
+            // documented retCodes, so anything reaching this catch is a real
+            // failure worth surfacing.
+            throw new Error(`Failed to set isolated margin on Bybit: ${errorMessage(e)}`);
         }
     }
 
@@ -80,112 +157,307 @@ export class BybitClient implements IExchangeClient {
         symbol: string,
         side: 'buy' | 'sell',
         amount: number,
-        params: any = {},
+        params: { reduceOnly?: boolean } = {},
     ): Promise<OrderResult> {
-        logger.debug(TAG, `Creating ${side} order for ${symbol}, amount: ${amount}`);
+        const exchangeSymbol = unifiedToBybit(symbol);
+        const body: Record<string, string | number | boolean> = {
+            category: 'linear',
+            symbol: exchangeSymbol,
+            side: side === 'buy' ? 'Buy' : 'Sell',
+            orderType: 'Market',
+            qty: formatQuantity(amount),
+            positionIdx: 0,
+        };
+        if (params.reduceOnly) body.reduceOnly = true;
 
-        const order = await this.exchange.createMarketOrder(symbol, side, amount, undefined, params);
-        let filled = order;
+        const created = await this.privateRequest<{ orderId?: string; orderLinkId?: string }>(
+            'POST',
+            '/v5/order/create',
+            body,
+        );
 
-        // Fast single retry: Bybit usually returns the filled order immediately
-        // but the average price field can be unset for the first tick after
-        // execution. A short 150ms retry avoids blocking the hot path for
-        // multiple seconds the way the previous 5×1000ms loop did.
-        if ((!filled.average || filled.status !== 'closed') && order.id) {
-            await new Promise(r => setTimeout(r, 150));
+        let fetched: BybitOrderRaw | null = null;
+        if (created.orderId) {
+            // Single fast retry to surface avgPrice + cumExecQty without
+            // blocking the hot path. Bybit's matching engine usually finalises
+            // a market fill within ~100ms but occasionally lags.
+            await sleep(FAST_RETRY_MS);
             try {
-                const checked = await this.exchange.fetchOrder(order.id, symbol);
-                if (checked) filled = checked;
-            } catch (e) {
-                // Ignore fetch errors during the quick retry.
+                fetched = await this.fetchOrderRaw(exchangeSymbol, created.orderId);
+            } catch {
+                fetched = null;
             }
         }
 
+        const avgPrice = Number(fetched?.avgPrice ?? 0);
+        const filledQty = Number(fetched?.cumExecQty ?? amount) || amount;
         const result: OrderResult = {
-            orderId: String(filled.id),
-            avgPrice: filled.average ?? filled.price ?? 0,
-            filledQty: filled.filled ?? amount,
-            // Commission is backfilled asynchronously via fetchOrderCommission
-            // to keep the latency-critical execution path short.
+            orderId: String(created.orderId ?? ''),
+            avgPrice,
+            filledQty,
             commission: 0,
             commissionAsset: 'USDT',
-            status: filled.status ?? 'unknown',
-            raw: filled,
+            status: fetched?.orderStatus === 'Filled' ? 'closed' : (fetched?.orderStatus?.toLowerCase() ?? 'unknown'),
+            raw: fetched ?? created,
         };
-
         logger.info(TAG, `Order placed: ${symbol} ${side} @ ${result.avgPrice}, qty: ${result.filledQty}, id=${result.orderId}`);
         return result;
     }
 
     async fetchOrderCommission(symbol: string, orderId: string): Promise<number> {
-        // Bybit may take a moment to attach fee details after fill; retry with
-        // backoff up to ~3 seconds in total.
-        const delays = [200, 400, 800, 1500];
-        for (let i = 0; i < delays.length; i++) {
+        const exchangeSymbol = unifiedToBybit(symbol);
+        for (let i = 0; i < COMMISSION_DELAYS_MS.length; i++) {
             try {
-                const order = await this.exchange.fetchOrder(orderId, symbol);
-                const commission = this.extractCommission(order);
-                if (commission > 0 || order.status === 'closed') {
+                const order = await this.fetchOrderRaw(exchangeSymbol, orderId);
+                const commission = Math.abs(Number(order.cumExecFee ?? 0));
+                if (commission > 0 || order.orderStatus === 'Filled') {
                     return commission;
                 }
-            } catch (e) {
-                // continue retrying
+            } catch {
+                // Retry until Bybit attaches realised fees to the order record.
             }
-            await new Promise(r => setTimeout(r, delays[i]));
+            await sleep(COMMISSION_DELAYS_MS[i]);
         }
         logger.warn(TAG, `Could not fetch commission for order ${orderId} after retries`);
         return 0;
     }
 
     getMarketInfo(symbol: string): SymbolMarketInfo | null {
-        // ccxt exchanges can report amount precision either as decimal places or
-        // as a tick size. Check precisionMode before deriving stepSize.
-        const market = this.exchange.markets[symbol];
+        const market = this.markets.get(unifiedToBybit(symbol));
         if (!market) return null;
-
-        let stepSize = 0.001;
-        if (market.precision?.amount !== undefined) {
-            const prec = Number(market.precision.amount);
-            if (this.exchange.precisionMode === (ccxt as any).TICK_SIZE) {
-                stepSize = prec;
-            } else {
-                stepSize = Math.pow(10, -prec);
-            }
-        }
-
+        const lot = market.lotSizeFilter ?? {};
+        const tickSize = Number(market.priceFilter?.tickSize ?? 0.001);
+        const stepSize = Number(lot.qtyStep ?? 0.001);
         return {
             symbol,
-            minQty: market.limits?.amount?.min ?? 0,
+            minQty: Number(lot.minOrderQty ?? 0),
             stepSize,
-            minNotional: market.limits?.cost?.min ?? 0,
-            pricePrecision: (market.precision?.price as number) ?? 8,
-            quantityPrecision: (market.precision?.amount as number) ?? 8,
+            minNotional: Number(lot.minNotionalValue ?? 0),
+            pricePrecision: tickSize > 0 ? Math.max(0, Math.round(-Math.log10(tickSize))) : 8,
+            quantityPrecision: stepSize > 0 ? Math.max(0, Math.round(-Math.log10(stepSize))) : 8,
         };
     }
 
     getUsdtSymbols(): string[] {
-        // ccxt futures symbols usually end with :USDT, e.g. BTC/USDT:USDT.
-        return Object.keys(this.exchange.markets).filter(sym => sym.endsWith(':USDT'));
+        return [...this.markets.keys()].map(bybitToUnified);
     }
 
-    private extractCommission(order: any): number {
-        // Normalize fee objects into an approximate USDT value. If the exchange
-        // charges non-USDT fees, this fallback multiplies by the order price.
-        if (order.fees && Array.isArray(order.fees)) {
-            return order.fees.reduce((total: number, fee: any) => {
-                if (fee.currency === 'USDT') {
-                    return total + (fee.cost ?? 0);
-                }
-                return total + (fee.cost ?? 0) * (order.average ?? order.price ?? 0);
-            }, 0);
+    async fetchPositions(symbols: string[]): Promise<ExchangePosition[]> {
+        const allowed = new Set(symbols.map(unifiedToBybit));
+        const positions = await this.fetchPrivatePaginated<BybitPositionRaw>(
+            '/v5/position/list',
+            { category: 'linear', settleCoin: 'USDT', limit: 200 },
+        );
+        const result: ExchangePosition[] = [];
+        for (const position of positions) {
+            const exchangeSymbol = position.symbol;
+            if (!exchangeSymbol || !allowed.has(exchangeSymbol)) continue;
+            const size = Number(position.size ?? 0);
+            if (!Number.isFinite(size) || size <= 0 || !position.side) continue;
+            result.push({
+                symbol: bybitToUnified(exchangeSymbol),
+                side: position.side === 'Buy' ? 'long' : 'short',
+                size,
+                entryPrice: Number(position.avgPrice ?? 0),
+            });
         }
-        if (order.fee) {
-            const fee = order.fee;
-            if (fee.currency === 'USDT') {
-                return fee.cost ?? 0;
-            }
-            return (fee.cost ?? 0) * (order.average ?? order.price ?? 0);
-        }
-        return 0;
+        return result;
     }
+
+    async fetchTicker(symbol: string): Promise<ExchangeTicker> {
+        const data = await this.publicRequest<BybitList<BybitTickerRaw>>('/v5/market/tickers', {
+            category: 'linear',
+            symbol: unifiedToBybit(symbol),
+        });
+        const ticker = data.list?.[0];
+        return {
+            last: Number(ticker?.lastPrice ?? 0),
+            quoteVolume: Number(ticker?.turnover24h ?? 0),
+        };
+    }
+
+    createMarketWs(store: OrderBookStore): MarketWsClient {
+        return new BybitMarketWs(store, config.useTestnet);
+    }
+
+    private async fetchOrderRaw(exchangeSymbol: string, orderId: string): Promise<BybitOrderRaw> {
+        const result = await this.privateRequest<BybitList<BybitOrderRaw>>(
+            'GET',
+            '/v5/order/realtime',
+            { category: 'linear', symbol: exchangeSymbol, orderId },
+        );
+        const order = result.list?.[0];
+        if (order) return order;
+        // realtime returns only active orders; if the order is already filled
+        // it will appear in the history endpoint instead.
+        const historic = await this.privateRequest<BybitList<BybitOrderRaw>>(
+            'GET',
+            '/v5/order/history',
+            { category: 'linear', symbol: exchangeSymbol, orderId, limit: 1 },
+        );
+        return historic.list?.[0] ?? {};
+    }
+
+    private async fetchPublicPaginated<T>(
+        endpoint: string,
+        params: Record<string, string | number>,
+    ): Promise<T[]> {
+        const all: T[] = [];
+        let cursor: string | undefined;
+        do {
+            const result = await this.publicRequest<BybitList<T>>(endpoint, { ...params, cursor });
+            all.push(...(result.list ?? []));
+            cursor = result.nextPageCursor || undefined;
+        } while (cursor);
+        return all;
+    }
+
+    private async fetchPrivatePaginated<T>(
+        endpoint: string,
+        params: Record<string, string | number>,
+    ): Promise<T[]> {
+        const all: T[] = [];
+        let cursor: string | undefined;
+        do {
+            const result = await this.privateRequest<BybitList<T>>('GET', endpoint, { ...params, cursor });
+            all.push(...(result.list ?? []));
+            cursor = result.nextPageCursor || undefined;
+        } while (cursor);
+        return all;
+    }
+
+    private async publicRequest<T>(
+        endpoint: string,
+        params: Record<string, string | number | undefined>,
+    ): Promise<T> {
+        const compact = compactParams(params);
+        const query = buildQuery(compact);
+        const url = query ? `${this.baseUrl}${endpoint}?${query}` : `${this.baseUrl}${endpoint}`;
+        const response = await requestJson<BybitResponse<T>>(url, { method: 'GET', timeoutMs: REQUEST_TIMEOUT_MS });
+        if (response.retCode !== 0) {
+            throw new Error(`Bybit public REST failed: ${response.retMsg}`);
+        }
+        return response.result;
+    }
+
+    private async privateRequest<T>(
+        method: 'GET' | 'POST',
+        endpoint: string,
+        params: Record<string, string | number | boolean | undefined>,
+        ignore: ApiErrorPredicate = () => false,
+    ): Promise<T> {
+        if (!this.apiKey || !this.secret) {
+            throw new Error('Bybit API credentials are required.');
+        }
+        const compact = compactParams(params);
+        let response = await this.sendPrivate<T>(method, endpoint, compact);
+        if (response.retCode !== 0 && isTimestampWindowError(response.retMsg)) {
+            // Refresh the time-offset cache and retry once. Cheaper than paying
+            // for `/v5/market/time` before every signed call.
+            await this.refreshTimeOffset();
+            response = await this.sendPrivate<T>(method, endpoint, compact);
+        }
+        if (response.retCode !== 0 && !ignore(response.retCode, response.retMsg)) {
+            throw new Error(`Bybit private REST failed (${response.retCode}): ${response.retMsg}`);
+        }
+        return response.result;
+    }
+
+    private async sendPrivate<T>(
+        method: 'GET' | 'POST',
+        endpoint: string,
+        params: Record<string, string | number | boolean>,
+    ): Promise<BybitResponse<T>> {
+        const recvWindow = String(RECV_WINDOW_MS);
+        const timestamp = String(await this.signedTimestamp());
+        const body = method === 'POST' ? JSON.stringify(params) : '';
+        const query = method === 'GET' ? buildQuery(params) : '';
+        const signPayload = `${timestamp}${this.apiKey}${recvWindow}${method === 'GET' ? query : body}`;
+        const signature = createHmac('sha256', this.secret).update(signPayload).digest('hex');
+        const url = query ? `${this.baseUrl}${endpoint}?${query}` : `${this.baseUrl}${endpoint}`;
+        return requestJson<BybitResponse<T>>(url, {
+            method,
+            body: method === 'POST' ? body : undefined,
+            timeoutMs: REQUEST_TIMEOUT_MS,
+            headers: {
+                'Content-Type': 'application/json',
+                'X-BAPI-API-KEY': this.apiKey,
+                'X-BAPI-TIMESTAMP': timestamp,
+                'X-BAPI-RECV-WINDOW': recvWindow,
+                'X-BAPI-SIGN': signature,
+            },
+        });
+    }
+
+    private async signedTimestamp(): Promise<number> {
+        if (this.timeOffsetMs === null || Date.now() >= this.timeOffsetExpiresAt) {
+            await this.refreshTimeOffset();
+        }
+        return Date.now() + (this.timeOffsetMs ?? 0);
+    }
+
+    private async refreshTimeOffset(): Promise<void> {
+        const requestedAt = Date.now();
+        const response = await requestJson<BybitResponse<BybitTimeRaw>>(
+            `${this.baseUrl}/v5/market/time`,
+            { method: 'GET', timeoutMs: REQUEST_TIMEOUT_MS },
+        );
+        const receivedAt = Date.now();
+        if (response.retCode !== 0) {
+            throw new Error(`Bybit time REST failed: ${response.retMsg}`);
+        }
+        const serverTime = bybitServerTimeMs(response.result);
+        if (serverTime === null) {
+            throw new Error('Bybit time REST returned an invalid timestamp.');
+        }
+        const localMidpoint = Math.floor((requestedAt + receivedAt) / 2);
+        this.timeOffsetMs = serverTime - localMidpoint;
+        this.timeOffsetExpiresAt = receivedAt + TIME_OFFSET_TTL_MS;
+    }
+}
+
+function compactParams<T extends Record<string, unknown>>(params: T): Record<string, string | number | boolean> {
+    const out: Record<string, string | number | boolean> = {};
+    for (const [key, value] of Object.entries(params)) {
+        if (value === undefined || value === null || value === '') continue;
+        out[key] = value as string | number | boolean;
+    }
+    return out;
+}
+
+function isAlreadyConfigured(retCode: number): boolean {
+    // Bybit treats no-op leverage/margin updates as errors with these specific
+    // codes. Engine startup is idempotent so we map them to success.
+    return retCode === 110043 || retCode === 110025;
+}
+
+function isIgnorableMarginModeResponse(retCode: number, retMsg: string): boolean {
+    if (isAlreadyConfigured(retCode)) return true;
+    if (retCode === 110026 || retCode === 110027 || retCode === 110028 || retCode === 3400045) return true;
+    const normalized = retMsg.toLowerCase();
+    return normalized.includes('unified account')
+        || normalized.includes('not modified')
+        || normalized.includes('isolated');
+}
+
+function isTimestampWindowError(retMsg: string): boolean {
+    const normalized = retMsg.toLowerCase();
+    return normalized.includes('timestamp') || normalized.includes('recv_window');
+}
+
+function bybitServerTimeMs(time: BybitTimeRaw): number | null {
+    const nano = Number(time.timeNano);
+    if (Number.isFinite(nano) && nano > 0) return Math.floor(nano / 1_000_000);
+    const second = Number(time.timeSecond);
+    if (Number.isFinite(second) && second > 0) return Math.floor(second * 1000);
+    return null;
+}
+
+function formatQuantity(value: number): string {
+    return Number(value).toFixed(12).replace(/0+$/, '').replace(/\.$/, '');
+}
+
+function errorMessage(error: unknown): string {
+    if (error instanceof Error) return error.message;
+    return String(error);
 }

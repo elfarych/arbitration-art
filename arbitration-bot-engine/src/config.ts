@@ -11,8 +11,17 @@ function requireEnv(name: string): string {
     if (!value) {
         throw new Error(`[Config] Missing required environment variable: ${name}`);
     }
-
     return value;
+}
+
+function readPositiveInt(name: string, fallback: number): number {
+    const raw = process.env[name];
+    if (raw === undefined || raw.trim() === '') return fallback;
+    const parsed = Number(raw.replace(/_/g, ''));
+    if (!Number.isFinite(parsed) || parsed <= 0) {
+        throw new Error(`[Config] ${name} must be a positive number`);
+    }
+    return parsed;
 }
 
 export const config = {
@@ -28,4 +37,17 @@ export const config = {
     tradeAmountUsdt: Number(process.env.TRADE_AMOUNT_USDT || '50'),
     // Shared service token for Django <-> runtime communication.
     serviceToken: requireEnv('SERVICE_SHARED_TOKEN'),
+    // Maximum age (ms) of an OrderBook snapshot considered fresh enough for a
+    // non-emergency trading decision. Updates older than this are treated as
+    // missing data: BotTrader skips entry/profit signals until the WS stream
+    // catches up. Emergency exits (timeout/liquidation/force-close/shutdown)
+    // intentionally bypass this guard because closing on stale prices is still
+    // safer than holding the position.
+    orderbookMaxAgeMs: readPositiveInt('ORDERBOOK_MAX_AGE_MS', 15_000),
+    // Maximum allowed difference (ms) between the local arrival timestamps of
+    // the primary and secondary snapshots used for one trading decision. A
+    // large skew means one leg's WS is lagging — comparing those books would
+    // produce a spread signal that does not exist on the live market. Set to 0
+    // to disable the check.
+    orderbookMaxSkewMs: readPositiveInt('ORDERBOOK_MAX_SKEW_MS', 2_000),
 };

@@ -1,356 +1,327 @@
-import axios, { AxiosInstance } from 'axios';
-import * as crypto from 'crypto';
+import { createHash, createHmac } from 'node:crypto';
 import type { IExchangeClient } from './exchange-client.js';
 import type { OrderResult, SymbolMarketInfo } from '../types/index.js';
+import type { ExchangePosition, ExchangeTicker, MarketWsClient } from './market-ws.js';
+import type { OrderBookStore } from '../market-data/orderbook-store.js';
+import { GateMarketWs } from './gate-market-ws.js';
+import { underscoredToUnified, unifiedToUnderscored } from './symbols.js';
+import { buildQuery, requestJson, sleep } from '../utils/http.js';
 import { logger } from '../utils/logger.js';
 import { config } from '../config.js';
 
 const TAG = 'GateClient';
+const REQUEST_TIMEOUT_MS = 10_000;
+const FAST_RETRY_MS = 150;
+const COMMISSION_DELAYS_MS = [200, 400, 800, 1500];
 
-function ccxtToGate(symbol: string): string {
-    // Convert ccxt futures symbol format (BTC/USDT:USDT) into Gate contract
-    // format (BTC_USDT).
-    return symbol.replace(':USDT', '').replace('/', '_');
+interface GateContractRaw {
+    name?: string;
+    type?: string;
+    quanto_multiplier?: string;
+    order_price_round?: string;
+    order_size_min?: string;
+    order_size_round?: string;
+    in_delisting?: boolean;
 }
 
-function gateToCcxt(gateSymbol: string): string {
-    // Convert Gate contract names back into the ccxt futures format used by
-    // orderbooks, Django bot config and MarketInfoService.
-    return gateSymbol.replace('_', '/') + ':USDT';
+interface GateOrderRaw {
+    id?: string | number;
+    status?: string;
+    fill_price?: string;
+    size?: number;
+    left?: number;
+}
+
+interface GatePositionRaw {
+    contract?: string;
+    size?: number;
+    entry_price?: string;
+}
+
+interface GateTickerRaw {
+    contract?: string;
+    last?: string;
+    volume_24h_quote?: string;
+}
+
+interface GateMyTradeRaw {
+    fee?: string;
 }
 
 /**
- * Gate USDT futures REST adapter.
+ * Gate.io USDT-futures native REST adapter.
  *
- * Gate uses a native contract-size model, so this client performs explicit
- * conversion between base-coin amounts and Gate contract sizes. It also signs
- * requests directly because the engine needs predictable request formatting.
+ * Gate signs requests with HMAC-SHA512 over `METHOD\n/api/v4/path\nQUERY\n
+ * SHA512(BODY)\nTIMESTAMP`. Trade amounts are expressed in base-coin units in
+ * the engine; this adapter converts to/from Gate contract counts via the
+ * cached `quanto_multiplier`.
  */
 export class GateClient implements IExchangeClient {
-    public readonly name = 'Gate';
-    private httpClient: AxiosInstance;
-    private baseUrl: string;
-    private markets: Map<string, any> = new Map();
-    private apiKey: string;
-    private secret: string;
+    readonly name = 'Gate';
+    readonly exchangeKey = 'gate';
 
-    constructor(apiKey: string, secret: string) {
-        // Gate has separate base URLs for futures testnet and production.
-        this.baseUrl = config.useTestnet 
+    private readonly baseUrl: string;
+    private readonly markets = new Map<string, GateContractRaw>();
+
+    constructor(private readonly apiKey: string, private readonly secret: string) {
+        this.baseUrl = config.useTestnet
             ? 'https://fx-api-testnet.gateio.ws/api/v4'
             : 'https://api.gateio.ws/api/v4';
-        this.apiKey = apiKey;
-        this.secret = secret;
-
-        this.httpClient = axios.create({
-            baseURL: this.baseUrl,
-            timeout: 10000,
-        });
-
-        // Normalize Gate error payloads into Error.message for consistent caller
-        // handling.
-        this.httpClient.interceptors.response.use(
-            response => response,
-            error => {
-                if (error.response?.data) {
-                    throw new Error(`Gate API Error: ${JSON.stringify(error.response.data)}`);
-                }
-                throw error;
-            }
-        );
-    }
-
-    // BotTrader expects a small ccxt-like surface for price and position data.
-    // GateClient supplies only the methods currently used by MarketInfoService
-    // and BotTrader cleanup/close logic.
-    get ccxtInstance(): any {
-        return {
-            fetchTime: async () => Date.now(),
-            fetchTicker: async (symbol: string) => {
-                const gateSymbol = ccxtToGate(symbol);
-                const data = await this.request('GET', '/futures/usdt/tickers', { contract: gateSymbol });
-                const t = Array.isArray(data) ? data[0] : data;
-                return {
-                    last: Number(t?.last ?? 0),
-                    quoteVolume: Number(t?.volume_24h_quote ?? 0),
-                };
-            },
-            fetchTickers: async () => {
-                // Gate tickers are converted to ccxt symbols so they align with
-                // the commonSymbols list and market info cache keys.
-                const data = await this.request('GET', '/futures/usdt/tickers');
-                const tickers: any = {};
-                for (const t of data) {
-                    tickers[gateToCcxt(t.contract)] = {
-                        last: Number(t.last),
-                        quoteVolume: Number(t.volume_24h_quote || 0)
-                    };
-                }
-                return tickers;
-            },
-            fetchPositions: async (symbols: string[]) => {
-                const results: any[] = [];
-                for (const symbol of symbols) {
-                    try {
-                        const gateSymbol = ccxtToGate(symbol);
-                        const data = await this.request('GET', `/futures/usdt/positions/${gateSymbol}`);
-                        if (data && data.size !== undefined && Number(data.size) !== 0) {
-                            const market = this.markets.get(gateSymbol);
-                            // Gate position size is reported in contracts. Convert
-                            // it back to base coin using the contract multiplier.
-                            const multiplier = Number(market?.quanto_multiplier || 1);
-                            const baseAmount = Math.abs(Number(data.size)) * multiplier;
-
-                            results.push({
-                                symbol: symbol,
-                                contracts: baseAmount,
-                                amount: baseAmount,
-                                side: Number(data.size) > 0 ? 'long' : 'short',
-                                entryPrice: parseFloat(data.entry_price || '0'),
-                            });
-                        }
-                    } catch (e: any) {
-                        logger.error(TAG, `Failed to fetch positions for ${symbol}: ${e.message}`);
-                    }
-                }
-                return results;
-            }
-        };
-    }
-
-    private sign(method: string, endpoint: string, query: string, payload: string) {
-        // Gate v4 signatures include method, full /api/v4 path, query string,
-        // SHA512 payload hash and timestamp separated by newlines.
-        const t = Math.floor(Date.now() / 1000).toString();
-        const hashedPayload = crypto.createHash('sha512').update(payload).digest('hex');
-        const signatureString = [method, endpoint, query, hashedPayload, t].join('\n');
-        
-        const sign = crypto.createHmac('sha512', this.secret).update(signatureString).digest('hex');
-        return {
-            'KEY': this.apiKey,
-            'Timestamp': t,
-            'SIGN': sign,
-        };
-    }
-
-    private async request(method: 'GET' | 'POST' | 'DELETE', endpoint: string, query: Record<string, any> = {}, data: any = null) {
-        const queryString = Object.keys(query)
-            .sort() // Gate usually requires sorted params or matched url formatting
-            .map(k => `${encodeURIComponent(k)}=${encodeURIComponent(query[k])}`)
-            .join('&');
-            
-        const payloadStr = data ? JSON.stringify(data) : '';
-        const pathStr = '/api/v4' + endpoint;
-
-        const headers = {
-            'Accept': 'application/json',
-            'Content-Type': 'application/json',
-            ...this.sign(method, pathStr, queryString, payloadStr)
-        };
-
-        const url = queryString ? `${endpoint}?${queryString}` : endpoint;
-
-        const response = await this.httpClient.request({
-            method,
-            url,
-            data: payloadStr || undefined,
-            headers
-        });
-        return response.data;
     }
 
     async loadMarkets(): Promise<void> {
-        // Cache futures contract metadata. Later methods use it for symbol
-        // conversion, contract multiplier and order-size constraints.
-        const contracts = await this.request('GET', '/futures/usdt/contracts');
+        const contracts = await this.publicRequest<GateContractRaw[]>('GET', '/futures/usdt/contracts');
         this.markets.clear();
         for (const contract of contracts) {
-            this.markets.set(contract.name, contract);
+            if (contract.name && !contract.in_delisting) {
+                this.markets.set(contract.name, contract);
+            }
         }
         logger.info(TAG, `Markets loaded: ${this.markets.size} symbols`);
     }
 
     async setLeverage(symbol: string, leverage: number): Promise<void> {
-        const gateSymbol = ccxtToGate(symbol);
+        const exchangeSymbol = unifiedToUnderscored(symbol);
         try {
-            // Gate v4 expects exactly one of these to be non-zero. `leverage`
-            // configures isolated margin; `cross_leverage_limit` configures
-            // cross. The engine intends isolated mode so cross_leverage_limit
-            // must be "0" — otherwise Gate may either reject the request or
-            // silently switch the position into cross mode.
-            await this.request('POST', `/futures/usdt/positions/${gateSymbol}/leverage`, {
-                leverage: leverage.toString(),
+            // Gate v4 expects exactly one non-zero leverage value: `leverage`
+            // configures isolated; `cross_leverage_limit` configures cross.
+            // Sending `cross_leverage_limit=0` is mandatory to keep the position
+            // in isolated mode; passing both non-zero either errors or silently
+            // switches the position to cross.
+            await this.privateRequest('POST', `/futures/usdt/positions/${exchangeSymbol}/leverage`, {
+                leverage: String(leverage),
                 cross_leverage_limit: '0',
             });
-            logger.debug(TAG, `Leverage set to ${leverage}x for ${symbol}`);
-        } catch (e: any) {
-            logger.warn(TAG, `Failed to set leverage to ${leverage}x on Gate for ${symbol}: ${e.message}`);
+        } catch (e: unknown) {
+            logger.warn(TAG, `Failed to set leverage to ${leverage}x on Gate for ${symbol}: ${errorMessage(e)}`);
         }
     }
 
     async setIsolatedMargin(symbol: string): Promise<void> {
-        const gateSymbol = ccxtToGate(symbol);
+        const exchangeSymbol = unifiedToUnderscored(symbol);
         try {
-            // Gate typically configures isolated mode dynamically when passing margin
-            // Try to force position into isolated if api supports it, or just ignore (as Gate isolates by default if not set to cross)
-            await this.request('POST', `/futures/usdt/positions/${gateSymbol}/margin`, {
-                size: "0" 
-            });
-            logger.debug(TAG, `Isolated margin logic confirmed for ${symbol}`);
-        } catch (e: any) {
-            if (e.message.includes('already in isolated')) {
-                logger.debug(TAG, `Margin already isolated for ${symbol}`);
-            } else {
-                logger.debug(TAG, `Gate fallback isolated margin skipped for ${symbol}: ${e.message}`);
-            }
+            // Gate keeps positions in isolated mode by default; calling the
+            // margin endpoint with `size=0` is a documented no-op that
+            // confirms the mode without changing position size.
+            await this.privateRequest('POST', `/futures/usdt/positions/${exchangeSymbol}/margin`, { size: '0' });
+        } catch (e: unknown) {
+            logger.debug(TAG, `Gate isolated margin call skipped for ${symbol}: ${errorMessage(e)}`);
         }
     }
 
     async createMarketOrder(
         symbol: string,
         side: 'buy' | 'sell',
-        amount: number, // Base currency (BTC)
-        params: any = {},
+        amount: number,
+        params: { reduceOnly?: boolean } = {},
     ): Promise<OrderResult> {
-        const gateSymbol = ccxtToGate(symbol);
-        const market = this.markets.get(gateSymbol);
+        const exchangeSymbol = unifiedToUnderscored(symbol);
+        const market = this.markets.get(exchangeSymbol);
+        if (!market) throw new Error(`Gate market not loaded for ${symbol}`);
 
-        if (!market) {
-            throw new Error(`Market not loaded for ${symbol}`);
-        }
+        const multiplier = Number(market.quanto_multiplier ?? 1) || 1;
+        let sizeInContracts = Math.round(amount / multiplier);
+        if (side === 'sell') sizeInContracts = -sizeInContracts;
 
-        // Convert base currency amount (for example BTC) to Gate contract count.
-        const quantoMultiplier = Number(market.quanto_multiplier);
-        let sizeInContracts = Math.round(amount / quantoMultiplier);
-
-        // Gate uses positive size for buy/long and negative size for sell/short.
-        if (side === 'sell') {
-            sizeInContracts = -sizeInContracts;
-        }
-
-        logger.debug(TAG, `Creating ${side} order for ${symbol}, amount (base): ${amount}, size (contracts): ${sizeInContracts}`);
-
-        const payload: any = {
-            contract: gateSymbol,
+        const body: Record<string, unknown> = {
+            contract: exchangeSymbol,
             size: sizeInContracts,
-            price: "0",
-            tif: "ioc"
+            price: '0',
+            tif: 'ioc',
         };
+        if (params.reduceOnly) body.reduce_only = true;
 
-        if (params.reduceOnly) {
-            payload.reduce_only = true;
-        }
+        const created = await this.privateRequest<GateOrderRaw>('POST', '/futures/usdt/orders', body, { jsonBody: true });
+        let order = created;
 
-        let orderData;
-        try {
-            orderData = await this.request('POST', '/futures/usdt/orders', {}, payload);
-        } catch (e: any) {
-            throw new Error(`Gate order failed: ${e.message}`);
-        }
-
-        let filled = orderData;
-        const orderId = orderData.id;
-        let avgPrice = parseFloat(filled.fill_price || '0');
-
-        // Fast single retry: most Gate IOC market orders fill before the POST
-        // returns, but the matching engine sometimes lags by a few hundred ms.
-        if ((avgPrice === 0 || filled.status === 'open') && orderId) {
-            await new Promise(r => setTimeout(r, 150));
+        // Fast retry covers the case where Gate accepts the IOC market order
+        // but has not yet stamped `fill_price`/`status=finished` before
+        // responding. 150ms keeps hot-path overhead negligible.
+        if ((!order.fill_price || order.fill_price === '0' || order.status === 'open') && order.id !== undefined) {
+            await sleep(FAST_RETRY_MS);
             try {
-                const checked = await this.request('GET', `/futures/usdt/orders/${orderId}`);
-                if (checked) {
-                    filled = checked;
-                    avgPrice = parseFloat(filled.fill_price || '0');
-                }
-            } catch (e) {
-                // Ignore fetch errors during the quick retry.
+                order = await this.privateRequest<GateOrderRaw>('GET', `/futures/usdt/orders/${order.id}`, {});
+            } catch {
+                // Use the initial response if the follow-up fetch fails.
             }
         }
 
-        // Compute actual filled base currency quantity
-        const filledContracts = Math.abs(Number(filled.size) - Number(filled.left || 0));
-        const filledQty = filledContracts * quantoMultiplier;
+        const filledContracts = Math.abs(Number(order.size ?? sizeInContracts)) - Math.abs(Number(order.left ?? 0));
+        const filledQty = filledContracts * multiplier;
+        const avgPrice = Number(order.fill_price ?? 0);
 
         const result: OrderResult = {
-            orderId: String(filled.id),
-            avgPrice: avgPrice,
-            filledQty: filledQty,
-            // Commission is backfilled asynchronously to keep this path fast.
+            orderId: String(order.id ?? ''),
+            avgPrice,
+            filledQty,
             commission: 0,
             commissionAsset: 'USDT',
-            status: filled.status === 'finished' ? 'closed' : filled.status,
-            raw: filled,
+            status: order.status === 'finished' ? 'closed' : (order.status ?? 'unknown'),
+            raw: order,
         };
-
         logger.info(TAG, `Order placed: ${symbol} ${side} @ ${result.avgPrice}, qty: ${result.filledQty}, id=${result.orderId}`);
         return result;
     }
 
     async fetchOrderCommission(symbol: string, orderId: string): Promise<number> {
-        const gateSymbol = ccxtToGate(symbol);
-        // Gate's my_trades endpoint flushes a few hundred ms after fill. Retry
-        // with backoff before giving up.
-        const delays = [200, 400, 800, 1500];
-        for (let i = 0; i < delays.length; i++) {
+        const exchangeSymbol = unifiedToUnderscored(symbol);
+        for (let i = 0; i < COMMISSION_DELAYS_MS.length; i++) {
             try {
-                const trades = await this.request('GET', '/futures/usdt/my_trades', {
-                    contract: gateSymbol,
-                    order: orderId,
-                });
+                const trades = await this.privateRequest<GateMyTradeRaw[]>(
+                    'GET',
+                    '/futures/usdt/my_trades',
+                    { contract: exchangeSymbol, order: orderId },
+                );
                 if (Array.isArray(trades) && trades.length > 0) {
                     let commission = 0;
-                    for (const t of trades) {
-                        commission += Math.abs(parseFloat(t.fee || '0'));
-                    }
+                    for (const trade of trades) commission += Math.abs(Number(trade.fee ?? 0));
                     return commission;
                 }
-            } catch (e: any) {
-                // continue retrying
+            } catch {
+                // Retry until the fee feed catches up.
             }
-            await new Promise(r => setTimeout(r, delays[i]));
+            await sleep(COMMISSION_DELAYS_MS[i]);
         }
         logger.warn(TAG, `Could not fetch commission for order ${orderId} after retries`);
         return 0;
     }
 
     getMarketInfo(symbol: string): SymbolMarketInfo | null {
-        // Convert Gate contract constraints into base-coin quantities so they can
-        // be compared with Binance/Bybit/MEXC limits.
-        const gateSymbol = ccxtToGate(symbol);
-        const market = this.markets.get(gateSymbol);
-        
+        const exchangeSymbol = unifiedToUnderscored(symbol);
+        const market = this.markets.get(exchangeSymbol);
         if (!market) return null;
-
-        const quantoMultiplier = Number(market.quanto_multiplier);
-        
-        // Gate precision in API response: order_price_round (e.g. "0.1")
-        const priceStep = Number(market.order_price_round);
-        
-        // Gate order size step is in contracts (order_size_round). 
-        // We convert contract step size back to base currency.
-        const sizeStepContracts = Number(market.order_size_round || '1');
-        const stepSizeBase = sizeStepContracts * quantoMultiplier;
-
-        const minQtyContracts = Number(market.order_size_min || '1');
-        const minQtyBase = minQtyContracts * quantoMultiplier;
-
+        const multiplier = Number(market.quanto_multiplier ?? 1) || 1;
+        const priceStep = Number(market.order_price_round ?? 0.001) || 0.001;
+        const sizeStepContracts = Number(market.order_size_round ?? 1) || 1;
+        const minQtyContracts = Number(market.order_size_min ?? 1) || 1;
+        const stepSizeBase = sizeStepContracts * multiplier;
+        const minQtyBase = minQtyContracts * multiplier;
         return {
             symbol,
             minQty: minQtyBase,
             stepSize: stepSizeBase,
-            minNotional: 0, // Gate calculates notional requirements mostly on size_min anyway
-            pricePrecision: Math.max(0, Math.round(-Math.log10(priceStep))),
-            quantityPrecision: Math.max(0, Math.round(-Math.log10(stepSizeBase))),
+            minNotional: 0,
+            pricePrecision: priceStep > 0 ? Math.max(0, Math.round(-Math.log10(priceStep))) : 8,
+            quantityPrecision: stepSizeBase > 0 ? Math.max(0, Math.round(-Math.log10(stepSizeBase))) : 8,
         };
     }
 
     getUsdtSymbols(): string[] {
-        const symbols: string[] = [];
+        const out: string[] = [];
         for (const contract of this.markets.values()) {
-            if (contract.type === 'direct' && contract.name.endsWith('_USDT')) {
-                symbols.push(gateToCcxt(contract.name));
+            if (contract.type === 'direct' && contract.name?.endsWith('_USDT')) {
+                out.push(underscoredToUnified(contract.name));
             }
         }
-        return symbols;
+        return out;
     }
+
+    async fetchPositions(symbols: string[]): Promise<ExchangePosition[]> {
+        const result: ExchangePosition[] = [];
+        await Promise.all(symbols.map(async symbol => {
+            const exchangeSymbol = unifiedToUnderscored(symbol);
+            try {
+                const position = await this.privateRequest<GatePositionRaw>('GET', `/futures/usdt/positions/${exchangeSymbol}`, {});
+                if (!position || position.size === undefined || Number(position.size) === 0) return;
+                const market = this.markets.get(exchangeSymbol);
+                const multiplier = Number(market?.quanto_multiplier ?? 1) || 1;
+                const baseAmount = Math.abs(Number(position.size)) * multiplier;
+                result.push({
+                    symbol,
+                    side: Number(position.size) > 0 ? 'long' : 'short',
+                    size: baseAmount,
+                    entryPrice: Number(position.entry_price ?? 0),
+                });
+            } catch (e: unknown) {
+                logger.error(TAG, `Failed to fetch positions for ${symbol}: ${errorMessage(e)}`);
+            }
+        }));
+        return result;
+    }
+
+    async fetchTicker(symbol: string): Promise<ExchangeTicker> {
+        const exchangeSymbol = unifiedToUnderscored(symbol);
+        const tickers = await this.publicRequest<GateTickerRaw[]>('GET', '/futures/usdt/tickers', { contract: exchangeSymbol });
+        const ticker = Array.isArray(tickers) ? tickers[0] : (tickers as GateTickerRaw | undefined);
+        return {
+            last: Number(ticker?.last ?? 0),
+            quoteVolume: Number(ticker?.volume_24h_quote ?? 0),
+        };
+    }
+
+    createMarketWs(store: OrderBookStore): MarketWsClient {
+        return new GateMarketWs(store, config.useTestnet);
+    }
+
+    private async publicRequest<T>(
+        method: 'GET' | 'POST',
+        path: string,
+        params: Record<string, string | number> = {},
+    ): Promise<T> {
+        const query = buildQuery(params);
+        const url = query ? `${this.baseUrl}${path}?${query}` : `${this.baseUrl}${path}`;
+        return requestJson<T>(url, { method, timeoutMs: REQUEST_TIMEOUT_MS });
+    }
+
+    private async privateRequest<T>(
+        method: 'GET' | 'POST' | 'DELETE',
+        path: string,
+        params: Record<string, unknown>,
+        options: { jsonBody?: boolean } = {},
+    ): Promise<T> {
+        if (!this.apiKey || !this.secret) {
+            throw new Error('Gate API credentials are required.');
+        }
+        const compact = compactParams(params);
+        const isBodyMethod = method === 'POST' || method === 'DELETE';
+        const queryString = !isBodyMethod || !options.jsonBody
+            ? buildSortedQuery(compact)
+            : '';
+        const bodyString = isBodyMethod && options.jsonBody
+            ? JSON.stringify(compact)
+            : '';
+        const timestamp = Math.floor(Date.now() / 1000).toString();
+        const fullPath = `/api/v4${path}`;
+        const hashedBody = createHash('sha512').update(bodyString).digest('hex');
+        const signPayload = `${method}\n${fullPath}\n${queryString}\n${hashedBody}\n${timestamp}`;
+        const signature = createHmac('sha512', this.secret).update(signPayload).digest('hex');
+        const headers: Record<string, string> = {
+            'Accept': 'application/json',
+            'Content-Type': 'application/json',
+            'KEY': this.apiKey,
+            'Timestamp': timestamp,
+            'SIGN': signature,
+        };
+        const url = queryString ? `${this.baseUrl}${path}?${queryString}` : `${this.baseUrl}${path}`;
+        try {
+            return await requestJson<T>(url, {
+                method,
+                headers,
+                body: bodyString || undefined,
+                timeoutMs: REQUEST_TIMEOUT_MS,
+            });
+        } catch (e: unknown) {
+            throw new Error(`Gate API Error: ${errorMessage(e)}`);
+        }
+    }
+}
+
+function compactParams<T extends Record<string, unknown>>(params: T): Record<string, string | number | boolean> {
+    const out: Record<string, string | number | boolean> = {};
+    for (const [key, value] of Object.entries(params)) {
+        if (value === undefined || value === null || value === '') continue;
+        out[key] = value as string | number | boolean;
+    }
+    return out;
+}
+
+function buildSortedQuery(params: Record<string, string | number | boolean>): string {
+    const entries = Object.entries(params);
+    entries.sort(([a], [b]) => a.localeCompare(b));
+    return entries.map(([key, value]) => `${encodeURIComponent(key)}=${encodeURIComponent(String(value))}`).join('&');
+}
+
+function errorMessage(error: unknown): string {
+    if (error instanceof Error) return error.message;
+    return String(error);
 }

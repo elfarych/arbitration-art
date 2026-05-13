@@ -7,21 +7,20 @@ const TAG = 'MarketInfo';
 
 /**
  * Pre-loads and caches unified market info for all tradeable symbols.
- * Called ONCE at bootstrap — never during trade execution.
  *
- * The service deliberately computes conservative constraints: for each pair it
- * picks the strictest amount and notional rules from both exchanges. That keeps
- * BotTrader from opening an amount that is valid on one leg and rejected on the
- * other.
+ * Called ONCE at bot start — never during trade execution. For every symbol
+ * the service stores the strictest of the two exchanges' lot/min/notional
+ * constraints so BotTrader cannot pick an amount valid on one leg and
+ * rejected on the other. It also runs a homonym-deviation check that drops
+ * symbols whose last prices disagree across exchanges by more than 40 %
+ * (a strong signal that the tickers refer to different underlying assets).
+ *
+ * The service is exchange-agnostic: it relies on `IExchangeClient.fetchTicker`
+ * and `getMarketInfo`, never on any ccxt-specific shape.
  */
 export class MarketInfoService {
-    private cache: Map<string, UnifiedMarketInfo> = new Map();
+    private readonly cache: Map<string, UnifiedMarketInfo> = new Map();
 
-    /**
-     * Initialize market info for all common symbols.
-     * Calculates the unified trade amount (identical for both exchanges).
-     * @returns Array of symbols that are tradeable on both exchanges.
-     */
     async initialize(
         primaryClient: IExchangeClient,
         secondaryClient: IExchangeClient,
@@ -29,44 +28,32 @@ export class MarketInfoService {
     ): Promise<string[]> {
         logger.info(TAG, `Initializing market info for ${commonSymbols.length} symbols...`);
 
-        // Fetch current prices to calculate static trade amounts and protect from ticker collisions.
-        // For a single-symbol bot we use fetchTicker(symbol) which is one cheap REST call per
-        // exchange; the previous fetchTickers() pulled thousands of tickers and added several
-        // seconds to bot startup.
         const currentPrices: Record<string, number> = {};
         const secondaryPrices: Record<string, number> = {};
         try {
             logger.info(TAG, `Fetching current prices for amount calculation and collision protection...`);
-            if (commonSymbols.length === 1) {
-                const symbol = commonSymbols[0];
-                const fetchOne = async (client: IExchangeClient): Promise<{ last?: number } | null> => {
-                    const inst = client.ccxtInstance as any;
-                    if (typeof inst.fetchTicker === 'function') {
-                        return await inst.fetchTicker(symbol);
-                    }
-                    const all = await inst.fetchTickers();
-                    return all?.[symbol] ?? null;
-                };
+            // For single-symbol bots, the native fetchTicker is one cheap REST
+            // call per exchange — avoid the legacy "fetch all tickers" path
+            // entirely; market data WS already provides every other price.
+            const results = await Promise.all(commonSymbols.map(async symbol => {
                 const [pTicker, sTicker] = await Promise.all([
-                    fetchOne(primaryClient),
-                    fetchOne(secondaryClient),
+                    primaryClient.fetchTicker(symbol).catch(err => {
+                        logger.warn(TAG, `fetchTicker ${primaryClient.name} ${symbol}: ${err.message}`);
+                        return null;
+                    }),
+                    secondaryClient.fetchTicker(symbol).catch(err => {
+                        logger.warn(TAG, `fetchTicker ${secondaryClient.name} ${symbol}: ${err.message}`);
+                        return null;
+                    }),
                 ]);
-                if (pTicker?.last) currentPrices[symbol] = Number(pTicker.last);
-                if (sTicker?.last) secondaryPrices[symbol] = Number(sTicker.last);
-            } else {
-                const [pTickers, sTickers] = await Promise.all([
-                    primaryClient.ccxtInstance.fetchTickers(),
-                    secondaryClient.ccxtInstance.fetchTickers(),
-                ]);
-                for (const sym of commonSymbols) {
-                    // ccxt symbols are used as stable keys throughout the engine,
-                    // even when a REST client internally uses native exchange IDs.
-                    if (pTickers[sym]?.last) currentPrices[sym] = pTickers[sym].last;
-                    if (sTickers[sym]?.last) secondaryPrices[sym] = sTickers[sym].last;
-                }
+                return { symbol, pLast: pTicker?.last ?? 0, sLast: sTicker?.last ?? 0 };
+            }));
+            for (const { symbol, pLast, sLast } of results) {
+                if (pLast > 0) currentPrices[symbol] = pLast;
+                if (sLast > 0) secondaryPrices[symbol] = sLast;
             }
         } catch (e: any) {
-            logger.warn(TAG, `Could not fetch tickers for exact amounts/collisions: ${e.message}`);
+            logger.warn(TAG, `Could not fetch tickers for amounts/collisions: ${e.message}`);
         }
 
         const tradeableSymbols: string[] = [];
@@ -80,7 +67,6 @@ export class MarketInfoService {
                 continue;
             }
 
-            // Use the strictest constraints from both exchanges
             const stepSize = Math.max(primaryInfo.stepSize, secondaryInfo.stepSize);
             const minQty = Math.max(primaryInfo.minQty, secondaryInfo.minQty);
             const minNotional = Math.max(primaryInfo.minNotional, secondaryInfo.minNotional);
@@ -89,11 +75,7 @@ export class MarketInfoService {
             const currentPrice = currentPrices[symbol];
             const secondaryPrice = secondaryPrices[symbol];
 
-            // ==== Homonym / Ticker Collision Protection ====
             if (currentPrice && secondaryPrice) {
-                // Some exchanges list different assets under the same ticker. A
-                // large cross-exchange last-price deviation is treated as a strong
-                // signal that the pair is not the same underlying instrument.
                 const deviation = Math.abs(currentPrice - secondaryPrice) / Math.min(currentPrice, secondaryPrice);
                 if (deviation > 0.40) {
                     logger.warn(TAG, `🚨 HOMONYM DETECTED: Skipping ${symbol}. Deviation: ${(deviation * 100).toFixed(0)}%. (${primaryClient.name}: ${currentPrice}, ${secondaryClient.name}: ${secondaryPrice})`);
@@ -105,37 +87,25 @@ export class MarketInfoService {
             }
 
             if (currentPrice) {
-                // tradeAmountUsdt is a per-bot fallback notional budget used only
-                // when the bot config does not provide an explicit coin_amount.
-                // BotTrader.checkSpreads still recomputes the amount per-tick from
-                // the live orderbook price, so this value mainly drives the
-                // tradeable/minimum-size pre-check.
                 const rawAmount = config.tradeAmountUsdt / currentPrice;
-                // Round DOWN to step size
                 tradeAmount = Math.floor(rawAmount / stepSize) * stepSize;
-                
-                // Validate against minimums
                 const notionalValue = tradeAmount * currentPrice;
                 if (tradeAmount < minQty || notionalValue < minNotional) {
-                    logger.debug(TAG, `Skipping ${symbol}: calculated amount ${tradeAmount} does not meet minimums. (${tradeAmount} < ${minQty} or ${notionalValue} < ${minNotional})`);
-                    continue; // exclude from tradeable
+                    logger.debug(TAG, `Skipping ${symbol}: calculated amount ${tradeAmount} does not meet minimums.`);
+                    continue;
                 }
-
-                // Clean up float errors, ensuring precision is at least 0.
                 const precision = Math.max(0, Math.round(-Math.log10(stepSize)));
                 tradeAmount = parseFloat(tradeAmount.toFixed(precision));
             }
 
-            const unified: UnifiedMarketInfo = {
+            this.cache.set(symbol, {
                 symbol,
                 stepSize,
                 minQty,
                 minNotional,
-                tradeAmount, // Pre-calculated fixed amount!
+                tradeAmount,
                 tradeable: true,
-            };
-
-            this.cache.set(symbol, unified);
+            });
             tradeableSymbols.push(symbol);
         }
 
@@ -143,9 +113,6 @@ export class MarketInfoService {
         return tradeableSymbols;
     }
 
-    /**
-     * Get cached market info for a symbol.
-     */
     getInfo(symbol: string): UnifiedMarketInfo | undefined {
         return this.cache.get(symbol);
     }

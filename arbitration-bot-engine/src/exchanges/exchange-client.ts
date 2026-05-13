@@ -1,52 +1,67 @@
 import type { OrderResult, SymbolMarketInfo } from '../types/index.js';
+import type { ExchangePosition, ExchangeTicker, MarketWsClient } from './market-ws.js';
+import type { OrderBookStore } from '../market-data/orderbook-store.js';
 
 /**
- * Unified interface for exchange operations.
- * Every REST exchange adapter implements this contract so BotTrader can execute
- * the same open/close workflow without depending on exchange-specific APIs.
+ * Unified interface implemented by every native REST exchange adapter.
  *
- * WebSocket orderbook streaming is intentionally not part of this interface:
- * Engine creates separate ccxt.pro clients for that concern.
+ * The engine intentionally has no `ccxt` runtime dependency. Each adapter
+ * speaks the exchange's REST API directly and exposes the small surface that
+ * BotTrader, MarketInfoService and exchange-tester actually use.
+ *
+ * Market data streaming is a separate concern delivered through the
+ * `createMarketWs` factory, which returns a self-contained WebSocket client
+ * that pushes parsed snapshots into the shared `OrderBookStore`.
  */
 export interface IExchangeClient {
+    /** Display name used in logs and `<name>_futures` Django payload fields. */
     readonly name: string;
 
-    /** Expose underlying ccxt instance */
-    readonly ccxtInstance: any;
+    /** Lowercase tag matching OrderBookStore exchange keys (`binance`/`bybit`/...). */
+    readonly exchangeKey: string;
 
-    /** Load all market data (call once at bootstrap) */
+    /** Cache market metadata once at startup; must be called before signing-sensitive ops. */
     loadMarkets(): Promise<void>;
 
-    /** Set leverage for a specific symbol */
+    /** Set leverage for a specific unified symbol. Idempotent across calls. */
     setLeverage(symbol: string, leverage: number): Promise<void>;
 
-    /** Set margin mode to isolated for a specific symbol */
+    /** Switch the symbol to isolated margin mode. Idempotent across calls. */
     setIsolatedMargin(symbol: string): Promise<void>;
 
     /**
-     * Place a market order. Returns as soon as the exchange acknowledges the
-     * fill with orderId + avgPrice + filledQty. Commission is NOT fetched here
-     * because that would block the latency-critical execution path; use
-     * fetchOrderCommission afterwards (typically as a background task).
+     * Place a market order. Returns once the exchange confirms a fill with
+     * orderId/avgPrice/filledQty. Commission backfill is intentionally split
+     * into `fetchOrderCommission` so the hot path never blocks on fee polling.
      */
     createMarketOrder(
         symbol: string,
         side: 'buy' | 'sell',
         amount: number,
-        params?: any,
+        params?: { reduceOnly?: boolean },
     ): Promise<OrderResult>;
 
     /**
-     * Fetch the realized commission (in USDT equivalent) for a previously placed
-     * order. Implementations should retry briefly because exchange fee endpoints
-     * may lag behind the order itself by hundreds of milliseconds. Returns 0 if
-     * the commission cannot be determined.
+     * Fetch realised commission for a previously placed order. Returns 0 if
+     * the exchange does not surface the fee within the internal retry budget.
      */
     fetchOrderCommission(symbol: string, orderId: string): Promise<number>;
 
-    /** Get market info (lot sizes, precision, etc.) for a symbol */
+    /** Lot/precision/min-notional info derived from cached market metadata. */
     getMarketInfo(symbol: string): SymbolMarketInfo | null;
 
-    /** Get all available USDT perpetual symbols */
+    /** All USDT-perpetual symbols available on this exchange (unified format). */
     getUsdtSymbols(): string[];
+
+    /** Fetch open positions for the given symbols, returning a normalised list. */
+    fetchPositions(symbols: string[]): Promise<ExchangePosition[]>;
+
+    /** Fetch the latest ticker for a single symbol (last price + 24h quote volume). */
+    fetchTicker(symbol: string): Promise<ExchangeTicker>;
+
+    /**
+     * Factory for the matching native market data WS client. The client
+     * pushes snapshots into the supplied store keyed by `exchangeKey`.
+     */
+    createMarketWs(store: OrderBookStore): MarketWsClient;
 }

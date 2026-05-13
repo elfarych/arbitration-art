@@ -11,9 +11,9 @@ const TAG = 'ExchangeTester';
  * On-demand exchange key tests invoked from Django's user profile.
  *
  * These helpers are intentionally decoupled from BotTrader and the Engine
- * lifecycle: they spin up a short-lived client, run the requested probe,
- * and return a structured result. They never touch the engine's bot
- * registry and never persist anything on the engine side.
+ * lifecycle: they spin up a short-lived native REST client, run the
+ * requested probe, and return a structured result. They never touch the
+ * engine's bot registry and never persist anything on the engine side.
  *
  * Routing test trades through the engine — instead of letting Django call
  * the exchange directly — guarantees that the same code path responsible
@@ -66,14 +66,10 @@ export function isSupportedExchange(value: unknown): value is SupportedExchange 
 
 function buildClient(exchange: SupportedExchange, apiKey: string, secret: string): IExchangeClient {
     switch (exchange) {
-        case 'binance':
-            return new BinanceClient(apiKey, secret);
-        case 'bybit':
-            return new BybitClient(apiKey, secret);
-        case 'gate':
-            return new GateClient(apiKey, secret);
-        case 'mexc':
-            return new MexcClient(apiKey, secret);
+        case 'binance': return new BinanceClient(apiKey, secret);
+        case 'bybit':   return new BybitClient(apiKey, secret);
+        case 'gate':    return new GateClient(apiKey, secret);
+        case 'mexc':    return new MexcClient(apiKey, secret);
     }
 }
 
@@ -82,27 +78,22 @@ async function safeCheck(name: string, fn: () => Promise<string>): Promise<Check
         const detail = await fn();
         return { name, ok: true, detail };
     } catch (e: any) {
-        const msg = e?.message || String(e);
-        return { name, ok: false, detail: msg };
+        return { name, ok: false, detail: e?.message || String(e) };
     }
 }
 
 /**
- * Read-only probe: load markets and fetch SOL/USDT positions. fetchPositions
- * is the smallest auth-requiring call that exercises futures read permissions
- * across all four exchanges via their existing engine clients.
+ * Read-only probe: load markets and fetch SOL/USDT positions.
+ * `fetchPositions` is the smallest auth-requiring call that exercises
+ * futures read permissions across all four exchanges through the unified
+ * `IExchangeClient` surface.
  */
 export async function testConnection(
     exchange: SupportedExchange,
     apiKey: string,
     secret: string,
 ): Promise<ConnectionTestResult> {
-    const result: ConnectionTestResult = {
-        ok: false,
-        exchange,
-        checks: [],
-        error: '',
-    };
+    const result: ConnectionTestResult = { ok: false, exchange, checks: [], error: '' };
 
     let client: IExchangeClient;
     try {
@@ -123,8 +114,8 @@ export async function testConnection(
     }
 
     const positions = await safeCheck('Fetch positions', async () => {
-        const data = await client.ccxtInstance.fetchPositions([TEST_TRADE_SYMBOL]);
-        return `positions fetched: ${Array.isArray(data) ? data.length : 0}`;
+        const data = await client.fetchPositions([TEST_TRADE_SYMBOL]);
+        return `positions fetched: ${data.length}`;
     });
     result.checks.push(positions);
     if (!positions.ok) {
@@ -150,11 +141,11 @@ function roundQty(client: IExchangeClient, symbol: string, raw: number): number 
 }
 
 /**
- * Round-trip futures trade: opens a market long sized to (margin_usd *
- * leverage) notional and immediately closes it with reduceOnly. Each leg's
- * wall-clock latency is captured around the createMarketOrder call so the
- * caller can attribute time to the exchange's matching engine rather than
- * any Django/Fastify hop.
+ * Round-trip futures trade: opens a market long sized to
+ * (margin_usd * leverage) notional and immediately closes it with
+ * reduceOnly. Each leg's wall-clock latency is captured around the
+ * createMarketOrder call so the caller can attribute time to the exchange's
+ * matching engine rather than any Django/Fastify hop.
  */
 export async function testTrade(
     exchange: SupportedExchange,
@@ -199,8 +190,6 @@ export async function testTrade(
         return result;
     }
 
-    // Best-effort margin setup. Most exchanges treat "already isolated" as a
-    // soft error; the helpers in each client already swallow those cases.
     try {
         await client.setIsolatedMargin(symbol);
         result.steps.push({ name: 'Set margin mode', ok: true, detail: 'isolated' });
@@ -220,19 +209,15 @@ export async function testTrade(
 
     let lastPrice = 0;
     try {
-        const ticker = await client.ccxtInstance.fetchTicker(symbol);
-        lastPrice = coerce(ticker?.last ?? ticker?.close);
+        const ticker = await client.fetchTicker(symbol);
+        lastPrice = coerce(ticker.last);
         if (lastPrice <= 0) throw new Error('Empty ticker price');
         const notional = TEST_TRADE_MARGIN_USD * TEST_TRADE_LEVERAGE;
         const rawQty = notional / lastPrice;
         const qty = roundQty(client, symbol, rawQty);
         if (qty <= 0) throw new Error('Quantity rounds to zero; increase margin_usd');
         result.quantity = qty;
-        result.steps.push({
-            name: 'Size order',
-            ok: true,
-            detail: `qty=${qty} price=${lastPrice}`,
-        });
+        result.steps.push({ name: 'Size order', ok: true, detail: `qty=${qty} price=${lastPrice}` });
     } catch (e: any) {
         const msg = e?.message ?? String(e);
         result.steps.push({ name: 'Size order', ok: false, detail: msg });
@@ -262,9 +247,7 @@ export async function testTrade(
 
     try {
         const t0 = Date.now();
-        const closeOrder = await client.createMarketOrder(symbol, 'sell', result.quantity, {
-            reduceOnly: true,
-        });
+        const closeOrder = await client.createMarketOrder(symbol, 'sell', result.quantity, { reduceOnly: true });
         const t1 = Date.now();
         result.close_latency_ms = t1 - t0;
         result.close_order_id = String(closeOrder.orderId || '');
@@ -276,8 +259,6 @@ export async function testTrade(
         });
     } catch (e: any) {
         const msg = e?.message ?? String(e);
-        // The position is still open at this point — surface that loudly so the
-        // user knows they need to close it manually.
         result.steps.push({ name: 'Close long', ok: false, detail: msg });
         result.error = `Close order failed: ${msg}. Position is likely still OPEN; close it manually.`;
         logger.error(TAG, `Close failed for ${exchange} test trade: ${msg}`);

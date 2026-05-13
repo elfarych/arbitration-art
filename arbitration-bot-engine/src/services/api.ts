@@ -1,67 +1,82 @@
-import axios, { AxiosInstance } from 'axios';
 import { config } from '../config.js';
 import type { TradeClosePayload, TradeOpenPayload, TradeRecord } from '../types/index.js';
+import { requestJson } from '../utils/http.js';
 import { logger } from '../utils/logger.js';
 
 const TAG = 'API';
+const REQUEST_TIMEOUT_MS = 15_000;
 
-// Shared Django API client used for service-to-service trade persistence and
-// recovery. JWT is not used here; the runtime authenticates with a service token.
-const client: AxiosInstance = axios.create({
-    baseURL: config.djangoApiUrl,
-    headers: {
-        'Content-Type': 'application/json',
-        'X-Service-Token': config.serviceToken,
-    },
-    timeout: 15000,
-});
+const baseUrl = config.djangoApiUrl.replace(/\/$/, '');
+const authHeaders: Record<string, string> = {
+    'Content-Type': 'application/json',
+    'X-Service-Token': config.serviceToken,
+};
+
+interface DjangoListResponse<T> {
+    results?: T[];
+}
+
+async function djangoRequest<T>(
+    method: 'GET' | 'POST' | 'PATCH',
+    path: string,
+    options: { body?: unknown; query?: Record<string, string | number> } = {},
+): Promise<T> {
+    const query = options.query
+        ? new URLSearchParams(Object.entries(options.query).map(([k, v]) => [k, String(v)])).toString()
+        : '';
+    const url = `${baseUrl}${path}${query ? `?${query}` : ''}`;
+    return requestJson<T>(url, {
+        method,
+        headers: authHeaders,
+        body: options.body !== undefined ? JSON.stringify(options.body) : undefined,
+        timeoutMs: REQUEST_TIMEOUT_MS,
+    });
+}
 
 /**
  * Thin adapter around Django trade endpoints.
  *
- * BotTrader should not know endpoint URLs or pagination formats; it calls this
- * module with normalized payloads and receives normalized TradeRecord objects.
+ * BotTrader does not know endpoint URLs or pagination formats; it calls this
+ * module with normalised payloads and receives normalised TradeRecord objects.
+ * Authentication is via `X-Service-Token` shared with Django; no JWT is used
+ * on the service-to-service channel.
  */
 export const api = {
     async openTrade(payload: TradeOpenPayload): Promise<TradeRecord> {
         try {
-            const { data } = await client.post('/bots/real-trades/', payload);
+            const data = await djangoRequest<TradeRecord>('POST', '/bots/real-trades/', { body: payload });
             logger.info(TAG, `Trade opened in Django: ID=${data.id}, coin=${data.coin}`);
             return data;
         } catch (e: any) {
-            logger.error(TAG, `openTrade failed: ${e?.response?.status} ${JSON.stringify(e?.response?.data) || e.message}`);
+            logger.error(TAG, `openTrade failed: ${e.message}`);
             throw e;
         }
     },
 
     async closeTrade(id: number, payload: TradeClosePayload): Promise<TradeRecord> {
         try {
-            const { data } = await client.patch(`/bots/real-trades/${id}/`, payload);
+            const data = await djangoRequest<TradeRecord>('PATCH', `/bots/real-trades/${id}/`, { body: payload });
             logger.info(TAG, `Trade closed in Django: ID=${id}, profit=${payload.profit_usdt} USDT`);
             return data;
         } catch (e: any) {
-            logger.error(TAG, `closeTrade failed for ID=${id}: ${e?.response?.status} ${JSON.stringify(e?.response?.data) || e.message}`);
+            logger.error(TAG, `closeTrade failed for ID=${id}: ${e.message}`);
             throw e;
         }
     },
 
     async updateTrade(id: number, payload: Record<string, any>): Promise<TradeRecord> {
-        // Partial PATCH used by the engine to backfill open/close commission and
-        // recomputed PnL after the synchronous trade write. Failures are surfaced
-        // to the caller so background tasks can log and move on.
-        const { data } = await client.patch(`/bots/real-trades/${id}/`, payload);
-        return data;
+        return djangoRequest<TradeRecord>('PATCH', `/bots/real-trades/${id}/`, { body: payload });
     },
 
     async getOpenTrades(botId: number): Promise<TradeRecord[]> {
         try {
-            const { data } = await client.get('/bots/real-trades/', {
-                params: {
-                    status: 'open',
-                    bot_id: botId,
-                },
-            });
-            return data.results || data || [];
+            const data = await djangoRequest<DjangoListResponse<TradeRecord> | TradeRecord[]>(
+                'GET',
+                '/bots/real-trades/',
+                { query: { status: 'open', bot_id: botId } },
+            );
+            if (Array.isArray(data)) return data;
+            return data.results ?? [];
         } catch (e: any) {
             logger.error(TAG, `getOpenTrades failed: ${e.message}`);
             return [];
@@ -70,8 +85,7 @@ export const api = {
 
     async openEmulationTrade(payload: TradeOpenPayload): Promise<TradeRecord> {
         try {
-            const { data } = await client.post('/bots/trades/', payload);
-            return data;
+            return await djangoRequest<TradeRecord>('POST', '/bots/trades/', { body: payload });
         } catch (e: any) {
             logger.error(TAG, `openEmulationTrade failed: ${e.message}`);
             throw e;
@@ -80,8 +94,7 @@ export const api = {
 
     async closeEmulationTrade(id: number, payload: TradeClosePayload): Promise<TradeRecord> {
         try {
-            const { data } = await client.patch(`/bots/trades/${id}/`, payload);
-            return data;
+            return await djangoRequest<TradeRecord>('PATCH', `/bots/trades/${id}/`, { body: payload });
         } catch (e: any) {
             logger.error(TAG, `closeEmulationTrade failed: ${e.message}`);
             throw e;
@@ -89,20 +102,18 @@ export const api = {
     },
 
     async updateEmulationTrade(id: number, payload: Record<string, any>): Promise<TradeRecord> {
-        // Symmetric to updateTrade for emulation trades.
-        const { data } = await client.patch(`/bots/trades/${id}/`, payload);
-        return data;
+        return djangoRequest<TradeRecord>('PATCH', `/bots/trades/${id}/`, { body: payload });
     },
 
     async getOpenEmulationTrades(botId: number): Promise<TradeRecord[]> {
         try {
-            const { data } = await client.get('/bots/trades/', {
-                params: {
-                    status: 'open',
-                    bot_id: botId,
-                },
-            });
-            return data.results || data || [];
+            const data = await djangoRequest<DjangoListResponse<TradeRecord> | TradeRecord[]>(
+                'GET',
+                '/bots/trades/',
+                { query: { status: 'open', bot_id: botId } },
+            );
+            if (Array.isArray(data)) return data;
+            return data.results ?? [];
         } catch (e: any) {
             logger.error(TAG, `getOpenEmulationTrades failed: ${e.message}`);
             return [];
