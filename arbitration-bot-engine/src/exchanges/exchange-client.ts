@@ -30,6 +30,19 @@ export interface IExchangeClient {
     setIsolatedMargin(symbol: string): Promise<void>;
 
     /**
+     * Optional warm-up for account/position-level settings that influence
+     * order construction (e.g. Binance Hedge Mode `positionSide`, Bybit
+     * `positionIdx`, Gate `auto_size`). Called once when a bot starts and
+     * before any test trade, so the hot path never pays for a per-order
+     * probe. The `symbol` is supplied because some exchanges (Bybit) expose
+     * the flag per-symbol; adapters that only need an account-level flag may
+     * ignore it. Implementations must be idempotent and never throw — any
+     * failure must be swallowed and reported via logger; the adapter is then
+     * free to fall back to the exchange's default mode on the first order.
+     */
+    prefetchAccountSettings?(symbol: string): Promise<void>;
+
+    /**
      * Place a market order. Returns once the exchange confirms a fill with
      * orderId/avgPrice/filledQty. Commission backfill is intentionally split
      * into `fetchOrderCommission` so the hot path never blocks on fee polling.

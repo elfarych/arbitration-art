@@ -108,6 +108,35 @@ export class MexcClient implements IExchangeClient {
         logger.info(TAG, `Markets loaded: ${this.markets.size} symbols`);
     }
 
+    /**
+     * Log MEXC position mode (1 = hedge, 2 = one-way) at startup. MEXC's side
+     * encoding (1=open_long / 2=close_long / 3=open_short / 4=close_short) is
+     * identical in both modes per the docs, so this is purely diagnostic — it
+     * surfaces the mode in logs and warns when the account is in one-way mode
+     * so any unexpected rejections can be traced quickly. `symbol` is ignored
+     * because MEXC position mode is account-level.
+     */
+    async prefetchAccountSettings(_symbol: string): Promise<void> {
+        try {
+            const raw = await this.signedRequest<number | { positionMode?: number }>(
+                'GET',
+                '/api/v1/private/position/position_mode',
+                {},
+            );
+            const mode = typeof raw === 'number' ? raw : Number((raw ?? {}).positionMode ?? 0);
+            const label = mode === 1 ? 'Hedge' : mode === 2 ? 'One-Way' : `Unknown(${mode})`;
+            logger.info(TAG, `Account position mode: ${label}`);
+            if (mode === 2) {
+                logger.warn(
+                    TAG,
+                    'MEXC account is in one-way mode. Order side encoding stays the same per MEXC docs, but report any unexpected rejections.',
+                );
+            }
+        } catch (e: unknown) {
+            logger.warn(TAG, `prefetchAccountSettings failed: ${errorMessage(e)}`);
+        }
+    }
+
     async setLeverage(symbol: string, leverage: number): Promise<void> {
         const exchangeSymbol = unifiedToUnderscored(symbol);
         try {

@@ -53,17 +53,29 @@ export class Engine {
             await marketInfo.initialize(primaryRest, secondaryRest, [config.coin]);
 
             // Margin/leverage setup is parallelised both inside each leg
-            // (margin + leverage) and across the two legs. Failures here are
-            // logged but never abort startBot — every supported exchange
-            // returns either a no-op or a benign error for repeated calls.
+            // (margin + leverage + optional account-settings prefetch) and
+            // across the two legs. `prefetchAccountSettings` warms adapter-
+            // specific account flags (e.g. Binance Hedge Mode) so the first
+            // order never has to probe them lazily on the hot path. Failures
+            // here are logged but never abort startBot — every supported
+            // exchange returns either a no-op or a benign error for repeated
+            // calls, and the adapter falls back to its own sensible default.
             if (isReal) {
+                const legSetup = (rest: IExchangeClient, leverage: number): Promise<any>[] => {
+                    const tasks: Promise<any>[] = [
+                        rest.setIsolatedMargin(config.coin),
+                        rest.setLeverage(config.coin, leverage),
+                    ];
+                    if (typeof rest.prefetchAccountSettings === 'function') {
+                        tasks.push(rest.prefetchAccountSettings(config.coin));
+                    }
+                    return tasks;
+                };
+
                 const setupTasks: Promise<any>[] = [];
                 if (tradePrimary) {
                     setupTasks.push(
-                        Promise.allSettled([
-                            primaryRest.setIsolatedMargin(config.coin),
-                            primaryRest.setLeverage(config.coin, config.primary_leverage),
-                        ]).then(results => {
+                        Promise.allSettled(legSetup(primaryRest, config.primary_leverage)).then(results => {
                             for (const r of results) {
                                 if (r.status === 'rejected') {
                                     logger.warn('Engine', `Primary leg setup warning: ${r.reason?.message ?? r.reason}`);
@@ -74,10 +86,7 @@ export class Engine {
                 }
                 if (tradeSecondary) {
                     setupTasks.push(
-                        Promise.allSettled([
-                            secondaryRest.setIsolatedMargin(config.coin),
-                            secondaryRest.setLeverage(config.coin, config.secondary_leverage),
-                        ]).then(results => {
+                        Promise.allSettled(legSetup(secondaryRest, config.secondary_leverage)).then(results => {
                             for (const r of results) {
                                 if (r.status === 'rejected') {
                                     logger.warn('Engine', `Secondary leg setup warning: ${r.reason?.message ?? r.reason}`);

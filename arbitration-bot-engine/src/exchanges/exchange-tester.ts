@@ -190,6 +190,18 @@ export async function testTrade(
         return result;
     }
 
+    // Warm adapter-level account settings (e.g. Binance Hedge Mode) before
+    // the first order so it can be constructed correctly on first try
+    // instead of relying on a lazy in-order probe.
+    if (typeof client.prefetchAccountSettings === 'function') {
+        try {
+            await client.prefetchAccountSettings(symbol);
+            result.steps.push({ name: 'Prefetch account settings', ok: true, detail: 'ok' });
+        } catch (e: any) {
+            result.steps.push({ name: 'Prefetch account settings', ok: false, detail: e?.message ?? String(e) });
+        }
+    }
+
     try {
         await client.setIsolatedMargin(symbol);
         result.steps.push({ name: 'Set margin mode', ok: true, detail: 'isolated' });

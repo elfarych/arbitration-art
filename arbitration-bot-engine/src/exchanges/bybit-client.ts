@@ -85,6 +85,10 @@ export class BybitClient implements IExchangeClient {
     private readonly markets = new Map<string, BybitInstrument>();
     private timeOffsetMs: number | null = null;
     private timeOffsetExpiresAt = 0;
+    // Per-symbol position-mode cache. Bybit V5 toggles Hedge vs One-Way
+    // per-symbol on linear futures, so the flag has to live keyed by the
+    // exchange symbol rather than as a single account-level boolean.
+    private readonly positionModePromises = new Map<string, Promise<'hedge' | 'one-way'>>();
 
     constructor(private readonly apiKey: string, private readonly secret: string) {
         this.baseUrl = config.useTestnet
@@ -130,6 +134,21 @@ export class BybitClient implements IExchangeClient {
         }
     }
 
+    /**
+     * Resolve per-symbol Hedge vs One-Way mode once before the first order.
+     * `Engine.startBot` calls this in parallel with margin/leverage setup, and
+     * the test-trade endpoint calls it before opening the leg. The cache
+     * survives for the life of this client instance.
+     */
+    async prefetchAccountSettings(symbol: string): Promise<void> {
+        try {
+            const mode = await this.getPositionMode(symbol);
+            logger.info(TAG, `Position mode for ${symbol}: ${mode === 'hedge' ? 'Hedge' : 'One-Way'}`);
+        } catch (e: unknown) {
+            logger.warn(TAG, `prefetchAccountSettings(${symbol}) failed: ${errorMessage(e)}`);
+        }
+    }
+
     async setIsolatedMargin(symbol: string): Promise<void> {
         try {
             await this.privateRequest<unknown>(
@@ -160,13 +179,26 @@ export class BybitClient implements IExchangeClient {
         params: { reduceOnly?: boolean } = {},
     ): Promise<OrderResult> {
         const exchangeSymbol = unifiedToBybit(symbol);
+        // Hedge Mode requires the position leg to be selected explicitly via
+        // `positionIdx` (1 = LONG, 2 = SHORT). One-Way mode keeps the single
+        // merged position at idx 0. `reduceOnly` is honoured in both modes —
+        // unlike Binance, Bybit accepts the combination of positionIdx and
+        // reduceOnly without complaint. Mode is resolved lazily if startBot
+        // did not prefetch it (e.g. during test-trade with a fresh client).
+        const mode = await this.getPositionMode(symbol);
+        let positionIdx = 0;
+        if (mode === 'hedge') {
+            const closing = Boolean(params.reduceOnly);
+            const longLeg = closing ? side === 'sell' : side === 'buy';
+            positionIdx = longLeg ? 1 : 2;
+        }
         const body: Record<string, string | number | boolean> = {
             category: 'linear',
             symbol: exchangeSymbol,
             side: side === 'buy' ? 'Buy' : 'Sell',
             orderType: 'Market',
             qty: formatQuantity(amount),
-            positionIdx: 0,
+            positionIdx,
         };
         if (params.reduceOnly) body.reduceOnly = true;
 
@@ -278,6 +310,38 @@ export class BybitClient implements IExchangeClient {
 
     createMarketWs(store: OrderBookStore): MarketWsClient {
         return new BybitMarketWs(store, config.useTestnet);
+    }
+
+    private getPositionMode(symbol: string): Promise<'hedge' | 'one-way'> {
+        const key = unifiedToBybit(symbol);
+        let pending = this.positionModePromises.get(key);
+        if (pending) return pending;
+        pending = this.privateRequest<BybitList<BybitPositionRaw & { positionIdx?: number }>>(
+            'GET',
+            '/v5/position/list',
+            { category: 'linear', symbol: key },
+        )
+            .then(res => {
+                // Hedge Mode returns two entries with positionIdx 1 and 2,
+                // even when both sides have size=0. One-Way returns a single
+                // entry with positionIdx 0. If neither shape is present (rare
+                // for UTA accounts with no historic position on the symbol),
+                // default to One-Way — Bybit accepts positionIdx=0 there.
+                const list = res.list ?? [];
+                const hedge = list.some(p => (p as any).positionIdx === 1 || (p as any).positionIdx === 2);
+                return hedge ? ('hedge' as const) : ('one-way' as const);
+            })
+            .catch(e => {
+                // Drop the cached failure so a later call can retry instead of
+                // permanently sticking to a fallback. Treat probe failures as
+                // One-Way: that matches Bybit's default for UTA accounts and
+                // keeps the order path responsive.
+                logger.warn(TAG, `Position mode probe for ${symbol} failed, assuming One-Way: ${errorMessage(e)}`);
+                this.positionModePromises.delete(key);
+                return 'one-way' as const;
+            });
+        this.positionModePromises.set(key, pending);
+        return pending;
     }
 
     private async fetchOrderRaw(exchangeSymbol: string, orderId: string): Promise<BybitOrderRaw> {

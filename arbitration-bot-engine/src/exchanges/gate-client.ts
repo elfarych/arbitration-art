@@ -62,6 +62,10 @@ export class GateClient implements IExchangeClient {
 
     private readonly baseUrl: string;
     private readonly markets = new Map<string, GateContractRaw>();
+    // Account-level `in_dual_mode` cache from /futures/usdt/accounts. Gate
+    // toggles dual (hedge) mode per settle-currency, not per symbol, so a
+    // single boolean covers every USDT-perp call.
+    private dualModePromise: Promise<boolean> | null = null;
 
     constructor(private readonly apiKey: string, private readonly secret: string) {
         this.baseUrl = config.useTestnet
@@ -97,6 +101,21 @@ export class GateClient implements IExchangeClient {
         }
     }
 
+    /**
+     * Resolve the account-level Dual (Hedge) Mode flag once before any order
+     * goes out. `Engine.startBot` calls this in parallel with margin/leverage
+     * setup, and the test-trade endpoint calls it before opening the leg.
+     * `symbol` is ignored — Gate Dual Mode lives per-settle, not per-symbol.
+     */
+    async prefetchAccountSettings(_symbol: string): Promise<void> {
+        try {
+            const dual = await this.isDualMode();
+            logger.info(TAG, `Account position mode: ${dual ? 'Dual (Hedge)' : 'Single (One-Way)'}`);
+        } catch (e: unknown) {
+            logger.warn(TAG, `prefetchAccountSettings failed: ${errorMessage(e)}`);
+        }
+    }
+
     async setIsolatedMargin(symbol: string): Promise<void> {
         const exchangeSymbol = unifiedToUnderscored(symbol);
         try {
@@ -120,16 +139,29 @@ export class GateClient implements IExchangeClient {
         if (!market) throw new Error(`Gate market not loaded for ${symbol}`);
 
         const multiplier = Number(market.quanto_multiplier ?? 1) || 1;
-        let sizeInContracts = Math.round(amount / multiplier);
-        if (side === 'sell') sizeInContracts = -sizeInContracts;
+        const signedSize = side === 'buy'
+            ? Math.round(amount / multiplier)
+            : -Math.round(amount / multiplier);
 
+        // In Dual Mode each side has its own position record, so a signed
+        // `size` on the closing leg would open a new opposing position
+        // instead of reducing the original one. Gate's documented close path
+        // for dual mode is `size=0` + `auto_size=close_long|close_short`;
+        // outside of dual mode the signed-size form keeps working.
+        const dualMode = await this.isDualMode();
         const body: Record<string, unknown> = {
             contract: exchangeSymbol,
-            size: sizeInContracts,
             price: '0',
             tif: 'ioc',
         };
-        if (params.reduceOnly) body.reduce_only = true;
+        if (dualMode && params.reduceOnly) {
+            body.size = 0;
+            body.auto_size = side === 'sell' ? 'close_long' : 'close_short';
+            body.reduce_only = true;
+        } else {
+            body.size = signedSize;
+            if (params.reduceOnly) body.reduce_only = true;
+        }
 
         const created = await this.privateRequest<GateOrderRaw>('POST', '/futures/usdt/orders', body, { jsonBody: true });
         let order = created;
@@ -146,7 +178,12 @@ export class GateClient implements IExchangeClient {
             }
         }
 
-        const filledContracts = Math.abs(Number(order.size ?? sizeInContracts)) - Math.abs(Number(order.left ?? 0));
+        // In Dual Mode close orders Gate reports `size: 0` and the realised
+        // fill goes into the response separately; fall back to the requested
+        // notional in that case so the engine still sees a sensible filled qty.
+        const reportedSize = Number(order.size ?? 0);
+        const fallbackSize = reportedSize !== 0 ? reportedSize : signedSize;
+        const filledContracts = Math.abs(fallbackSize) - Math.abs(Number(order.left ?? 0));
         const filledQty = filledContracts * multiplier;
         const avgPrice = Number(order.fill_price ?? 0);
 
@@ -251,6 +288,25 @@ export class GateClient implements IExchangeClient {
 
     createMarketWs(store: OrderBookStore): MarketWsClient {
         return new GateMarketWs(store, config.useTestnet);
+    }
+
+    private isDualMode(): Promise<boolean> {
+        if (!this.dualModePromise) {
+            this.dualModePromise = this.privateRequest<{ in_dual_mode?: boolean }>(
+                'GET',
+                '/futures/usdt/accounts',
+                {},
+            )
+                .then(res => Boolean(res?.in_dual_mode))
+                .catch(e => {
+                    // Drop the cached failure so the next call can retry;
+                    // assume Single Mode (Gate default) in the meantime.
+                    logger.warn(TAG, `Dual mode probe failed, assuming Single Mode: ${errorMessage(e)}`);
+                    this.dualModePromise = null;
+                    return false;
+                });
+        }
+        return this.dualModePromise;
     }
 
     private async publicRequest<T>(

@@ -61,6 +61,10 @@ export class BinanceClient implements IExchangeClient {
 
     private readonly baseUrl: string;
     private readonly markets = new Map<string, BinanceMarketRaw>();
+    // Cached account-level "Hedge Mode" flag from /fapi/v1/positionSide/dual.
+    // Resolved once per client and reused for every subsequent order so the
+    // hot path does not pay for an extra REST call.
+    private dualSidePositionPromise: Promise<boolean> | null = null;
 
     constructor(private readonly apiKey: string, private readonly secret: string) {
         this.baseUrl = config.useTestnet
@@ -97,6 +101,24 @@ export class BinanceClient implements IExchangeClient {
         }
     }
 
+    /**
+     * Resolve account-level Hedge Mode flag once so the first order does not
+     * pay for an extra REST round-trip. Engine calls this from startBot in
+     * parallel with margin/leverage setup, and the test-trade endpoint calls
+     * it before placing the open leg. `symbol` is ignored — Binance position
+     * mode is account-level (`dualSidePosition`), not per-symbol.
+     */
+    async prefetchAccountSettings(_symbol: string): Promise<void> {
+        try {
+            const hedge = await this.isHedgeMode();
+            logger.info(TAG, `Account position mode: ${hedge ? 'Hedge' : 'One-Way'}`);
+        } catch (e: unknown) {
+            // isHedgeMode already swallows errors and falls back to One-Way;
+            // this catch only guards against unforeseen sync throws.
+            logger.warn(TAG, `prefetchAccountSettings failed: ${errorMessage(e)}`);
+        }
+    }
+
     async setIsolatedMargin(symbol: string): Promise<void> {
         try {
             await this.signedRequest('POST', '/fapi/v1/marginType', {
@@ -128,7 +150,21 @@ export class BinanceClient implements IExchangeClient {
             // the common case.
             newOrderRespType: 'RESULT',
         };
-        if (params.reduceOnly) orderParams.reduceOnly = 'true';
+
+        // Hedge Mode accounts (dualSidePosition=true) require `positionSide`
+        // on every order and reject `reduceOnly` with code -1106. In One-Way
+        // mode the opposite is true: `positionSide` defaults to BOTH and
+        // `reduceOnly` is the canonical close flag. The reduceOnly param is
+        // our open/close intent — `sell+reduceOnly` closes a long, etc. — so
+        // we can derive `positionSide` from `side` and `reduceOnly` together.
+        const hedgeMode = await this.isHedgeMode();
+        if (hedgeMode) {
+            const closingPosition = Boolean(params.reduceOnly);
+            const longLeg = closingPosition ? side === 'sell' : side === 'buy';
+            orderParams.positionSide = longLeg ? 'LONG' : 'SHORT';
+        } else if (params.reduceOnly) {
+            orderParams.reduceOnly = 'true';
+        }
 
         let order = await this.signedRequest<BinanceOrderResponse>('POST', '/fapi/v1/order', orderParams);
         let avgPrice = Number(order.avgPrice ?? order.price ?? 0);
@@ -271,6 +307,27 @@ export class BinanceClient implements IExchangeClient {
 
     createMarketWs(store: OrderBookStore): MarketWsClient {
         return new BinanceMarketWs(store, config.useTestnet);
+    }
+
+    private isHedgeMode(): Promise<boolean> {
+        if (!this.dualSidePositionPromise) {
+            this.dualSidePositionPromise = this.signedRequest<{ dualSidePosition?: boolean }>(
+                'GET',
+                '/fapi/v1/positionSide/dual',
+                {},
+            )
+                .then(res => Boolean(res?.dualSidePosition))
+                .catch(e => {
+                    // Treat probe failures as One-Way mode — that matches Binance's
+                    // default and keeps the order path working for accounts that
+                    // simply cannot reach the endpoint (e.g. transient 5xx). The
+                    // next createMarketOrder will retry the probe.
+                    logger.warn(TAG, `positionSide/dual probe failed, assuming One-Way mode: ${errorMessage(e)}`);
+                    this.dualSidePositionPromise = null;
+                    return false;
+                });
+        }
+        return this.dualSidePositionPromise;
     }
 
     private async publicRequest<T>(
