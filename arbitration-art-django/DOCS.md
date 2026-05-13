@@ -1380,13 +1380,19 @@ Build context для Dokploy:
 Опциональные (есть дефолты в `base.py`):
 
 - `CORS_ALLOWED_ORIGINS` — origin фронтенда (`https://...`); без него API недоступен из браузера.
+- `CSRF_TRUSTED_ORIGINS` — список origin-ов с схемой (`https://...`) для CSRF-валидации POST-форм за TLS-терминирующим прокси. Обязателен для `/admin/login/` и любой формы admin, когда Django стоит за Traefik. Без него Django 4+ отдаёт 403 на POST.
 - `SECURE_SSL_REDIRECT` — дефолт `True`. См. риски ниже.
 - `LANGUAGE_CODE`, `TIME_ZONE`, `SERVICE_*_TIMEOUT_SECONDS`, `GUNICORN_WORKERS`.
+
+Reverse proxy / HTTPS termination:
+
+`production.py` ставит `SECURE_PROXY_SSL_HEADER=("HTTP_X_FORWARDED_PROTO","https")` и `USE_X_FORWARDED_HOST=True`. Это критично для Dokploy/Traefik: без этой настройки Django видит входящий запрос как HTTP, `SECURE_SSL_REDIRECT=True` отдаёт 301 на HTTPS, прокси заворачивает обратно в HTTP — и получается бесконечный редирект (`ERR_TOO_MANY_REDIRECTS`). Прокси обязан перезаписывать `X-Forwarded-Proto` на каждом входящем запросе и не пропускать клиентский заголовок (Traefik делает это по умолчанию). Если меняете прокси на менее доверенный — снимите `SECURE_PROXY_SSL_HEADER`, иначе клиент сможет подделать «secure».
 
 Риски и подводные камни при деплое за reverse proxy:
 
 - **Static files.** `gunicorn` сам по себе статику не отдаёт. После `collectstatic` файлы лежат в `/app/staticfiles` внутри контейнера. В продакшене статику обслуживает Traefik/Nginx перед контейнером либо добавляется WhiteNoise (сейчас не подключён). До этого `/static/...` отдавать через прокси (volume mount) или принять, что admin не получит CSS.
-- **HTTPS redirect loop.** `production.py` задаёт `SECURE_SSL_REDIRECT=True`, `SESSION_COOKIE_SECURE`, `CSRF_COOKIE_SECURE`. Если TLS терминируется на Traefik (Dokploy default), Django увидит запрос как HTTP и уйдёт в бесконечный редирект. Решения: 1) выставить `SECURE_PROXY_SSL_HEADER=('HTTP_X_FORWARDED_PROTO','https')` в settings и убедиться, что прокси добавляет этот заголовок, 2) на время отладки выключить через `SECURE_SSL_REDIRECT=False`. Сейчас `SECURE_PROXY_SSL_HEADER` в settings не задан — это known issue для Dokploy-деплоя.
+- **CSRF на admin login.** После исправления HTTPS-redirect-loop POST в `/admin/login/` упадёт 403, если в env не задан `CSRF_TRUSTED_ORIGINS=https://your-django-domain`. Включить туда все домены, по которым к Django ходят формы.
+- **Контейнер не должен торчать наружу мимо Traefik.** В Dokploy убрать публикацию порта `8000` на публичный IP. Сервис должен быть доступен только через Traefik по домену. Иначе публичные сканеры (leakix, l9scan) долбятся напрямую по IP, обходя HTTPS и логи прокси.
 - **Биржевые ключи и `.env`.** В образе должно быть пусто по части `.env` — секреты приходят через Dokploy env vars. Биржевые ключи в `.env` не кладём в любом случае (§10.1) — они живут в БД через `UserExchangeKeys`.
 - **Engine на отдельном хосте.** Канал Django → engine по умолчанию HTTP с `X-Service-Token`. Если engine разворачивается на другом узле, держать его на private сети или терминировать TLS на прокси между сервисами.
 
