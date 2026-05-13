@@ -21,14 +21,16 @@ RUN corepack enable
 
 WORKDIR /app
 
-# Cache deps layer.
-COPY package.json pnpm-lock.yaml ./
-RUN pnpm install --frozen-lockfile
+# Copy the full project before install. The `postinstall` script in
+# package.json runs `quasar prepare`, which requires quasar.config.ts (and
+# the rest of the project layout) to be present in cwd. Splitting deps and
+# sources into separate layers — the usual Node.js caching pattern — makes
+# prepare abort with "must be executed inside a Quasar project folder".
+# Dokploy clones the repo fresh on every deploy, so the lost layer-cache
+# would not have helped anyway.
+COPY . .
 
-# Copy sources required for the production build.
-COPY tsconfig.json quasar.config.ts postcss.config.js index.html ./
-COPY public ./public
-COPY src ./src
+RUN pnpm install --frozen-lockfile
 
 # `quasar build` emits the SPA to dist/spa/.
 RUN pnpm run build
