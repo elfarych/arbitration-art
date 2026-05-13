@@ -56,9 +56,15 @@
               </div>
             </div>
             <div class="stat">
-              <div class="stat-label">Маржа / Плечо</div>
+              <div class="stat-label">Размер / Плечо</div>
               <div class="stat-value">
-                ${{ resultDialog.tradeResult.margin_usd }} ×{{ resultDialog.tradeResult.leverage }}
+                ${{ resultDialog.tradeResult.notional_usd }} ×{{ resultDialog.tradeResult.leverage }}
+              </div>
+            </div>
+            <div class="stat">
+              <div class="stat-label">Маржа</div>
+              <div class="stat-value">
+                ${{ formatMargin(resultDialog.tradeResult.margin_usd) }}
               </div>
             </div>
           </div>
@@ -148,7 +154,7 @@
                     no-caps
                     color="warning"
                     icon="science"
-                    :label="`Тест сделки $${tradeMarginUsd} ×${tradeLeverage}`"
+                    :label="`Тест сделки $${tradeNotionalUsd} ×${tradeLeverage}`"
                     :disable="!isConfigured(item.id) || profileStore.testing[item.id] !== null"
                     :loading="profileStore.testing[item.id] === 'trade'"
                     @click="confirmTestTrade(item.id)"
@@ -315,8 +321,9 @@ type ResultDialogState = {
   tradeResult: ExchangeTradeTestResult | null;
 };
 
-const tradeMarginUsd = 15;
+const tradeNotionalUsd = 15;
 const tradeLeverage = 10;
+const tradeMarginUsd = tradeNotionalUsd / tradeLeverage;
 
 const resultDialog = ref<ResultDialogState>({
   open: false,
@@ -379,11 +386,11 @@ function confirmTestTrade(exchange: ExchangeId) {
   const label = labelFor(exchange);
   $q.dialog({
     title: `Тестовая сделка на ${label}`,
-    message: `Будет открыт реальный market-long по SOL/USDT с маржей $${tradeMarginUsd} и плечом ${tradeLeverage}x, а затем сразу закрыт reduceOnly. Это реальные средства на ${label}. Продолжить?`,
+    message: `Будет открыт реальный market-long по SOL/USDT размером $${tradeNotionalUsd} с плечом ${tradeLeverage}x (≈ $${formatMargin(tradeMarginUsd)} маржи), а затем сразу закрыт reduceOnly. Это реальные средства на ${label}. Продолжить?`,
     persistent: true,
     dark: true,
     color: 'warning',
-    ok: { label: 'Запустить', color: 'warning', noCaps: true },
+    ok: { label: 'Запустить', color: 'warning', textColor: 'dark', noCaps: true },
     cancel: { label: 'Отмена', flat: true, noCaps: true },
   }).onOk(async () => {
     try {
@@ -413,6 +420,11 @@ function formatPrice(value: number): string {
 function formatPnl(value: number): string {
   const sign = value > 0 ? '+' : '';
   return `${sign}${value.toFixed(4)}`;
+}
+
+function formatMargin(value: number): string {
+  if (!value) return '0';
+  return value.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
 
 function pnlColorClass(value: number): string {

@@ -66,11 +66,13 @@ const historyBot = ref<BotConfig | null>(null);
 const BOT_LIST_POLL_MS = 15_000;
 let pollHandle: number | undefined;
 
-const loadBots = async () => {
+const loadBots = async (options: { silent?: boolean } = {}) => {
   try {
-    await botsStore.fetchBots();
+    await botsStore.fetchBots(options);
   } catch (e) {
-    $q.notify({ color: 'negative', message: extractApiErrorMessage(e, 'Не удалось загрузить ботов') });
+    if (!options.silent) {
+      $q.notify({ color: 'negative', message: extractApiErrorMessage(e, 'Не удалось загрузить ботов') });
+    }
   }
 };
 
@@ -135,7 +137,7 @@ const forceCloseBot = (id: number) => {
 
 onMounted(async () => {
   await loadBots();
-  pollHandle = window.setInterval(() => { void loadBots(); }, BOT_LIST_POLL_MS);
+  pollHandle = window.setInterval(() => { void loadBots({ silent: true }); }, BOT_LIST_POLL_MS);
 });
 
 onUnmounted(() => {

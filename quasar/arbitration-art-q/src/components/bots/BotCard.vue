@@ -5,19 +5,21 @@
       <div class="row items-center justify-between q-mb-sm">
         <div class="row items-center">
           <q-badge color="primary" class="q-mr-sm text-weight-bold" style="font-size: 13px">{{ coinDisplay }}</q-badge>
-          <q-badge :color="bot.order_type === 'buy' ? 'positive' : 'negative'" text-color="dark" class="text-weight-bold q-mr-md" style="font-size: 11px">
+          <q-badge :color="bot.order_type === 'buy' ? 'positive' : 'negative'" text-color="dark" class="text-weight-bold" style="font-size: 11px">
             {{ orderTypeLabel }}
-          </q-badge>
-          <q-badge :color="bot.trade_mode === 'real' ? 'negative' : 'info'"
-                   text-color="white"
-                   class="text-weight-bolder q-py-xs q-px-sm shadow-1"
-                   :class="bot.trade_mode === 'real' ? 'negative-glow' : ''"
-                   style="font-size: 11px; letter-spacing: 0.5px; border: 1px solid rgba(255,255,255,0.2);">
-            <q-icon :name="bot.trade_mode === 'real' ? 'local_fire_department' : 'science'" size="14px" class="q-mr-xs" />
-            {{ bot.trade_mode === 'real' ? 'РЕАЛЬНАЯ ТОРГОВЛЯ' : 'ЭМУЛЯТОР' }}
           </q-badge>
         </div>
         <div class="row items-center">
+          <q-badge
+            :color="bot.trade_mode === 'real' ? 'negative' : 'info'"
+            text-color="white"
+            class="text-weight-bold q-mr-sm"
+            :class="bot.trade_mode === 'real' ? 'negative-glow' : ''"
+            style="font-size: 10px"
+          >
+            <q-icon :name="bot.trade_mode === 'real' ? 'local_fire_department' : 'science'" size="12px" class="q-mr-xs" />
+            {{ bot.trade_mode === 'real' ? 'РЕАЛЬНАЯ ТОРГОВЛЯ' : 'ЭМУЛЯТОР' }}
+          </q-badge>
           <span v-if="!bot.is_active" class="text-caption text-weight-bold text-negative q-mr-sm opacity-80" style="font-size: 10px">ОСТАНОВЛЕН</span>
           <span v-else class="text-caption text-weight-bold text-positive q-mr-sm opacity-80" style="font-size: 10px">РАБОТАЕТ</span>
           <div class="status-dot" :class="{ 'active-dot': bot.is_active }"></div>
@@ -540,32 +542,32 @@ const currentPnL = computed(() => {
   return (profitUsdt / sOpen) * 100;
 });
 
-// Polling configuration: Django returns lists by bot_id+status, so each card
-// makes two cheap queries every TRADE_POLL_MS. Engine writes trades into Django
-// asynchronously via api.openTrade / api.openEmulationTrade, so polling is
-// what the UI uses to mirror engine state. Lower bound keeps it responsive
-// without saturating the Django worker pool.
+// Polling configuration: Django returns lists by bot_id (no status filter, so
+// we get open + closed + force_closed in one round-trip and partition them
+// client-side). Engine writes trades into Django asynchronously via
+// api.openTrade / api.openEmulationTrade, so polling is what the UI uses to
+// mirror engine state. Lower bound keeps it responsive without saturating the
+// Django worker pool.
 const TRADE_POLL_MS = 5000;
 
 async function refreshTradeState(initial = false) {
   if (initial) tradesLoading.value = true;
   try {
     const params = { botId: props.bot.id } as const;
-    if (props.bot.trade_mode === 'real') {
-      const [openTrades, closedTrades] = await Promise.all([
-        realTradesApi.list({ ...params, status: 'open' }),
-        realTradesApi.list({ ...params, status: 'closed' }),
-      ]);
-      activeTrade.value = openTrades[0] ?? null;
-      closedTradesCount.value = closedTrades.length;
-    } else {
-      const [openTrades, closedTrades] = await Promise.all([
-        botTradesApi.list({ ...params, status: 'open' }),
-        botTradesApi.list({ ...params, status: 'closed' }),
-      ]);
-      activeTrade.value = openTrades[0] ?? null;
-      closedTradesCount.value = closedTrades.length;
-    }
+    // Single query without status filter so the counter picks up every
+    // terminal state. Real-mode trades use `closed` for profit/shutdown and
+    // `force_closed` for force-close/timeout/liquidation/error; emulator
+    // trades always end as `closed` (see BotTrader.executeClose), but
+    // existing rows from earlier builds may still carry `force_closed` and
+    // would be miscounted as "open" by a status=closed filter.
+    const all: AnyTrade[] = props.bot.trade_mode === 'real'
+      ? await realTradesApi.list({ ...params })
+      : await botTradesApi.list({ ...params });
+    activeTrade.value = all.find(t => t.status === 'open') ?? null;
+    closedTradesCount.value = all.reduce(
+      (count, t) => count + (t.status !== 'open' ? 1 : 0),
+      0,
+    );
   } catch (e) {
     if (initial) {
       console.error('Failed to load trades for bot', props.bot.id, e);
@@ -588,8 +590,11 @@ function confirmForceClose() {
     try {
       await botsStore.forceCloseBot(props.bot.id);
       $q.notify({ color: 'positive', message: 'Команда force-close отправлена' });
-      // Refresh shortly: engine close is async, give it a few seconds.
-      window.setTimeout(() => { void refreshTradeState(); }, 2000);
+      // Engine close is asynchronous: it can spend up to ~10s clearing the
+      // busy state and submitting reduceOnly orders. Rather than busy-polling
+      // (which previously fired ~20 requests in 15s and spammed Django when
+      // the close stalled on the engine side), rely on the regular 5s trade
+      // poll set up in onMounted to pick up the new state.
     } catch (e) {
       $q.notify({ color: 'negative', message: extractApiErrorMessage(e, 'Не удалось отправить команду') });
     } finally {

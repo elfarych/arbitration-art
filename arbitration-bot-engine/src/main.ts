@@ -1,5 +1,7 @@
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
+import { Buffer } from 'node:buffer';
+import { timingSafeEqual } from 'node:crypto';
 import { config } from './config.js';
 import { logger } from './utils/logger.js';
 import { Engine } from './classes/Engine.js';
@@ -8,6 +10,18 @@ import {
     testConnection,
     testTrade,
 } from './exchanges/exchange-tester.js';
+
+// Constant-time comparison of the shared service token. A plain `!==` leaks
+// the position of the first mismatching byte through response timing, which
+// would let an attacker on the same network recover the token byte-by-byte.
+// Django side already uses hmac.compare_digest; the engine matches.
+const SERVICE_TOKEN_BUF = Buffer.from(config.serviceToken, 'utf8');
+function isValidServiceToken(provided: unknown): boolean {
+    if (typeof provided !== 'string' || provided.length === 0) return false;
+    const providedBuf = Buffer.from(provided, 'utf8');
+    if (providedBuf.length !== SERVICE_TOKEN_BUF.length) return false;
+    return timingSafeEqual(providedBuf, SERVICE_TOKEN_BUF);
+}
 
 // Fastify is used only as a thin control plane. The actual trading lifecycle is
 // owned by Engine/BotTrader; HTTP handlers should translate requests into engine
@@ -26,7 +40,7 @@ fastify.addHook('preHandler', async (request, reply) => {
     }
 
     const token = request.headers['x-service-token'];
-    if (token !== config.serviceToken) {
+    if (!isValidServiceToken(token)) {
         return reply.status(401).send({ success: false, error: 'Unauthorized' });
     }
 });
@@ -88,6 +102,26 @@ fastify.post('/engine/bot/sync', async (request, reply) => {
     if (err) return reply.status(400).send({ success: false, error: err });
     try {
         engine.syncBot(body.bot_id, body.config);
+        return { success: true };
+    } catch (e: any) {
+        return reply.status(500).send({ success: false, error: e.message });
+    }
+});
+
+fastify.post('/engine/bot/pause', async (request, reply) => {
+    // Pause is a soft stop: the trader stays registered with its WS streams
+    // and timeout loop intact, but `bot.is_active=false` in the synced config
+    // makes BotTrader.checkSpreads bail out before any new open. The active
+    // trade (if any) keeps closing on profit / timeout / drawdown via the
+    // existing checkExit/checkTimeouts paths. Positions are never closed by
+    // this command — operators must use force-close or delete the bot for
+    // that. Payload matches /engine/bot/sync so Django can reuse the same
+    // builder.
+    const body = request.body as any;
+    const err = requireFields(body, ['bot_id', 'config']);
+    if (err) return reply.status(400).send({ success: false, error: err });
+    try {
+        engine.pauseBot(body.bot_id, body.config);
         return { success: true };
     } catch (e: any) {
         return reply.status(500).send({ success: false, error: e.message });
@@ -211,12 +245,41 @@ process.on('uncaughtException', (err: Error) => {
     void gracefulShutdown('uncaughtException');
 });
 
+// Bootstrap retries cover the case where the engine restarts before Django is
+// reachable (typical in compose/systemd setups). Bootstrap runs asynchronously
+// so the engine's own HTTP listener is available immediately for manual
+// lifecycle commands and `/health` probes while restoration is in flight.
+const BOOTSTRAP_MAX_ATTEMPTS = 5;
+const BOOTSTRAP_RETRY_DELAY_MS = 3_000;
+
+async function runBootstrapWithRetry(): Promise<void> {
+    for (let attempt = 1; attempt <= BOOTSTRAP_MAX_ATTEMPTS; attempt += 1) {
+        if (shuttingDown) return;
+        try {
+            await engine.bootstrapFromDjango(config.engineServiceUrl);
+            return;
+        } catch (err: any) {
+            logger.error(
+                'MAIN',
+                `Bootstrap attempt ${attempt}/${BOOTSTRAP_MAX_ATTEMPTS} failed: ${err?.message ?? err}`,
+            );
+            if (attempt < BOOTSTRAP_MAX_ATTEMPTS) {
+                await new Promise(resolve => setTimeout(resolve, BOOTSTRAP_RETRY_DELAY_MS));
+            }
+        }
+    }
+    logger.error('MAIN', 'Bootstrap exhausted retries; engine is up but holds no traders.');
+}
+
 const start = async () => {
     try {
         // Listen on all interfaces so Django can reach the engine in local
         // Docker/network deployments as well as on bare localhost.
         await fastify.listen({ port: config.port, host: '0.0.0.0' });
         logger.info('MAIN', `🚀 Arbitration Fastify Engine running on :${config.port}`);
+        // Restore in-memory bot state from Django without blocking listen.
+        // startBot is idempotent against concurrent Django lifecycle commands.
+        void runBootstrapWithRetry();
     } catch (err) {
         logger.error('MAIN', err as any);
         process.exit(1);

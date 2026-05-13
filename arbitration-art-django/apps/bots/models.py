@@ -36,6 +36,7 @@ class LifecycleCommand(models.TextChoices):
     START = "start", "Start"
     SYNC = "sync", "Sync"
     STOP = "stop", "Stop"
+    PAUSE = "pause", "Pause"
     FORCE_CLOSE = "force-close", "Force close"
 
 

@@ -23,12 +23,47 @@ _COIN_PATTERN = re.compile(r"^[A-Z0-9]{1,20}/USDT:USDT$")
 # requires the operator to first set is_active=False (engine closes positions
 # and drops the trader), then change the field, then re-activate.
 _RESTRICTED_WHILE_ACTIVE = (
-    "trade_mode",
     "primary_exchange",
     "secondary_exchange",
     "primary_leverage",
     "secondary_leverage",
 )
+
+# Fields locked for the entire lifetime of a BotConfig, regardless of
+# is_active. trade_mode determines whether trades hit `EmulationTrade` or
+# real `Trade` rows; switching it mid-life would leave the existing history
+# split across two tables and let the engine submit live orders against
+# what the operator created as a paper account (or vice versa). Easier to
+# require the operator to create a fresh bot for the other mode.
+_LOCKED_AFTER_CREATE = (
+    "trade_mode",
+)
+
+# Maps the BotConfig exchange choice value ("binance_futures") to the
+# UserExchangeKeys field prefix engine expects ("binance_api_key" /
+# "binance_secret"). Keep in sync with Engine.extractKeys.
+_EXCHANGE_KEY_PREFIX = {
+    "binance_futures": "binance",
+    "bybit_futures": "bybit",
+    "gate_futures": "gate",
+    "mexc_futures": "mexc",
+}
+
+
+def _has_keys_for(user, exchange: str) -> bool:
+    """Return True if the user has non-empty api_key + secret for ``exchange``."""
+
+    prefix = _EXCHANGE_KEY_PREFIX.get(exchange)
+    if prefix is None:
+        # Unknown exchange names cannot be validated for keys; the serializer's
+        # ChoiceField already rejects them, so this branch is defensive only.
+        return True
+    keys = getattr(user, "exchange_keys", None)
+    if keys is None:
+        return False
+    api_key = (getattr(keys, f"{prefix}_api_key", "") or "").strip()
+    secret = (getattr(keys, f"{prefix}_secret", "") or "").strip()
+    return bool(api_key) and bool(secret)
 
 
 class BotConfigSerializer(serializers.ModelSerializer):
@@ -124,6 +159,31 @@ class BotConfigSerializer(serializers.ModelSerializer):
                 "An active real-trading bot must execute on at least one exchange."
             )
 
+        # Pre-flight key check. Without this the engine receives a payload
+        # with empty credential fields and bounces with HTTP 500, which the
+        # user only sees as a generic 502 from Django. Catching it at the
+        # serializer turns the error into an actionable 400 referencing the
+        # exact exchange whose key is missing. Only applies in real mode and
+        # only for legs the bot will actually execute on.
+        if is_active and trade_mode == BotConfig.TradeMode.REAL:
+            user = self.context.get("request").user if self.context.get("request") else None
+            owner = user if user is not None else getattr(instance, "owner", None)
+            if owner is not None and getattr(owner, "is_authenticated", False):
+                if trade_on_primary and not _has_keys_for(owner, primary):
+                    raise serializers.ValidationError({
+                        "primary_exchange": (
+                            f"Missing API key/secret for {primary}. "
+                            f"Add them in Profile → Exchange keys before activating real mode."
+                        ),
+                    })
+                if trade_on_secondary and not _has_keys_for(owner, secondary):
+                    raise serializers.ValidationError({
+                        "secondary_exchange": (
+                            f"Missing API key/secret for {secondary}. "
+                            f"Add them in Profile → Exchange keys before activating real mode."
+                        ),
+                    })
+
         # Block in-place changes to fields that require re-initialising the
         # engine trader. The operator must transition through is_active=False
         # first so the engine cleanly closes positions and rebuilds the trader.
@@ -134,6 +194,22 @@ class BotConfigSerializer(serializers.ModelSerializer):
                         field: (
                             "Set is_active=false to stop the bot before changing "
                             "this field, then re-activate."
+                        ),
+                    })
+
+        # Fields that are immutable for the bot's entire lifetime. Currently
+        # only trade_mode — switching it would split history across the
+        # EmulationTrade/Trade tables and risks emulator-built configs being
+        # promoted to real money. Frontend mirrors the rule by disabling the
+        # toggle in edit mode.
+        if instance is not None:
+            for field in _LOCKED_AFTER_CREATE:
+                if field in attrs and attrs[field] != getattr(instance, field):
+                    raise serializers.ValidationError({
+                        field: (
+                            "This field cannot be changed after the bot is "
+                            "created. Create a new bot with the desired value "
+                            "instead."
                         ),
                     })
 

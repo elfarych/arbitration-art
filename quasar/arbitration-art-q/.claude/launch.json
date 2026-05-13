@@ -4,7 +4,7 @@
     {
       "name": "quasar-dev",
       "runtimeExecutable": "pnpm",
-      "runtimeArgs": ["--dir", "quasar/arbitration-art-q", "dev"],
+      "runtimeArgs": ["dev"],
       "port": 9000
     }
   ]

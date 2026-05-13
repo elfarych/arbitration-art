@@ -523,7 +523,7 @@ Backend endpoints:
 - raw saved secrets are not returned by backend;
 - empty fields in the form do not overwrite saved values;
 - clear action sends empty strings for selected exchange key and secret;
-- тестовая сделка реальная, исполняется engine'ом на live-бирже (`SOL/USDT` perpetual, маржа $15, плечо 10x, open + reduceOnly close); перед отправкой пользователю показывается confirmation-диалог.
+- тестовая сделка реальная, исполняется engine'ом на live-бирже (`SOL/USDT` perpetual, notional $15, плечо 10x, ≈ $1.5 маржи, open + reduceOnly close); перед отправкой пользователю показывается confirmation-диалог.
 
 ### 12.3. IndexPage
 
@@ -547,9 +547,9 @@ Actions:
 
 - Создать bot -> open `BotFormDialog`.
 - Edit -> open `BotFormDialog` with bot.
-- Toggle active -> `botsStore.toggleBot`.
-- Delete -> Quasar confirm dialog -> `botsStore.deleteBot`.
-- Force close -> Quasar confirm dialog -> `botsStore.forceCloseBot`.
+- Toggle active -> `botsStore.toggleBot`. PATCH `is_active`. Переход `true → false` это **pause**, не stop: engine оставляет трейдер живым, новые сделки не открываются, активная сделка (если есть) продолжает закрываться по profit / timeout / drawdown. Чтобы закрыть позицию сразу — используй force-close. Снятие паузы (`false → true`) — обычный START, engine.startBot идемпотентен.
+- Delete -> Quasar confirm dialog -> `botsStore.deleteBot`. Перед удалением engine получает STOP, который закрывает активную сделку с reason `shutdown` и убирает трейдер из памяти.
+- Force close -> Quasar confirm dialog -> `botsStore.forceCloseBot`. Закрывает активную сделку немедленно, бот остаётся в текущем состоянии (если был активен — продолжит открывать новые; если на паузе — после закрытия просто стоит).
 - History -> open `SpreadHistoryDialog`.
 
 Children:
@@ -775,7 +775,7 @@ interface BotConfig {
   // Engine integration status (populated by Django from inline lifecycle sync)
   status: 'stopped' | 'starting' | 'running' | 'stopping' | 'error' | 'archived',
   sync_status: 'idle' | 'pending' | 'success' | 'failed',
-  last_command: 'start' | 'sync' | 'stop' | 'force-close' | '',
+  last_command: 'start' | 'sync' | 'stop' | 'pause' | 'force-close' | '',
   last_sync_error: string,
   last_synced_at: string | null,
 }

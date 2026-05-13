@@ -39,6 +39,7 @@ export interface TradeTestResult {
     success: boolean;
     exchange: SupportedExchange;
     symbol: string;
+    notional_usd: number;
     margin_usd: number;
     leverage: number;
     quantity: number;
@@ -55,7 +56,8 @@ export interface TradeTestResult {
 
 export const TEST_TRADE_SYMBOL = 'SOL/USDT:USDT';
 export const TEST_TRADE_SYMBOL_DISPLAY = 'SOL/USDT';
-export const TEST_TRADE_MARGIN_USD = 15;
+// Total trade size in USD. Required margin = TEST_TRADE_NOTIONAL_USD / TEST_TRADE_LEVERAGE.
+export const TEST_TRADE_NOTIONAL_USD = 15;
 export const TEST_TRADE_LEVERAGE = 10;
 
 const SUPPORTED: readonly SupportedExchange[] = ['binance', 'bybit', 'gate', 'mexc'];
@@ -156,7 +158,8 @@ export async function testTrade(
         success: false,
         exchange,
         symbol: TEST_TRADE_SYMBOL_DISPLAY,
-        margin_usd: TEST_TRADE_MARGIN_USD,
+        notional_usd: TEST_TRADE_NOTIONAL_USD,
+        margin_usd: TEST_TRADE_NOTIONAL_USD / TEST_TRADE_LEVERAGE,
         leverage: TEST_TRADE_LEVERAGE,
         quantity: 0,
         open_price: 0,
@@ -224,10 +227,9 @@ export async function testTrade(
         const ticker = await client.fetchTicker(symbol);
         lastPrice = coerce(ticker.last);
         if (lastPrice <= 0) throw new Error('Empty ticker price');
-        const notional = TEST_TRADE_MARGIN_USD * TEST_TRADE_LEVERAGE;
-        const rawQty = notional / lastPrice;
+        const rawQty = TEST_TRADE_NOTIONAL_USD / lastPrice;
         const qty = roundQty(client, symbol, rawQty);
-        if (qty <= 0) throw new Error('Quantity rounds to zero; increase margin_usd');
+        if (qty <= 0) throw new Error('Quantity rounds to zero; increase notional_usd');
         result.quantity = qty;
         result.steps.push({ name: 'Size order', ok: true, detail: `qty=${qty} price=${lastPrice}` });
     } catch (e: any) {

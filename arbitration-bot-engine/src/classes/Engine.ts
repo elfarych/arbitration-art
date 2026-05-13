@@ -158,11 +158,98 @@ export class Engine {
         }
     }
 
+    /**
+     * Soft stop for the UI pause toggle: the trader stays in memory, its WS
+     * streams stay subscribed, and the timeout / exit-spread / drawdown
+     * monitoring keeps running so the currently open trade (if any) still
+     * closes on its own conditions. The synced config carries
+     * `is_active=false`, which is what BotTrader.checkSpreads checks before
+     * opening anything new (line ~288 in BotTrader.ts).
+     *
+     * Resuming is plain START — Engine.startBot detects the existing entry
+     * and routes the call through syncBot, flipping is_active back to true
+     * without recreating WS clients or restoring trades.
+     *
+     * Pause does NOT close positions. Use forceClose or stopBot+delete for
+     * that. Pause on an unknown bot logs a warning instead of erroring so a
+     * stale UI click cannot 500 the engine.
+     */
+    public pauseBot(botId: number, config: any): void {
+        const trader = this.traders.get(botId);
+        if (!trader) {
+            logger.warn('Engine', `Bot ${botId} not loaded; pause is a no-op.`);
+            return;
+        }
+        trader.syncConfig(config);
+        logger.info(
+            'Engine',
+            `Paused Bot ${botId} — active trade (if any) will close on profit / timeout / drawdown; no new entries.`,
+        );
+    }
+
     public async forceClose(botId: number): Promise<void> {
         const trader = this.traders.get(botId);
         if (trader) {
             await trader.forceClose();
         }
+    }
+
+    /**
+     * Restore in-memory trader state after an engine crash/restart.
+     *
+     * Engine itself holds no persistent state — when the process dies, every
+     * `BotTrader`, every market WS connection and every order-book snapshot is
+     * lost, but open positions on exchanges and `BotConfig.is_active=True` in
+     * Django survive. Without bootstrap, Django would only re-issue `start`
+     * when an operator manually edits a bot, so trading stays frozen and open
+     * trades drift without engine-side guardrails (timeout / drawdown / WS
+     * liveness). This method pulls every bot bound to `serviceUrl` from Django
+     * and runs `startBot` for each; open trades are reattached inside
+     * `startBot` via `BotTrader.restoreOpenTrades`.
+     *
+     * Bots are started concurrently; failure of one does not block the others.
+     */
+    public async bootstrapFromDjango(serviceUrl: string): Promise<void> {
+        let payloads;
+        try {
+            payloads = await api.getActiveBotPayloads(serviceUrl);
+        } catch (e: any) {
+            logger.error(
+                'Engine',
+                `Bootstrap: failed to fetch active bots from Django for ${serviceUrl}: ${e.message}`,
+            );
+            return;
+        }
+
+        if (payloads.length === 0) {
+            logger.info(
+                'Engine',
+                `Bootstrap: no active bots returned for service_url=${serviceUrl}. ` +
+                `Verify that ENGINE_SERVICE_URL matches BotConfig.service_url if bots are expected.`,
+            );
+            return;
+        }
+
+        logger.info('Engine', `Bootstrap: restoring ${payloads.length} active bot(s) for ${serviceUrl}`);
+
+        const results = await Promise.allSettled(
+            payloads.map(p => this.startBot(p.bot_id, p.config, p.keys)),
+        );
+
+        let started = 0;
+        let failed = 0;
+        results.forEach((r, idx) => {
+            const id = payloads[idx]?.bot_id;
+            if (r.status === 'fulfilled') {
+                started += 1;
+            } else {
+                failed += 1;
+                const reason = r.reason instanceof Error ? r.reason.message : String(r.reason);
+                logger.error('Engine', `Bootstrap: bot ${id} failed to start: ${reason}`);
+            }
+        });
+
+        logger.info('Engine', `Bootstrap: started=${started}, failed=${failed}`);
     }
 
     public async stopAll(): Promise<void> {
@@ -187,8 +274,8 @@ export class Engine {
         if (!keys || typeof keys !== 'object') {
             throw new Error(`Missing keys payload for ${exchangeName}`);
         }
-        let apiKey = '';
-        let secret = '';
+        let apiKey: unknown;
+        let secret: unknown;
         if (exchangeName.startsWith('binance')) {
             apiKey = keys.binance_api_key;
             secret = keys.binance_secret;
@@ -204,9 +291,15 @@ export class Engine {
         } else {
             throw new Error(`No credential mapping for exchange ${exchangeName}`);
         }
-        if (!apiKey || !secret) {
+        // Strict type + emptiness check. Plain `!apiKey` would let a whitespace-only
+        // value reach the exchange client and fail later with a generic auth error;
+        // surfacing it here gives operators an actionable message before any HTTP
+        // round-trip happens.
+        const apiKeyStr = typeof apiKey === 'string' ? apiKey.trim() : '';
+        const secretStr = typeof secret === 'string' ? secret.trim() : '';
+        if (apiKeyStr.length === 0 || secretStr.length === 0) {
             throw new Error(`Missing API credentials for ${exchangeName}`);
         }
-        return { apiKey, secret };
+        return { apiKey: apiKeyStr, secret: secretStr };
     }
 }

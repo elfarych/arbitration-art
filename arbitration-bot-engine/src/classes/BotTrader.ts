@@ -91,8 +91,29 @@ export class BotTrader {
     }
 
     public restoreOpenTrades(openTrades: TradeRecord[]): void {
-        const trade = openTrades.find(t => t.coin === this.bot.coin && t.status === 'open');
-        if (trade && !this.state.activeTrade) {
+        const matching = openTrades.filter(t => t.coin === this.bot.coin && t.status === 'open');
+        if (matching.length === 0) return;
+        if (matching.length > 1) {
+            // Django enforces at most one open trade per (bot, coin) via the
+            // engine writing path, so seeing >1 here means either a manual
+            // admin edit or a recovery race left ghost rows in the table.
+            // Restoring an arbitrary one would silently mis-track the position;
+            // surface it loudly so operators can reconcile before trading.
+            const ids = matching.map(t => t.id).join(', ');
+            logger.error(
+                this.tag,
+                `🚨 Data inconsistency: ${matching.length} open trades found for ${this.bot.coin} (IDs: ${ids}). ` +
+                `Restoring most recent and ignoring older duplicates; reconcile Django state manually.`,
+            );
+        }
+        // Pick the most recently opened record. Older duplicates, if they exist,
+        // most likely correspond to positions that were already closed on the
+        // exchange but failed to PATCH back to Django — engine cannot recover
+        // those automatically.
+        const trade = matching.reduce((latest, t) => {
+            return new Date(t.opened_at).getTime() > new Date(latest.opened_at).getTime() ? t : latest;
+        }, matching[0]!);
+        if (!this.state.activeTrade) {
             this.state.activeTrade = trade;
             this.state.openedAtMs = new Date(trade.opened_at).getTime();
             logger.info(this.tag, `♻️ Restored open trade (ID: ${trade.id}, ${trade.order_type})`);
@@ -388,7 +409,15 @@ export class BotTrader {
                 );
             }
 
-            logger.debug(this.tag, `📝 Open Payload: ${JSON.stringify(payload)}`);
+            // Avoid eagerly stringifying the payload — JSON.stringify on the
+            // hot path adds measurable latency per trade open. The orderId,
+            // spread and price are sufficient to trace; the full payload is
+            // recoverable from Django by trade ID.
+            logger.debug(
+                this.tag,
+                `📝 Open payload: amount=${payload.amount} spread=${payload.open_spread} ` +
+                `pPrice=${payload.primary_open_price} sPrice=${payload.secondary_open_price}`,
+            );
 
             let tradeRecord: TradeRecord;
             try {
@@ -634,7 +663,16 @@ export class BotTrader {
 
             const { profitUsdt, profitPercentage } = calculateRealPnL(pOpen, sOpen, pPrice, sPrice, amount, orderType, totalCommission);
             const closeSpread = this.calculateCloseSpread(pPrice, sPrice, orderType);
-            const closeStatus = (reason === 'profit' || reason === 'shutdown') ? 'closed' : 'force_closed';
+            // EmulationTrade.Status in Django only defines `open` / `closed` —
+            // there is no `force_closed` choice because there is no real-money
+            // distinction in emulator (no orders, no partial fills). Sending
+            // `force_closed` here triggers a serializer ValidationError and the
+            // trade stays open in Django forever. RealTrade keeps the original
+            // mapping; the close reason is still preserved on its `close_reason`
+            // field, so no information is lost there.
+            const closeStatus = isReal && !(reason === 'profit' || reason === 'shutdown')
+                ? 'force_closed'
+                : 'closed';
 
             const payload: any = {
                 status: closeStatus,
@@ -656,13 +694,27 @@ export class BotTrader {
                 payload.profit_usdt = d(profitUsdt, 6);
             }
 
-            logger.debug(this.tag, `📝 Close Payload: ${JSON.stringify(payload)}`);
+            logger.debug(
+                this.tag,
+                `📝 Close payload: status=${payload.status} reason=${payload.close_reason ?? '-'} ` +
+                `pPrice=${payload.primary_close_price} sPrice=${payload.secondary_close_price} ` +
+                `profit=${payload.profit_usdt ?? '-'}`,
+            );
 
-            try {
-                if (isReal) await api.closeTrade(trade.id, payload);
-                else await api.closeEmulationTrade(trade.id, payload);
-            } catch (e: any) {
-                logger.error(this.tag, `❌ DB write failed during close; exchange already actioned: ${e.message}`);
+            // The exchange has already actioned the close — if Django write
+            // fails the position state is correct on the exchange but Django
+            // still considers the trade open, which prevents the next entry
+            // and confuses recovery on restart. Retry the PATCH a few times
+            // with linear backoff before giving up; only then leave the
+            // 🚨 CRITICAL log for operator follow-up.
+            const closeWriteOk = await this.persistCloseWithRetry(trade.id, payload, isReal);
+            if (!closeWriteOk) {
+                logger.error(
+                    this.tag,
+                    `🚨 CRITICAL: failed to PATCH Django trade ${trade.id} after exchange close. ` +
+                    `Position is closed on exchange but Django still shows status=open. ` +
+                    `Manual reconciliation required.`,
+                );
             }
 
             this.state.activeTrade = null;
@@ -737,6 +789,45 @@ export class BotTrader {
         } catch (e: any) {
             logger.error(this.tag, `Residual verification error: ${e.message}`);
         }
+    }
+
+    private async persistCloseWithRetry(
+        tradeId: number,
+        payload: any,
+        isReal: boolean,
+    ): Promise<boolean> {
+        // Three attempts with linear backoff cover the most common transient
+        // failure mode (Django worker restart, brief network hiccup). Beyond
+        // that, the failure is likely structural (auth, validation) and more
+        // retries would only delay operator notification.
+        const delaysMs = [0, 500, 1500];
+        let lastError: unknown = null;
+        for (let attempt = 0; attempt < delaysMs.length; attempt++) {
+            const delay = delaysMs[attempt];
+            if (delay && delay > 0) await sleep(delay);
+            try {
+                if (isReal) await api.closeTrade(tradeId, payload);
+                else await api.closeEmulationTrade(tradeId, payload);
+                if (attempt > 0) {
+                    logger.warn(
+                        this.tag,
+                        `Trade ${tradeId} close PATCH succeeded on attempt ${attempt + 1}/${delaysMs.length}`,
+                    );
+                }
+                return true;
+            } catch (e: any) {
+                lastError = e;
+                logger.warn(
+                    this.tag,
+                    `Close PATCH attempt ${attempt + 1}/${delaysMs.length} failed for trade ${tradeId}: ${e?.message ?? e}`,
+                );
+            }
+        }
+        logger.error(
+            this.tag,
+            `Close PATCH exhausted retries for trade ${tradeId}: ${(lastError as any)?.message ?? lastError}`,
+        );
+        return false;
     }
 
     private async backfillOpenCommission(

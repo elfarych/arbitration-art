@@ -16,6 +16,25 @@ interface DjangoListResponse<T> {
     results?: T[];
 }
 
+export interface EngineBootstrapBot {
+    bot_id: number;
+    owner_id?: number;
+    config: Record<string, any>;
+    keys: Record<string, string>;
+}
+
+interface EngineBootstrapResponse {
+    bots: EngineBootstrapBot[];
+}
+
+// DRF returns 201 Created for POST that creates a resource (trades),
+// 200 OK for GET/PATCH/action endpoints, and 204 No Content for some
+// service-only writes. `requestJson` defaults to [200] only — without
+// the explicit list a successful POST would surface as `HttpError` and
+// the engine would refuse to update its in-memory trade state even
+// though Django persisted the row.
+const DJANGO_OK_STATUSES = [200, 201, 204];
+
 async function djangoRequest<T>(
     method: 'GET' | 'POST' | 'PATCH',
     path: string,
@@ -30,6 +49,7 @@ async function djangoRequest<T>(
         headers: authHeaders,
         body: options.body !== undefined ? JSON.stringify(options.body) : undefined,
         timeoutMs: REQUEST_TIMEOUT_MS,
+        expectedStatuses: DJANGO_OK_STATUSES,
     });
 }
 
@@ -103,6 +123,18 @@ export const api = {
 
     async updateEmulationTrade(id: number, payload: Record<string, any>): Promise<TradeRecord> {
         return djangoRequest<TradeRecord>('PATCH', `/bots/trades/${id}/`, { body: payload });
+    },
+
+    // Bootstrap is invoked once on engine startup. The engine self-identifies by
+    // serviceUrl so Django returns only bots whose BotConfig.service_url matches —
+    // mandatory for multi-engine deployments to avoid cross-loading.
+    async getActiveBotPayloads(serviceUrl: string): Promise<EngineBootstrapBot[]> {
+        const data = await djangoRequest<EngineBootstrapResponse>(
+            'GET',
+            '/bots/engine-bootstrap/',
+            { query: { service_url: serviceUrl } },
+        );
+        return data?.bots ?? [];
     },
 
     async getOpenEmulationTrades(botId: number): Promise<TradeRecord[]> {

@@ -12,6 +12,11 @@
           {{ restrictedNotice }}
         </q-banner>
 
+        <q-banner v-if="missingKeysNotice" dense rounded class="bg-negative text-white q-mb-md text-caption">
+          <q-icon name="error" class="q-mr-xs" />
+          {{ missingKeysNotice }}
+        </q-banner>
+
         <q-form @submit.prevent="onSubmit" class="bot-form">
 
           <div class="grid-cols-2">
@@ -128,7 +133,10 @@
 
           <div class="grid-cols-2 q-mt-sm">
             <div>
-              <div class="text-caption opacity-70 q-mb-xs">Режим работы</div>
+              <div class="text-caption opacity-70 q-mb-xs">
+                Режим работы
+                <span v-if="isEdit" class="opacity-50">(нельзя менять после создания)</span>
+              </div>
               <q-btn-toggle
                 v-model="form.trade_mode"
                 spread
@@ -137,7 +145,7 @@
                 color="dark"
                 text-color="grey"
                 toggle-text-color="dark"
-                :disable="lockRestrictedFields"
+                :disable="isEdit"
                 :options="[
                   {label: 'Эмулятор', value: 'emulator'},
                   {label: 'Торговля', value: 'real'}
@@ -156,8 +164,7 @@
                 toggle-text-color="dark"
                 :options="[
                   {label: 'Покупка', value: 'buy'},
-                  {label: 'Продажа', value: 'sell'},
-                  {label: 'Авто', value: 'auto'}
+                  {label: 'Продажа', value: 'sell'}
                 ]"
               />
             </div>
@@ -192,12 +199,24 @@
 </template>
 
 <script setup lang="ts">
-import { ref, watch, computed } from 'vue';
+import { ref, watch, computed, onMounted } from 'vue';
 import type { BotConfig, BotConfigPayload } from 'src/stores/bots/api/botConfig';
 import { useBotsStore } from 'src/stores/bots/bots.store';
 import { useExchangesStore } from 'src/stores/exchanges/exchanges.store';
+import { useProfileStore } from 'src/stores/profile/profile.store';
+import { storeToRefs } from 'pinia';
 import { useQuasar } from 'quasar';
 import { extractApiErrorMessage } from 'src/utils/apiError';
+
+// Bot exchange choice ("binance_futures") -> UserExchangeKeys prefix
+// ("binance"). Must stay in sync with Django _EXCHANGE_KEY_PREFIX and
+// Engine.extractKeys; mismatched mapping would break the pre-flight check.
+const EXCHANGE_KEY_PREFIX: Record<string, 'binance' | 'bybit' | 'gate' | 'mexc'> = {
+  binance_futures: 'binance',
+  bybit_futures: 'bybit',
+  gate_futures: 'gate',
+  mexc_futures: 'mexc',
+};
 
 const props = defineProps<{
   modelValue: boolean;
@@ -212,6 +231,8 @@ const emit = defineEmits<{
 const $q = useQuasar();
 const botsStore = useBotsStore();
 const exchangesStore = useExchangesStore();
+const profileStore = useProfileStore();
+const { exchangeKeys } = storeToRefs(profileStore);
 
 const isEdit = computed(() => !!props.bot);
 
@@ -294,9 +315,38 @@ const isCoinValidated = computed(() => {
   return validationResults.value.length === 2 && validationResults.value.every(v => v.exists);
 });
 
+// Pre-flight check: real mode requires API keys for every leg that will
+// execute. Engine.extractKeys throws if keys are missing, Django mirrors the
+// check at serializer level — the UI surfaces the same message before the
+// user even submits so they know exactly where to go fix it.
+const missingKeyLegs = computed<string[]>(() => {
+  if (form.value.trade_mode !== 'real') return [];
+  if (!form.value.is_active) return [];
+  const missing: string[] = [];
+  const check = (exchange: string, enabled: boolean | undefined) => {
+    if (!enabled) return;
+    const prefix = EXCHANGE_KEY_PREFIX[exchange];
+    if (!prefix) return;
+    const state = exchangeKeys.value[prefix];
+    if (!state || !state.has_api_key || !state.has_secret) {
+      missing.push(exchangeLabels[exchange] ?? exchange);
+    }
+  };
+  check(form.value.primary_exchange, form.value.trade_on_primary_exchange);
+  check(form.value.secondary_exchange, form.value.trade_on_secondary_exchange);
+  return missing;
+});
+
+const missingKeysNotice = computed(() => {
+  if (missingKeyLegs.value.length === 0) return '';
+  const list = missingKeyLegs.value.join(', ');
+  return `Нет API-ключей для биржи: ${list}. Откройте Профиль → API-ключи и добавьте ключи перед активацией реальной торговли.`;
+});
+
 const canSubmit = computed(() => {
   if (!coinBase.value) return false;
   if (form.value.primary_exchange === form.value.secondary_exchange) return false;
+  if (missingKeyLegs.value.length > 0) return false;
   return isCoinValidated.value;
 });
 
@@ -362,9 +412,19 @@ const onSubmit = async () => {
   }
 };
 
+// Mounted once per dialog instance. The store may already be populated by
+// ProfilePage; calling fetch again is cheap and guarantees the pre-flight key
+// check uses up-to-date state if the user added keys in another tab.
+onMounted(() => {
+  void profileStore.fetchExchangeKeys();
+});
+
 // Sync form on open
 watch(() => props.modelValue, (isOpen) => {
   if (!isOpen) return;
+  // Refresh keys each time the dialog opens so a user who just added keys in
+  // another tab does not see a stale "missing keys" warning.
+  void profileStore.fetchExchangeKeys();
   validationResults.value = [];
   estimatedUsdt.value = 0;
   priceCache = 0;

@@ -22,6 +22,7 @@ from apps.bots.models import (
 from apps.bots.permissions import ServiceTokenOnly, ServiceTokenWriteOrAuthenticatedRead, is_service_request
 from apps.bots.services.lifecycle import (
     LifecycleSyncError,
+    build_bot_runtime_payload,
     check_bot_engine_health,
     sync_bot_lifecycle,
 )
@@ -83,12 +84,20 @@ class BotConfigViewSet(viewsets.ModelViewSet):
         # Engine.startBot is idempotent: it either starts a new trader or
         # forwards the new config to the existing one. Therefore a single
         # START suffices for every active-bot transition (newly active, still
-        # active, config-only change). STOP is sent only when the bot moves
-        # to inactive — Engine.stop closes positions gracefully.
+        # active, config-only change).
+        #
+        # When the bot moves to inactive we send PAUSE (NOT STOP): the engine
+        # keeps the trader alive, stops opening new trades, and lets the
+        # active trade — if any — close on profit / timeout / drawdown via
+        # the existing checkExit/checkTimeouts loop. Operators reach the
+        # close-positions-now behaviour explicitly through the force-close
+        # endpoint, and STOP-with-close is reserved for the delete path
+        # where the trader has to be removed and positions cannot be left
+        # orphaned.
         if instance.is_active:
             _dispatch_bot_lifecycle(instance.id, LifecycleCommand.START)
         elif previous_is_active:
-            _dispatch_bot_lifecycle(instance.id, LifecycleCommand.STOP)
+            _dispatch_bot_lifecycle(instance.id, LifecycleCommand.PAUSE)
         # If the bot was already inactive and stays inactive, no engine call
         # is needed: no in-memory runtime exists to mutate.
 
@@ -116,6 +125,22 @@ class BotConfigViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=["post"], url_path="force-close")
     def force_close(self, request, pk=None):
         bot = self.get_object()
+        # `is_active=False` is no longer equivalent to "no in-memory trader":
+        # the pause path keeps the trader registered so an open trade can
+        # finish closing on profit / timeout / drawdown. The engine is the
+        # source of truth — if there is no trader or no active trade it
+        # silently no-ops. We do refuse early only when Django itself has no
+        # open trade row for this bot, since that is the cheapest pre-flight
+        # check that catches "user clicked force-close on a never-traded
+        # bot" without round-tripping to the engine.
+        if not bot.is_active and not (
+            bot.emulation_trades.filter(status="open").exists()
+            or bot.real_trades.filter(status="open").exists()
+        ):
+            return Response(
+                {"detail": "Bot is not active and has no open trades; nothing to force-close."},
+                status=status.HTTP_409_CONFLICT,
+            )
         try:
             sync_bot_lifecycle(bot.id, LifecycleCommand.FORCE_CLOSE)
         except LifecycleSyncError as exc:
@@ -125,6 +150,37 @@ class BotConfigViewSet(viewsets.ModelViewSet):
             )
 
         return Response({"status": "force-close triggered"})
+
+    @action(
+        detail=False,
+        methods=["get"],
+        url_path="engine-bootstrap",
+        permission_classes=[ServiceTokenOnly],
+    )
+    def engine_bootstrap(self, request):
+        """Return runtime payloads for every active bot bound to a service_url.
+
+        Called by the engine right after it starts so it can restore in-memory
+        state for bots whose `is_active=True` rows survived the crash. The
+        engine identifies itself by passing its own URL in `service_url`; we
+        only return bots whose `BotConfig.service_url` matches exactly. This
+        keeps multi-engine deployments from cross-loading each other's bots,
+        and the explicit filter avoids returning open trades from an inactive
+        bot the operator paused on purpose.
+        """
+        service_url = request.query_params.get("service_url", "").strip()
+        if not service_url:
+            return Response(
+                {"detail": "service_url query parameter is required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        bots = (
+            BotConfig.objects.select_related("owner", "owner__exchange_keys")
+            .filter(is_active=True, service_url=service_url)
+            .order_by("id")
+        )
+        return Response({"bots": [build_bot_runtime_payload(bot) for bot in bots]})
 
     @action(detail=True, methods=["get"], url_path="engine-health")
     def engine_health(self, request, pk=None):

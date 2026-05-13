@@ -28,16 +28,16 @@ class LifecycleSyncError(RuntimeError):
 def _lifecycle_settings(action: str) -> tuple[int, float, float]:
     """Return (retries, timeout_seconds, retry_delay_seconds) for an action.
 
-    SYNC operations are in-memory only on the engine side and must return in
-    milliseconds. START/STOP/FORCE-CLOSE may run loadMarkets / setLeverage /
-    position closes and need a longer budget. A single global timeout would
-    either be too short for START (blocking trades) or too long for SYNC
-    (blocking the Django worker on cosmetic edits).
+    SYNC and PAUSE operations are in-memory only on the engine side and must
+    return in milliseconds. START/STOP/FORCE-CLOSE may run loadMarkets /
+    setLeverage / position closes and need a longer budget. A single global
+    timeout would either be too short for START (blocking trades) or too long
+    for SYNC/PAUSE (blocking the Django worker on cosmetic edits).
     """
 
     retries = max(1, int(getattr(settings, "SERVICE_REQUEST_RETRIES", 3)))
     retry_delay = float(getattr(settings, "SERVICE_REQUEST_RETRY_DELAY_SECONDS", 1))
-    if action == LifecycleCommand.SYNC:
+    if action in {LifecycleCommand.SYNC, LifecycleCommand.PAUSE}:
         timeout = float(getattr(settings, "SERVICE_SYNC_TIMEOUT_SECONDS", 5))
     else:
         # Fall back to the legacy SERVICE_REQUEST_TIMEOUT_SECONDS for backwards
@@ -80,7 +80,7 @@ def _perform_post(url: str, payload: dict[str, Any], action: str | None = None) 
     raise LifecycleSyncError(last_error)
 
 
-def _bot_runtime_payload(bot: BotConfig) -> dict[str, Any]:
+def build_bot_runtime_payload(bot: BotConfig) -> dict[str, Any]:
     return {
         "bot_id": bot.id,
         "owner_id": bot.owner_id,
@@ -115,7 +115,7 @@ def _bot_runtime_payload(bot: BotConfig) -> dict[str, Any]:
 def _pending_status_for(action: str) -> str:
     if action in {LifecycleCommand.START, LifecycleCommand.SYNC}:
         return RuntimeStatus.STARTING
-    if action == LifecycleCommand.STOP:
+    if action in {LifecycleCommand.STOP, LifecycleCommand.PAUSE}:
         return RuntimeStatus.STOPPING
     return ""
 
@@ -125,7 +125,12 @@ def _success_status_for(action: str, *, archived: bool) -> str:
         return RuntimeStatus.ARCHIVED
     if action in {LifecycleCommand.START, LifecycleCommand.SYNC}:
         return RuntimeStatus.RUNNING
-    if action == LifecycleCommand.STOP:
+    # PAUSE leaves the trader registered on the engine but with is_active=False;
+    # for Django's runtime status that is observationally identical to STOPPED
+    # (no new trades being opened). The presence of an open trade row in
+    # `EmulationTrade`/`Trade` is what UI uses to surface the "still closing"
+    # state, not a separate runtime status.
+    if action in {LifecycleCommand.STOP, LifecycleCommand.PAUSE}:
         return RuntimeStatus.STOPPED
     return ""
 
@@ -172,7 +177,7 @@ def sync_bot_lifecycle(bot_id: int, action: str) -> None:
     payload = (
         {"bot_id": bot.id}
         if action in {LifecycleCommand.STOP, LifecycleCommand.FORCE_CLOSE}
-        else _bot_runtime_payload(bot)
+        else build_bot_runtime_payload(bot)
     )
 
     try:

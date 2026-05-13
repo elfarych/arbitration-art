@@ -33,6 +33,15 @@ export const config = {
     useTestnet: process.env.USE_TESTNET === 'true',
     // Public HTTP port for Django -> engine control requests.
     port: parseInt(process.env.PORT || '3001', 10),
+    // Self-identification URL the engine sends to Django when fetching the
+    // active-bot bootstrap payload. Must match `BotConfig.service_url` exactly,
+    // otherwise Django returns an empty bot list and the engine starts cold.
+    // Default mirrors Django's `BOT_ENGINE_SERVICE_URL_DEFAULT` for single-host
+    // dev setups; override per deployment when engine lives on another host.
+    engineServiceUrl: (
+        process.env.ENGINE_SERVICE_URL
+        || `http://127.0.0.1:${parseInt(process.env.PORT || '3001', 10)}`
+    ).replace(/\/$/, ''),
     // MarketInfoService uses this fixed notional only as a preflight guard.
     tradeAmountUsdt: Number(process.env.TRADE_AMOUNT_USDT || '50'),
     // Shared service token for Django <-> runtime communication.
@@ -49,5 +58,5 @@ export const config = {
     // large skew means one leg's WS is lagging — comparing those books would
     // produce a spread signal that does not exist on the live market. Set to 0
     // to disable the check.
-    orderbookMaxSkewMs: readPositiveInt('ORDERBOOK_MAX_SKEW_MS', 2_000),
+    orderbookMaxSkewMs: readPositiveInt('ORDERBOOK_MAX_SKEW_MS', 20_000),
 };

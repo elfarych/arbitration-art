@@ -12,7 +12,7 @@ export type EngineRuntimeStatus =
 
 export type EngineSyncStatus = 'idle' | 'pending' | 'success' | 'failed';
 
-export type EngineLastCommand = 'start' | 'sync' | 'stop' | 'force-close' | '';
+export type EngineLastCommand = 'start' | 'sync' | 'stop' | 'pause' | 'force-close' | '';
 
 export interface BotConfig {
   id: number;

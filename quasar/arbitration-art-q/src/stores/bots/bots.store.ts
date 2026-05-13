@@ -11,12 +11,18 @@ export const useBotsStore = defineStore('bots', {
     loading: false,
   }),
   actions: {
-    async fetchBots() {
-      this.loading = true;
+    // `silent` is used by background polling: the IndexPage spinner branch
+    // hides the cards grid when `loading` is true, which would unmount every
+    // BotCard on each poll (killing WS streams, restarting trade polls and
+    // re-running skeleton states). Initial load still flips the flag so the
+    // user sees the spinner instead of an empty grid.
+    async fetchBots(options: { silent?: boolean } = {}) {
+      const showSpinner = !options.silent;
+      if (showSpinner) this.loading = true;
       try {
         this.bots = await botConfigApi.list();
       } finally {
-        this.loading = false;
+        if (showSpinner) this.loading = false;
       }
     },
 

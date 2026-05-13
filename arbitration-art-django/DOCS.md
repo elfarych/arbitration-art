@@ -329,7 +329,7 @@ Prefix: `/api/auth/`.
 | `GET` | `/api/auth/exchange-keys/` | `ExchangeKeysView` | authenticated | Получить masked состояние API-ключей текущего пользователя. |
 | `PATCH` | `/api/auth/exchange-keys/` | `ExchangeKeysView` | authenticated | Обновить или очистить API-ключи текущего пользователя. |
 | `POST` | `/api/auth/exchange-keys/<exchange>/test-connection/` | `ExchangeKeyTestConnectionView` | authenticated | Прокси на `engine /engine/exchange/test-connection`. Проверяет ключи через `loadMarkets` + `fetchPositions(['SOL/USDT:USDT'])`. |
-| `POST` | `/api/auth/exchange-keys/<exchange>/test-trade/` | `ExchangeKeyTestTradeView` | authenticated | Прокси на `engine /engine/exchange/test-trade`. Запускает round-trip SOL/USDT futures-сделку с $15 маржей и плечом 10x и возвращает per-leg latency в ms. |
+| `POST` | `/api/auth/exchange-keys/<exchange>/test-trade/` | `ExchangeKeyTestTradeView` | authenticated | Прокси на `engine /engine/exchange/test-trade`. Запускает round-trip SOL/USDT futures-сделку с notional $15 и плечом 10x (≈ $1.5 маржи) и возвращает per-leg latency в ms. |
 
 Login использует стандартный Simple JWT serializer. Так как `USERNAME_FIELD = "email"`, ожидаемый credential field - `email`.
 
@@ -586,6 +586,7 @@ Endpoints:
 | `DELETE` | `/api/bots/{id}/` | Сначала inline STOP (если бот активен), потом удаление. 502 без удаления, если engine не подтвердил остановку. |
 | `POST` | `/api/bots/{id}/force-close/` | Inline FORCE-CLOSE через engine. |
 | `GET` | `/api/bots/{id}/engine-health/` | Probe engine `/health` для service_url этого бота. 502 если engine недоступен. Side effect-free. |
+| `GET` | `/api/bots/engine-bootstrap/?service_url=<self>` | Service-only (`X-Service-Token`). Возвращает `{ "bots": [<runtime_payload>, ...] }` для всех `BotConfig` с `is_active=True` и `service_url=<self>`. Engine дёргает endpoint при старте, чтобы восстановить in-memory traders после крэша. Фильтр по `service_url` нужен для multi-engine setup-а — каждый engine получает только своих ботов. `runtime_payload` идентичен полезной нагрузке `/engine/bot/start` (тот же `build_bot_runtime_payload`), включая `keys`. |
 
 Serializer fields (`BotConfigSerializer`):
 
@@ -640,17 +641,18 @@ updated_at
 - `primary_exchange != secondary_exchange` (плюс DB-level `CheckConstraint`).
 - Если `is_active=true` и `trade_mode=real`, хотя бы одна из ног (`trade_on_primary_exchange`/`trade_on_secondary_exchange`) должна быть включена.
 - Поля `trade_mode`, `primary_exchange`, `secondary_exchange`, `primary_leverage`, `secondary_leverage` запрещено менять, пока бот активен. Для смены нужно сначала `is_active=false` (engine закроет позиции и сбросит trader), потом изменить поле, потом `is_active=true` (engine стартует новый trader с правильной margin/leverage конфигурацией).
+- При `is_active=true` и `trade_mode=real` сериалайзер проверяет, что у `owner.exchange_keys` непустые `api_key` + `secret` для каждой ноги, которая будет торговать (`trade_on_primary_exchange`/`trade_on_secondary_exchange`). Маппинг `binance_futures → binance` и т.д. (см. `_EXCHANGE_KEY_PREFIX`) держится в синхроне с `Engine.extractKeys` и фронтовым `EXCHANGE_KEY_PREFIX` в `BotFormDialog.vue`. Без ключей сериалайзер отдаёт `400` с указанием конкретной биржи, вместо непрозрачного `502` от engine.
 
 Side effects (inline, без `transaction.on_commit`):
 
 - `POST` `is_active=true` → `sync_bot_lifecycle(START)`. На fail — 502, запись остаётся в БД с `sync_status=FAILED`, `last_sync_error` заполнен, можно ретраить через PATCH.
 - `POST` `is_active=false` → engine call не выполняется (бот создан как pre-staged).
-- `PUT`/`PATCH` (стал активным или остался активным) → `START` (engine идемпотентен: START уже запущенного трейдера эквивалентен SYNC).
-- `PUT`/`PATCH` (был активен, стал неактивен) → `STOP`.
+- `PUT`/`PATCH` (стал активным или остался активным) → `START` (engine идемпотентен: START уже запущенного трейдера эквивалентен SYNC). Это же путь используется для возобновления после pause: при `is_active: False → True` engine получает START и через `Engine.startBot` → `syncBot` флипает `is_active=true` без teardown/reconnect; уже-открытая сделка продолжает закрываться по своим условиям.
+- `PUT`/`PATCH` (был активен, стал неактивен) → `PAUSE`. Engine оставляет трейдер в памяти, останавливает открытие новых сделок (через `bot.is_active=false` в синканутом конфиге), но `checkExit`/`checkTimeouts` продолжают мониторить активную сделку и закроют её по profit / timeout / max-leg drawdown. **Pause не закрывает позиции.** Чтобы закрыть сделку немедленно — `force-close` (бот остаётся активным) или последовательно pause+force-close. Чтобы полностью убрать трейдер из engine — DELETE (за бот стоп с закрытием).
 - `PUT`/`PATCH` (был и остался неактивным) → engine не дёргается.
-- `DELETE` (активный) → синхронный `STOP` + delete row; 502 без delete, если engine не подтвердил.
+- `DELETE` (активный) → синхронный `STOP` (`Engine.stopBot` закрывает active trade с reason `shutdown` и удаляет трейдер из `Engine.traders`) + delete row; 502 без delete, если engine не подтвердил.
 - `DELETE` (неактивный) → просто delete row.
-- `force-close` → синхронный `FORCE-CLOSE`.
+- `force-close` → синхронный `FORCE-CLOSE`. Если `bot.is_active=False`, action отвечает `409 Conflict` без вызова engine — у engine нет in-memory trader-а для неактивного бота, и команда была бы no-op с misleading-2xx. Если хочешь принудительно закрыть сделку у паузнутого бота — сначала сними паузу (PATCH is_active=true), engine.startBot подцепит open trade через restoreOpenTrades, потом дёрни force-close.
 
 Сигнальный путь `bot_config_pre_delete` остаётся как safety net для admin/cascade удалений: если активный бот удалён без прохождения через ViewSet (например, при cascade-delete пользователя), сигнал шлёт best-effort `STOP` на engine. В нормальном flow inline `STOP` уже отработал, и signal видит `is_active=False` (in-memory мутация в `destroy`) и пропускает дубль.
 
@@ -1053,10 +1055,13 @@ Service token прокидывается обратной стороной: Djan
 |---|---|---|---|
 | Create bot, is_active=true | `start` | `POST {service_url}/engine/bot/start` | `SERVICE_LIFECYCLE_TIMEOUT_SECONDS` (default 30s) |
 | Update bot, остаётся активным или становится активным | `start` (идемпотентен в engine) | `POST {service_url}/engine/bot/start` | `SERVICE_LIFECYCLE_TIMEOUT_SECONDS` |
-| Update bot, был активен → стал неактивен | `stop` | `POST {service_url}/engine/bot/stop` | `SERVICE_LIFECYCLE_TIMEOUT_SECONDS` |
+| Update bot, был активен → стал неактивен (pause) | `pause` | `POST {service_url}/engine/bot/pause` | `SERVICE_SYNC_TIMEOUT_SECONDS` (default 5s) |
 | Delete bot (активный) | `stop` | `POST {service_url}/engine/bot/stop` | `SERVICE_LIFECYCLE_TIMEOUT_SECONDS` |
 | Force close | `force-close` | `POST {service_url}/engine/bot/force-close` | `SERVICE_LIFECYCLE_TIMEOUT_SECONDS` |
 | Engine health probe (read-only) | (GET) | `GET {service_url}/health` | `SERVICE_SYNC_TIMEOUT_SECONDS` (default 5s) |
+| Engine bootstrap (engine → Django, read-only) | (GET) | `GET /api/bots/engine-bootstrap/?service_url=<self>` | client timeout 15s (`api.ts`) |
+
+Engine bootstrap — pull-направление: при старте engine сам зовёт Django, чтобы восстановить in-memory traders для всех `is_active=True` ботов с матчащимся `service_url`. Это закрывает класс ситуаций «engine рестартанул, Django считает ботов running, но они фактически стоят». Open trades восстанавливает уже существующий `BotTrader.restoreOpenTrades` внутри `Engine.startBot`. Endpoint защищён `ServiceTokenOnly` permission — без валидного `X-Service-Token` возвращает 403.
 
 START заменяет SYNC потому что [`Engine.startBot`](../arbitration-bot-engine/src/classes/Engine.ts) **идемпотентен**: если bot_id уже зарегистрирован, он форвардит конфиг существующему trader-у через `syncConfig`. Это убирает класс багов «бот не стартует после re-activate, потому что Django шлёт SYNC, а engine не имеет trader-а в памяти».
 

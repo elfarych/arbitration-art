@@ -39,6 +39,7 @@ export interface ExchangeTradeTestResult {
   success: boolean;
   exchange: ExchangeId;
   symbol: string;
+  notional_usd: number;
   margin_usd: number;
   leverage: number;
   quantity: number;
