@@ -4,8 +4,6 @@ from apps.bots.models import (
     BotConfig,
     EmulationTrade,
     Trade,
-    TraderRuntimeConfig,
-    TraderRuntimeConfigError,
 )
 
 
@@ -29,52 +27,6 @@ class BotConfigAdmin(admin.ModelAdmin):
     list_filter = ("is_active", "order_type", "primary_exchange", "status", "sync_status")
     search_fields = ("coin", "owner__email", "service_url")
     readonly_fields = ("status", "sync_status", "last_command", "last_sync_error", "last_synced_at", "created_at", "updated_at")
-
-
-@admin.register(TraderRuntimeConfig)
-class TraderRuntimeConfigAdmin(admin.ModelAdmin):
-    """Admin interface for TraderRuntimeConfig model."""
-
-    list_display = (
-        "id",
-        "owner",
-        "name",
-        "primary_exchange",
-        "secondary_exchange",
-        "service_url",
-        "is_active",
-        "status",
-        "sync_status",
-        "is_deleted",
-        "created_at",
-    )
-    list_filter = ("is_active", "status", "sync_status", "is_deleted", "use_testnet")
-    search_fields = ("name", "owner__email", "service_url")
-    readonly_fields = (
-        "status",
-        "sync_status",
-        "last_command",
-        "last_sync_error",
-        "last_synced_at",
-        "archived_at",
-        "created_at",
-        "updated_at",
-    )
-
-
-@admin.register(TraderRuntimeConfigError)
-class TraderRuntimeConfigErrorAdmin(admin.ModelAdmin):
-    """Admin interface for TraderRuntimeConfigError model."""
-
-    list_display = (
-        "id",
-        "runtime_config",
-        "error_type",
-        "created_at",
-    )
-    list_filter = ("error_type", "created_at")
-    search_fields = ("runtime_config__name", "runtime_config__owner__email", "error_text")
-    readonly_fields = ("created_at",)
 
 
 @admin.register(EmulationTrade)

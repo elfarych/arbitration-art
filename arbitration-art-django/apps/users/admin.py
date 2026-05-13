@@ -1,7 +1,19 @@
 from django.contrib import admin
 from django.contrib.auth.admin import UserAdmin as BaseUserAdmin
+from rest_framework_simplejwt.token_blacklist.models import (
+    BlacklistedToken,
+    OutstandingToken,
+)
 
 from apps.users.models import User, UserExchangeKeys
+
+# Hide SimpleJWT token-blacklist tables from Django admin. The app itself
+# stays in INSTALLED_APPS because SIMPLE_JWT.BLACKLIST_AFTER_ROTATION relies
+# on its models and signal handlers; only the admin surface is removed.
+# apps.users sits after rest_framework_simplejwt.token_blacklist in
+# INSTALLED_APPS, so the default registrations exist by the time this runs.
+admin.site.unregister(BlacklistedToken)
+admin.site.unregister(OutstandingToken)
 
 
 @admin.register(User)

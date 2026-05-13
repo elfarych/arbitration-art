@@ -1209,6 +1209,11 @@ Fieldsets:
 - Open details.
 - Close details.
 
+### 11.5. Что не регистрируется в admin
+
+- `TraderRuntimeConfig` / `TraderRuntimeConfigError` — out of scope §3.0 (`arbitration-trader`), регистрации в `apps/bots/admin.py` нет.
+- `rest_framework_simplejwt.token_blacklist.BlacklistedToken` и `OutstandingToken` — снимаются с регистрации в `apps/users/admin.py` через `admin.site.unregister(...)`. Сам app `rest_framework_simplejwt.token_blacklist` остаётся в `INSTALLED_APPS`, потому что `SIMPLE_JWT.BLACKLIST_AFTER_ROTATION=True` опирается на его модели и сигналы — удаляется только admin-поверхность.
+
 ## 12. Миграции и состояние БД
 
 Проверено 2026-04-22:
