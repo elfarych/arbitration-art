@@ -966,7 +966,7 @@ primary_leverage: 10
 secondary_leverage: 10
 order_type: 'buy'
 trade_mode: 'emulator'
-max_trade_duration_minutes: 60
+max_trade_duration_seconds: 3600
 max_leg_drawdown_percent: 80
 is_active: true
 ```

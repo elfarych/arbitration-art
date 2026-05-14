@@ -33,7 +33,7 @@ export interface BotConfig {
   secondary_leverage: number;
   trade_on_primary_exchange: boolean;
   trade_on_secondary_exchange: boolean;
-  max_trade_duration_minutes: number;
+  max_trade_duration_seconds: number;
   max_leg_drawdown_percent: number;
   is_active: boolean;
   // Engine integration status — populated by Django from the inline lifecycle

@@ -99,7 +99,7 @@ def build_bot_runtime_payload(bot: BotConfig) -> dict[str, Any]:
             "secondary_leverage": bot.secondary_leverage,
             "trade_on_primary_exchange": bot.trade_on_primary_exchange,
             "trade_on_secondary_exchange": bot.trade_on_secondary_exchange,
-            "max_trade_duration_minutes": bot.max_trade_duration_minutes,
+            "max_trade_duration_seconds": bot.max_trade_duration_seconds,
             "max_leg_drawdown_percent": bot.max_leg_drawdown_percent,
             "is_active": bot.is_active,
         },

@@ -13,10 +13,17 @@ interface PairState {
     openedAtMs: number | null;
     busy: boolean;
     cooldownUntil: number;
+    // Total trades the bot ever opened (open + closed + force_closed),
+    // initialised from Django on start() so the cap survives engine
+    // restarts. Compared against bot.max_trades before each new open.
+    tradesOpenedCount: number;
 }
 
 const COOLDOWN_MS = 30_000;
-const TIMEOUT_CHECK_INTERVAL_MS = 10_000;
+// 2s gives the engine enough resolution to honour the 10s minimum
+// max_trade_duration_seconds the operator can set in Django, while keeping
+// per-bot CPU cost negligible (one timer + one elapsed-time compare per tick).
+const TIMEOUT_CHECK_INTERVAL_MS = 2_000;
 // Maximum time stop() waits for an in-flight open/close to settle before giving
 // up. We do not abandon a real-money trade mid-flight, but we also cannot block
 // shutdown forever if a leg is stuck.
@@ -26,6 +33,9 @@ const FORCE_CLOSE_BUSY_WAIT_MS = 10_000;
 // happens on every WS update, so without throttling the same lag would emit
 // hundreds of identical warnings per second.
 const STALE_LOG_THROTTLE_MS = 5_000;
+// Same throttle reasoning as STALE_LOG_THROTTLE_MS: once max_trades is hit,
+// every orderbook tick would otherwise emit the same "budget reached" line.
+const MAX_TRADES_LOG_THROTTLE_MS = 60_000;
 // Approximate taker fee per exchange. The engine writes an estimated commission
 // to Django immediately on close and replaces it with the actual value once the
 // exchange surfaces userTrades.
@@ -64,6 +74,7 @@ export class BotTrader {
     private timeoutTimer: ReturnType<typeof setInterval> | null = null;
     private storeUnsubscribe: (() => void) | null = null;
     private lastStaleLogAtMs = 0;
+    private lastMaxTradesLogAtMs = 0;
 
     constructor(
         public bot: any,
@@ -82,6 +93,7 @@ export class BotTrader {
             openedAtMs: null,
             busy: false,
             cooldownUntil: 0,
+            tradesOpenedCount: 0,
         };
     }
 
@@ -122,6 +134,23 @@ export class BotTrader {
 
     public async start(): Promise<void> {
         logger.info(this.tag, `Starting market data subscriptions for ${this.bot.coin}...`);
+
+        // Hydrate the all-time opened-trades counter from Django before any
+        // WS update can trigger checkSpreads(). The counter is the source of
+        // truth for max_trades enforcement; if Django is briefly unreachable
+        // we log and start from 0 — the cap is loose for this run but the
+        // operator still has BotConfig.is_active to cut things off manually.
+        try {
+            const isReal = this.bot.trade_mode === 'real';
+            this.state.tradesOpenedCount = await api.getTotalTradesCount(this.bot.id, isReal);
+            logger.info(
+                this.tag,
+                `Trades budget: ${this.state.tradesOpenedCount}/${this.bot.max_trades ?? '∞'}`,
+            );
+        } catch (e: any) {
+            logger.warn(this.tag, `getTotalTradesCount failed at start (${e.message}); starting counter from 0`);
+            this.state.tradesOpenedCount = 0;
+        }
 
         // Subscribe to the store BEFORE connecting WS clients so the first
         // snapshot that arrives is delivered to checkSpreads().
@@ -288,6 +317,23 @@ export class BotTrader {
         if (!this.bot.is_active) return;
         if (Date.now() < this.state.cooldownUntil) return;
 
+        // BotConfig.max_trades caps how many trades the bot can ever open
+        // (open + closed + force_closed combined). 0 / undefined / negative
+        // means "no cap" — the field is PositiveIntegerField in Django so
+        // negatives never reach here in practice, but we guard the cast.
+        const maxTrades = Number(this.bot.max_trades);
+        if (Number.isFinite(maxTrades) && maxTrades > 0 && this.state.tradesOpenedCount >= maxTrades) {
+            const now = Date.now();
+            if (now - this.lastMaxTradesLogAtMs > MAX_TRADES_LOG_THROTTLE_MS) {
+                logger.info(
+                    this.tag,
+                    `🛑 max_trades budget reached (${this.state.tradesOpenedCount}/${maxTrades}); skipping new opens`,
+                );
+                this.lastMaxTradesLogAtMs = now;
+            }
+            return;
+        }
+
         const primarySnap = this.orderBookStore.get(this.primaryExchangeKey, symbol);
         const currentPrice = primarySnap?.bids?.[0]?.[0];
         if (!currentPrice) return;
@@ -435,6 +481,7 @@ export class BotTrader {
 
             this.state.activeTrade = tradeRecord;
             this.state.openedAtMs = Date.now();
+            this.state.tradesOpenedCount += 1;
             logger.info(this.tag, `✅ Opened ${symbol} (${orderType}). DB ID: ${tradeRecord.id}, Spr: ${realOpenSpread.toFixed(3)}%`);
 
             if (isReal) {
@@ -897,12 +944,12 @@ export class BotTrader {
     private async checkTimeouts(): Promise<void> {
         if (!this.isRunning || !this.state.activeTrade || !this.state.openedAtMs || this.state.busy) return;
 
-        const maxDurationMinutes = this.bot.max_trade_duration_minutes || 60;
-        const maxDurationMs = maxDurationMinutes * 60000;
+        const maxDurationSeconds = this.bot.max_trade_duration_seconds || 3600;
+        const maxDurationMs = maxDurationSeconds * 1000;
 
         const elapsed = Date.now() - this.state.openedAtMs;
         if (elapsed >= maxDurationMs) {
-            logger.warn(this.tag, `⏰ Trade timeout (${Math.round(elapsed / 60000)}min)`);
+            logger.warn(this.tag, `⏰ Trade timeout (${Math.round(elapsed / 1000)}s)`);
             const targetCoins = parseFloat(this.state.activeTrade.amount as any);
             const prices = this.getPrices(this.bot.coin, targetCoins, true);
             await this.executeClose('timeout', prices);

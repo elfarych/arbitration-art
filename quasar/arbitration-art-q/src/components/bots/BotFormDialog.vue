@@ -174,7 +174,7 @@
           <div class="text-caption opacity-70 q-mb-sm text-weight-bold">Предохранители / Safety</div>
           <div class="grid-cols-2">
             <div>
-              <q-input v-model.number="form.max_trade_duration_minutes" type="number" label="Таймаут (мин)" outlined dense dark />
+              <q-input v-model.number="form.max_trade_duration_seconds" type="number" min="10" step="1" label="Таймаут (сек)" outlined dense dark />
             </div>
             <div>
               <q-input v-model.number="form.max_leg_drawdown_percent" type="number" step="0.1" label="Просадка ликвидации (%)" outlined dense dark />
@@ -278,7 +278,7 @@ const defaultForm: BotConfigPayload = {
   trade_mode: 'emulator',
   trade_on_primary_exchange: true,
   trade_on_secondary_exchange: true,
-  max_trade_duration_minutes: 60,
+  max_trade_duration_seconds: 3600,
   max_leg_drawdown_percent: 80.0,
   is_active: true,
 };
@@ -445,7 +445,7 @@ watch(() => props.modelValue, (isOpen) => {
       secondary_leverage: props.bot.secondary_leverage,
       trade_on_primary_exchange: props.bot.trade_on_primary_exchange,
       trade_on_secondary_exchange: props.bot.trade_on_secondary_exchange,
-      max_trade_duration_minutes: props.bot.max_trade_duration_minutes,
+      max_trade_duration_seconds: props.bot.max_trade_duration_seconds,
       max_leg_drawdown_percent: props.bot.max_leg_drawdown_percent,
       is_active: props.bot.is_active,
     };

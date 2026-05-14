@@ -417,12 +417,12 @@ Choices:
 | `coin_amount` | `DecimalField(18, 8)` | - | Размер позиции в монете. |
 | `order_type` | `CharField(4, choices=OrderType)` | `auto` | Направление/режим ордера. |
 | `trade_mode` | `CharField(20, choices=TradeMode)` | `emulator` | Эмуляция или реальная торговля. |
-| `max_trades` | `PositiveIntegerField` | `10` | Максимум сделок. |
+| `max_trades` | `PositiveIntegerField` | `10` | Максимум сделок, которые бот может **открыть за всё время жизни** (`open + closed + force_closed`). Enforce'ится в engine (`BotTrader`): in-memory счётчик гидрируется из Django на `start()` через `GET /bots/trades/?bot_id=N&page_size=1` (читается `count` пагинатора). Источник истины — Django; счётчик переживает engine restart. Сброс — удалить и пересоздать бот, либо поднять значение через PATCH. `0` (если кто-то ручкой выставит) трактуется как «без лимита». |
 | `primary_leverage` | `PositiveIntegerField` | `1` | Плечо на основной бирже. |
 | `secondary_leverage` | `PositiveIntegerField` | `1` | Плечо на вторичной бирже. |
 | `trade_on_primary_exchange` | `BooleanField` | `True` | Торговать ли на primary leg. |
 | `trade_on_secondary_exchange` | `BooleanField` | `True` | Торговать ли на secondary leg. |
-| `max_trade_duration_minutes` | `PositiveIntegerField` | `60` | Максимальная длительность сделки. |
+| `max_trade_duration_seconds` | `PositiveIntegerField` | `3600` | Максимальная длительность сделки в секундах. Сериализатор форсит `min_value=10` (см. §api/serializers, `BotConfigSerializer`). Engine проверяет таймаут раз в `TIMEOUT_CHECK_INTERVAL_MS=2s`, так что нижняя граница 10s рабочая. Миграция `0020` переименовала поле из `_minutes` и умножила существующие значения на 60. |
 | `max_leg_drawdown_percent` | `FloatField` | `80.0` | Максимальная просадка leg в процентах. |
 | `is_active` | `BooleanField` | `True` | Активность бота. |
 | `created_at` | `DateTimeField(auto_now_add)` | - | Дата создания. |
@@ -606,7 +606,7 @@ primary_leverage
 secondary_leverage
 trade_on_primary_exchange
 trade_on_secondary_exchange
-max_trade_duration_minutes
+max_trade_duration_seconds
 max_leg_drawdown_percent
 is_active
 status
@@ -673,7 +673,7 @@ Side effects (inline, без `transaction.on_commit`):
   "secondary_leverage": 1,
   "trade_on_primary_exchange": true,
   "trade_on_secondary_exchange": true,
-  "max_trade_duration_minutes": 60,
+  "max_trade_duration_seconds": 3600,
   "max_leg_drawdown_percent": 80.0,
   "is_active": true
 }
@@ -1028,7 +1028,7 @@ Service token прокидывается обратной стороной: Djan
     "secondary_leverage": 5,
     "trade_on_primary_exchange": true,
     "trade_on_secondary_exchange": true,
-    "max_trade_duration_minutes": 60,
+    "max_trade_duration_seconds": 3600,
     "max_leg_drawdown_percent": 80.0,
     "is_active": true
   },

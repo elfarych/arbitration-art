@@ -69,6 +69,11 @@ def _has_keys_for(user, exchange: str) -> bool:
 class BotConfigSerializer(serializers.ModelSerializer):
     """Serializer for BotConfig CRUD operations."""
 
+    # Engine timeout granularity is bounded by TIMEOUT_CHECK_INTERVAL_MS
+    # (currently 2s in BotTrader). Going below 10s would make the detection
+    # slip dominate the configured value, so we floor it here.
+    max_trade_duration_seconds = serializers.IntegerField(min_value=10)
+
     class Meta:
         model = BotConfig
         fields = (
@@ -87,7 +92,7 @@ class BotConfigSerializer(serializers.ModelSerializer):
             "secondary_leverage",
             "trade_on_primary_exchange",
             "trade_on_secondary_exchange",
-            "max_trade_duration_minutes",
+            "max_trade_duration_seconds",
             "max_leg_drawdown_percent",
             "is_active",
             "status",

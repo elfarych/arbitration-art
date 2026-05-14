@@ -13,6 +13,7 @@ const authHeaders: Record<string, string> = {
 };
 
 interface DjangoListResponse<T> {
+    count?: number;
     results?: T[];
 }
 
@@ -149,6 +150,28 @@ export const api = {
         } catch (e: any) {
             logger.error(TAG, `getOpenEmulationTrades failed: ${e.message}`);
             return [];
+        }
+    },
+
+    // Used by BotTrader to enforce BotConfig.max_trades across engine
+    // restarts. We ask Django for `page_size=1` and read the paginated
+    // `count` — the body shape we care about is cheap (one row) but the
+    // count covers the full filter. No status filter: max_trades counts
+    // every trade the bot ever opened, including the one currently active
+    // and the ones that already closed.
+    async getTotalTradesCount(botId: number, isReal: boolean): Promise<number> {
+        const path = isReal ? '/bots/real-trades/' : '/bots/trades/';
+        try {
+            const data = await djangoRequest<DjangoListResponse<TradeRecord> | TradeRecord[]>(
+                'GET',
+                path,
+                { query: { bot_id: botId, page_size: 1 } },
+            );
+            if (Array.isArray(data)) return data.length;
+            return data.count ?? data.results?.length ?? 0;
+        } catch (e: any) {
+            logger.error(TAG, `getTotalTradesCount failed: ${e.message}`);
+            return 0;
         }
     },
 };

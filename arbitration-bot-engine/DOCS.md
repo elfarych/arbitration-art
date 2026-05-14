@@ -254,7 +254,7 @@ Payload от Django:
     "secondary_leverage": 1,
     "trade_on_primary_exchange": true,
     "trade_on_secondary_exchange": true,
-    "max_trade_duration_minutes": 60,
+    "max_trade_duration_seconds": 3600,
     "max_leg_drawdown_percent": 80,
     "is_active": true
   },
@@ -486,14 +486,20 @@ Constructor dependencies:
 | `openedAtMs` | Local timestamp for timeout checks. |
 | `busy` | Re-entrancy lock for open/close operations. |
 | `cooldownUntil` | Timestamp until next entry attempt is blocked after failure. |
+| `tradesOpenedCount` | All-time count of trades the bot has opened. Hydrated in `start()` via `api.getTotalTradesCount(botId, isReal)` (no status filter — includes `open + closed + force_closed`). Incremented after every successful Django write in `executeOpen`. Persists across engine restart through Django; resets only on bot deletion + recreation. |
 
 Constants:
 
 - `COOLDOWN_MS = 30_000` — пауза между неудачной попыткой open и следующей.
-- `TIMEOUT_CHECK_INTERVAL_MS = 10_000` — частота проверки `max_trade_duration_minutes`.
+- `TIMEOUT_CHECK_INTERVAL_MS = 2_000` — частота проверки `max_trade_duration_seconds`. 2s выбраны как нижняя граница, при которой минимально допустимое значение `max_trade_duration_seconds=10` (форсится Django serializer) даёт детект таймаута с дрейфом ≤2s; больше резолюции тут не нужно, меньше — CPU-носер ни за что.
 - `STOP_BUSY_WAIT_MS = 30_000` — макс. время ожидания в `stop()`.
 - `FORCE_CLOSE_BUSY_WAIT_MS = 10_000` — макс. время ожидания в `forceClose`.
+- `MAX_TRADES_LOG_THROTTLE_MS = 60_000` — троттлинг лога «budget reached»; без него каждый orderbook tick после исчерпания `max_trades` спамил бы один и тот же info-лог.
 - `ESTIMATED_TAKER_RATE` — оценки taker fee per exchange (binance 0.05%, bybit 0.055%, mexc 0.02%, gate 0.05%) для записи estimated commission до того, как background backfill подставит точное значение.
+
+#### `max_trades` enforcement
+
+`checkSpreads` перед каждым потенциальным open проверяет `state.tradesOpenedCount >= bot.max_trades` (если `max_trades > 0`). Если budget исчерпан — open не делается, лог «🛑 max_trades budget reached» (throttled). Активный trade при этом продолжает обслуживаться (exit / timeout / drawdown / force-close), только новые входы блокируются. Чтобы «сбросить» лимит — удалить и пересоздать бот (или поднять `max_trades` через PATCH; in-memory счётчик не меняется, но сравнение `count < new_max_trades` снова станет true).
 
 ### 8.2. Lifecycle methods
 
@@ -654,9 +660,9 @@ Django `Trade.CloseReason` choices: `profit`, `timeout`, `manual`, `shutdown`, `
 
 `checkTimeouts()`:
 
-- Каждые 10 секунд.
+- Каждые 2 секунды (`TIMEOUT_CHECK_INTERVAL_MS`).
 - Если нет active trade или busy — return.
-- `maxDurationMinutes = bot.max_trade_duration_minutes || 60`.
+- `maxDurationSeconds = bot.max_trade_duration_seconds || 3600`.
 - Если elapsed >= maxDuration → emergency prices → `executeClose('timeout', prices)`.
 
 ### 8.11. Inactive bot behavior

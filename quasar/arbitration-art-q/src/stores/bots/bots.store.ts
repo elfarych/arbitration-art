@@ -61,7 +61,18 @@ export const useBotsStore = defineStore('bots', {
 
     async createBot(payload: BotConfigPayload) {
       const newBot = await botConfigApi.create(payload);
-      this.bots.unshift(newBot);
+      // Idempotent insert: BotConfigViewSet.perform_create does inline
+      // lifecycle sync with engine which can hold the POST open for seconds.
+      // If BOT_LIST_POLL fires during that window, fetchBots replaces the
+      // array with a fresh Django list that already contains newBot. Without
+      // this guard, the subsequent unshift would add a duplicate row visible
+      // until the next poll.
+      const idx = this.bots.findIndex(b => b.id === newBot.id);
+      if (idx === -1) {
+        this.bots.unshift(newBot);
+      } else {
+        this.bots[idx] = newBot;
+      }
       return newBot;
     },
 

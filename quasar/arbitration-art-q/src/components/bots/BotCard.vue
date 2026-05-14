@@ -148,8 +148,11 @@
               <q-badge color="transparent" class="text-weight-bold" :class="hasActiveTrade ? 'text-warning' : 'text-grey-6'" :style="{ fontSize: '10px', padding: '4px 6px', boxShadow: hasActiveTrade ? '0 0 0 1px rgba(242,192,55,0.4) inset' : '0 0 0 1px rgba(255,255,255,0.15) inset' }">
                 Статус: {{ hasActiveTrade ? 'В сделке' : 'Ожидание' }}
               </q-badge>
-              <q-badge color="transparent" class="text-weight-bold cursor-pointer hover-opacity-100" :class="closedTradesCount > 0 ? 'text-positive' : 'text-grey-6'" :style="{ fontSize: '10px', padding: '4px 6px', boxShadow: closedTradesCount > 0 ? '0 0 0 1px rgba(33,186,69,0.3) inset' : '0 0 0 1px rgba(255,255,255,0.15) inset' }" @click="showTradesHistory = true">
-                Трейдов: {{ closedTradesCount }}
+              <q-badge color="transparent" class="text-weight-bold cursor-pointer hover-opacity-100" :class="tradesBadgeTextClass" :style="{ fontSize: '10px', padding: '4px 6px', boxShadow: tradesBadgeShadow }" @click="showTradesHistory = true">
+                {{ tradesBadgeText }}
+                <q-tooltip v-if="tradesBudgetReached" class="bg-dark text-white border-radius-sm">
+                  Лимит «Максимальное кол-во сделок» достигнут — engine больше не открывает новые входы. Активная сделка (если есть) доработает до своего выхода. Поднимите лимит в настройках, чтобы возобновить.
+                </q-tooltip>
               </q-badge>
               <q-spinner v-if="tradesLoading" color="primary" size="14px" />
             </div>
@@ -530,6 +533,28 @@ watch(
 );
 
 const hasActiveTrade = computed(() => activeTrade.value !== null && (activeTrade.value as AnyTrade).status === 'open');
+
+// Engine counts every trade the bot ever opened against bot.max_trades —
+// closed + force_closed + the currently-open one. UI mirrors that math so
+// the badge denominator lines up with what the engine actually enforces.
+const totalTradesOpened = computed(() => closedTradesCount.value + (hasActiveTrade.value ? 1 : 0));
+const maxTradesLimit = computed(() => Number(props.bot.max_trades) || 0);
+const tradesBudgetReached = computed(() => maxTradesLimit.value > 0 && totalTradesOpened.value >= maxTradesLimit.value);
+const tradesBadgeText = computed(() =>
+  maxTradesLimit.value > 0
+    ? `Трейдов: ${totalTradesOpened.value} / ${maxTradesLimit.value}`
+    : `Трейдов: ${totalTradesOpened.value}`,
+);
+const tradesBadgeTextClass = computed(() => {
+  if (tradesBudgetReached.value) return 'text-warning';
+  if (totalTradesOpened.value > 0) return 'text-positive';
+  return 'text-grey-6';
+});
+const tradesBadgeShadow = computed(() => {
+  if (tradesBudgetReached.value) return '0 0 0 1px rgba(242,192,55,0.5) inset';
+  if (totalTradesOpened.value > 0) return '0 0 0 1px rgba(33,186,69,0.3) inset';
+  return '0 0 0 1px rgba(255,255,255,0.15) inset';
+});
 
 const currentPnL = computed(() => {
   if (!activeTrade.value || !spreadStats.value?.current) return 0;
