@@ -517,11 +517,17 @@ watch(() => spreadStats.value?.current?.closeSpread, (newVal) => {
   if (newVal < minCloseSpread.value) minCloseSpread.value = newVal;
 });
 
-watch(() => [props.bot.entry_spread, props.bot.exit_spread, props.bot.coin], () => {
-  // Reset rolling stats when the bot config materially changes.
-  maxOpenSpread.value = -Infinity;
-  minCloseSpread.value = Infinity;
-});
+// Multi-source form: Vue compares each getter result independently via
+// `Object.is`. A single-getter form returning `[a, b, c]` would compare the
+// array by reference and reset on every props.bot re-assignment (which happens
+// every 15s when IndexPage polls fetchBots), wiping the rolling extremes.
+watch(
+  [() => props.bot.entry_spread, () => props.bot.exit_spread, () => props.bot.coin],
+  () => {
+    maxOpenSpread.value = -Infinity;
+    minCloseSpread.value = Infinity;
+  },
+);
 
 const hasActiveTrade = computed(() => activeTrade.value !== null && (activeTrade.value as AnyTrade).status === 'open');
 

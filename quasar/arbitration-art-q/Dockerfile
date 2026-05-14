@@ -68,6 +68,46 @@ server {
         add_header Cache-Control "no-store";
     }
 
+    # Exchange REST proxies — prod counterpart to quasar.config.ts devServer.proxy.
+    # Frontend (mexcApi.ts, binanceApi.ts, bybitApi.ts) hardcodes relative paths
+    # like `/mexc-api/...`. Without these locations, prod nginx would fall through
+    # to the SPA fallback below and return index.html, which axios then fails to
+    # parse as JSON. Trailing slash on proxy_pass strips the matched prefix —
+    # equivalent to the dev-proxy `rewrite` rule. WS streams (wss://...) still
+    # go direct to exchanges from the browser (see DOCS §30.3).
+    location /binance-api/ {
+        proxy_pass https://fapi.binance.com/;
+        proxy_ssl_server_name on;
+        proxy_http_version 1.1;
+        proxy_set_header Host fapi.binance.com;
+        proxy_set_header Origin "";
+        proxy_set_header User-Agent $http_user_agent;
+    }
+    location /binance-spot-api/ {
+        proxy_pass https://api.binance.com/;
+        proxy_ssl_server_name on;
+        proxy_http_version 1.1;
+        proxy_set_header Host api.binance.com;
+        proxy_set_header Origin "";
+        proxy_set_header User-Agent $http_user_agent;
+    }
+    location /mexc-api/ {
+        proxy_pass https://contract.mexc.com/;
+        proxy_ssl_server_name on;
+        proxy_http_version 1.1;
+        proxy_set_header Host contract.mexc.com;
+        proxy_set_header Origin "";
+        proxy_set_header User-Agent $http_user_agent;
+    }
+    location /bybit-api/ {
+        proxy_pass https://api.bybit.com/;
+        proxy_ssl_server_name on;
+        proxy_http_version 1.1;
+        proxy_set_header Host api.bybit.com;
+        proxy_set_header Origin "";
+        proxy_set_header User-Agent $http_user_agent;
+    }
+
     # SPA fallback — required for history routing, harmless for hash mode.
     location / {
         try_files $uri $uri/ /index.html;
