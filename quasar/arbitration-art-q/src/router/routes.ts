@@ -16,7 +16,8 @@ const routes: RouteRecordRaw[] = [
       { path: '', component: () => import('pages/IndexPage.vue') },
       { path: 'trader-runtime', component: () => import('pages/TraderRuntimePage.vue') },
       { path: 'profile', component: () => import('pages/ProfilePage.vue') },
-      { path: 'screener', component: () => import('pages/ScreenerPage.vue') }
+      { path: 'screener', component: () => import('pages/ScreenerPage.vue') },
+      { path: 'pnl', component: () => import('pages/PnlPage.vue') }
     ],
   },
   {

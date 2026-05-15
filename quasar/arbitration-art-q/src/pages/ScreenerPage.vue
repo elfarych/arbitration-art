@@ -58,13 +58,24 @@
             options-dense
           />
         </div>
+        <div class="col-12 col-md-2">
+          <q-input
+            v-model.number="store.minVolume"
+            type="number"
+            label="Мин. объём 24ч (USDT)"
+            dark
+            outlined
+            dense
+            clearable
+          />
+        </div>
       </q-card-section>
     </q-card>
 
     <!-- Table -->
     <q-card class="bg-dark border-radius-md" flat>
       <q-table
-        :rows="store.results"
+        :rows="store.filteredResults"
         :columns="columns"
         row-key="coin"
         dark
@@ -106,6 +117,22 @@
           </q-td>
         </template>
 
+        <template v-slot:body-cell-primaryQuoteVolume="props">
+          <q-td :props="props">
+            <div class="text-caption" :class="props.value > 0 ? 'text-grey-3' : 'text-grey-7'">
+              {{ formatVolume(props.value) }}
+            </div>
+          </q-td>
+        </template>
+
+        <template v-slot:body-cell-secondaryQuoteVolume="props">
+          <q-td :props="props">
+            <div class="text-caption" :class="props.value > 0 ? 'text-grey-3' : 'text-grey-7'">
+              {{ formatVolume(props.value) }}
+            </div>
+          </q-td>
+        </template>
+
       </q-table>
     </q-card>
 
@@ -113,6 +140,7 @@
 </template>
 
 <script setup lang="ts">
+import { computed } from 'vue';
 import { useScreenerStore } from 'src/stores/screener/screener.store';
 
 const store = useScreenerStore();
@@ -124,12 +152,39 @@ const exchangeOptions = [
   { label: 'Binance Spot', value: 'binance_spot' }
 ];
 
-const columns = [
+// Short labels for column headers. Keep them concise so the table stays
+// readable on narrow viewports.
+const exchangeShortLabels: Record<string, string> = {
+  binance_futures: 'Binance',
+  binance_spot: 'Binance Spot',
+  bybit_futures: 'Bybit',
+  mexc_futures: 'MEXC',
+};
+const exchangeShort = (key: string) => exchangeShortLabels[key] ?? key;
+
+const primaryLabel = computed(() => exchangeShort(store.primaryExchange));
+const secondaryLabel = computed(() => exchangeShort(store.secondaryExchange));
+
+// Columns are computed so headers track the user's exchange selection (e.g.
+// "Цена MEXC" / "Цена Binance") instead of generic "open / close" labels
+// that read the same regardless of routing direction.
+const columns = computed(() => ([
   { name: 'coin', label: 'Монета', field: 'coin', align: 'left', sortable: true },
-  { name: 'primaryPrice', label: 'Цена Открытия', field: 'primaryPrice', align: 'right', sortable: true },
-  { name: 'secondaryPrice', label: 'Цена Закрытия', field: 'secondaryPrice', align: 'right', sortable: true },
-  { name: 'spread', label: 'Спред', field: 'spread', align: 'right', sortable: true }
-] as any;
+  { name: 'primaryPrice', label: `Цена ${primaryLabel.value}`, field: 'primaryPrice', align: 'right', sortable: true },
+  { name: 'secondaryPrice', label: `Цена ${secondaryLabel.value}`, field: 'secondaryPrice', align: 'right', sortable: true },
+  { name: 'primaryQuoteVolume', label: `Объём 24ч ${primaryLabel.value}`, field: 'primaryQuoteVolume', align: 'right', sortable: true },
+  { name: 'secondaryQuoteVolume', label: `Объём 24ч ${secondaryLabel.value}`, field: 'secondaryQuoteVolume', align: 'right', sortable: true },
+  { name: 'spread', label: 'Спред', field: 'spread', align: 'right', sortable: true },
+])) as any;
+
+// Compact USDT volume label: 2.1M / 350K / 12.5K, etc.
+const formatVolume = (v: number): string => {
+  if (!v || v <= 0) return '—';
+  if (v >= 1e9) return `${(v / 1e9).toFixed(2)}B`;
+  if (v >= 1e6) return `${(v / 1e6).toFixed(2)}M`;
+  if (v >= 1e3) return `${(v / 1e3).toFixed(1)}K`;
+  return v.toFixed(0);
+};
 
 </script>
 

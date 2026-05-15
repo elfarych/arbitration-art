@@ -1,21 +1,23 @@
 import axios from 'axios';
-import type { ExchangeTickerInfo, TickerData, AggTrade, DepthData, KlineData } from './binanceApi';
+import type { ExchangeTickerInfo, TickerData, AggTrade, DepthData, KlineData, TickerSnapshot } from './binanceApi';
 
 const bybitHttp = axios.create({ baseURL: '/bybit-api/v5' });
 
 export const bybitApi = {
-  async getAllTickers(): Promise<Record<string, { bid: number; ask: number }>> {
+  async getAllTickers(): Promise<Record<string, TickerSnapshot>> {
     try {
       const { data } = await bybitHttp.get('/market/tickers?category=linear');
-      const result: Record<string, { bid: number; ask: number }> = {};
-      
+      const result: Record<string, TickerSnapshot> = {};
+
       if (data && data.result && data.result.list) {
         for (const item of data.result.list) {
           if (item.symbol.endsWith('USDT')) {
             const coin = item.symbol.replace('USDT', '');
             result[coin] = {
               bid: parseFloat(item.bid1Price),
-              ask: parseFloat(item.ask1Price)
+              ask: parseFloat(item.ask1Price),
+              // Bybit returns `turnover24h` in quote currency (USDT for linear).
+              quoteVolume: parseFloat(item.turnover24h) || 0,
             };
           }
         }

@@ -18,6 +18,16 @@ export interface TickerData {
   volume: number;
 }
 
+// Snapshot returned by getAllTickers across all exchange adapters. quoteVolume
+// is the 24h turnover in USDT (matches Binance's `quoteVolume`, Bybit's
+// `turnover24h`, MEXC's `amount24`). 0 when the upstream payload didn't carry
+// the value (e.g. unreachable secondary request).
+export interface TickerSnapshot {
+  bid: number;
+  ask: number;
+  quoteVolume: number;
+}
+
 export interface AggTrade {
   price: number;
   timestamp: number;
@@ -39,16 +49,28 @@ export interface KlineData {
 const binanceHttp = axios.create({ baseURL: '/binance-api/fapi/v1' });
 
 export const binanceApi = {
-  async getAllTickers(): Promise<Record<string, { bid: number; ask: number }>> {
+  async getAllTickers(): Promise<Record<string, TickerSnapshot>> {
     try {
-      const { data } = await binanceHttp.get<Array<{ symbol: string; bidPrice: string; askPrice: string }>>('/ticker/bookTicker');
-      const result: Record<string, { bid: number; ask: number }> = {};
-      for (const item of data) {
+      // bookTicker has bid/ask but no volume; /ticker/24hr has quoteVolume but
+      // not best bid/ask. Pull both in parallel and merge by symbol.
+      const [bookReq, statsReq] = await Promise.all([
+        binanceHttp.get<Array<{ symbol: string; bidPrice: string; askPrice: string }>>('/ticker/bookTicker'),
+        binanceHttp.get<Array<{ symbol: string; quoteVolume: string }>>('/ticker/24hr').catch(() => ({ data: [] as Array<{ symbol: string; quoteVolume: string }> })),
+      ]);
+      const volumes: Record<string, number> = {};
+      for (const item of statsReq.data) {
+        if (item.symbol.endsWith('USDT')) {
+          volumes[item.symbol.replace('USDT', '')] = parseFloat(item.quoteVolume) || 0;
+        }
+      }
+      const result: Record<string, TickerSnapshot> = {};
+      for (const item of bookReq.data) {
         if (item.symbol.endsWith('USDT')) {
           const coin = item.symbol.replace('USDT', '');
           result[coin] = {
             bid: parseFloat(item.bidPrice),
-            ask: parseFloat(item.askPrice)
+            ask: parseFloat(item.askPrice),
+            quoteVolume: volumes[coin] ?? 0,
           };
         }
       }

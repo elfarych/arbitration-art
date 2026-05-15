@@ -248,7 +248,7 @@ Root URL config: `arbitration_art_django/urls.py`.
 |---|---|
 | `/admin/` | Django admin |
 | `/api/auth/` | Auth/profile endpoints из `apps.users.api.urls` |
-| `/api/bots/` | Bot/trade endpoints из `apps.bots.api.urls` |
+| `/api/bots/` | Bot/trade endpoints из `apps.bots.api.urls`, включая агрегированный PnL `GET /api/bots/pnl/` (см. §9.6) |
 
 ## 7. Пользователи и auth
 
@@ -553,10 +553,16 @@ router.register("trades", EmulationTradeViewSet, basename="bot-trades")
 router.register("real-trades", TradeViewSet, basename="real-trades")
 router.register("runtime-config-errors", TraderRuntimeConfigErrorViewSet, basename="trader-runtime-config-errors")
 router.register("runtime-configs", TraderRuntimeConfigViewSet, basename="trader-runtime-config")
+# Standalone path declared before the empty-prefix BotConfigViewSet, иначе
+# роутер интерпретирует `pnl` как pk у BotConfig.retrieve.
+urlpatterns = [
+    path("pnl/", PnlSummaryView.as_view(), name="bots-pnl-summary"),
+]
 router.register("", BotConfigViewSet, basename="bot-config")
+urlpatterns += router.urls
 ```
 
-Из-за регистрации пустого prefix для `BotConfigViewSet` endpoints конфигураций находятся прямо под `/api/bots/`.
+Из-за регистрации пустого prefix для `BotConfigViewSet` endpoints конфигураций находятся прямо под `/api/bots/`. Standalone `path("pnl/", ...)` обязательно объявлять до `router.register("", ...)`, иначе DRF попытается распарсить `pnl` как `BotConfig.pk`.
 
 ### 9.1. `BotConfigViewSet`
 
@@ -993,6 +999,70 @@ owner
 ```
 
 `opened_at` writable на POST так что engine записывает фактическое время fill-а (не время DB write). Поскольку POST доступен только с `X-Service-Token`, конечный пользователь подделать `opened_at` не может. `bot` и `runtime_config` запрещены к смене на PATCH (валидируется в `TradeSerializer.validate`), чтобы трейд нельзя было перепривязать к другому боту после открытия. Write methods доступны только request-ам с `X-Service-Token`. JWT-пользователи используют endpoint для чтения своих реальных сделок.
+
+### 9.6. `PnlSummaryView`
+
+Класс: `apps.bots.api.views.PnlSummaryView` (DRF `APIView`).
+
+Endpoint: `GET /api/bots/pnl/`.
+
+Permissions: `IsAuthenticated`.
+
+Назначение: агрегированный отчёт по реализованному PnL текущего пользователя — для виджета «PnL за сегодня» в шапке, чипа лайфтайм-PnL на `BotCard` и страницы `/pnl` во фронте.
+
+Логика собрана в `apps/bots/services/pnl.py::aggregate_pnl`. Только закрытые сделки (`closed_at IS NOT NULL`, `status IN (closed, force_closed)` для `Trade`, `status = closed` для `EmulationTrade`, `profit_*` не NULL).
+
+Query параметры (все опциональны):
+
+| Param | Тип | Семантика |
+|---|---|---|
+| `from` | ISO 8601 datetime | Нижняя граница `closed_at` (включительно). Принимает суффикс `Z`. |
+| `to` | ISO 8601 datetime | Верхняя граница `closed_at` (включительно). |
+| `bot_id` | int | Ограничить агрегацию одним ботом. |
+| `trade_mode` | `real` \| `emulator` | Без параметра учитываются оба режима. |
+
+Источник USDT:
+
+- `Trade.profit_usdt` — authoritative, считается engine через `calculateRealPnL` после fill-ов и докомпенсируется фактической комиссией в `BotTrader`-е.
+- `EmulationTrade.profit_usdt` не хранится. Сервис аннотирует выражением `profit_percentage * amount * LEAST(primary_open_price, secondary_open_price) / 100`. Это обратное преобразование от `capital = amount * min(open prices)`, которое engine использует в `calculateRealPnL`. Эмуляция не платит комиссию, поэтому процент уже соответствует капиталу.
+
+Формат ответа:
+
+```json
+{
+  "from": "2026-05-01T00:00:00+05:00",
+  "to": "2026-05-15T23:59:59.999000+05:00",
+  "total": {
+    "profit_usdt": "12.345600",
+    "trades_count": 17,
+    "wins": 11,
+    "losses": 6,
+    "win_rate": 64.71
+  },
+  "real": { "profit_usdt": "10.123400", "trades_count": 10, "wins": 7, "losses": 3 },
+  "emulator": { "profit_usdt": "2.222200", "trades_count": 7, "wins": 4, "losses": 3 },
+  "by_bot": [
+    {
+      "bot_id": 5,
+      "coin": "BTC/USDT:USDT",
+      "trade_mode": "real",
+      "primary_exchange": "binance_futures",
+      "secondary_exchange": "bybit_futures",
+      "is_active": true,
+      "profit_usdt": "5.340000",
+      "trades_count": 5,
+      "wins": 3,
+      "losses": 2,
+      "real": { "profit_usdt": "5.340000", "trades_count": 5, "wins": 3, "losses": 2 },
+      "emulator": { "profit_usdt": "0.000000", "trades_count": 0, "wins": 0, "losses": 0 }
+    }
+  ]
+}
+```
+
+Сортировка `by_bot` — по `abs(profit_usdt) DESC`. Сделки с `bot_id IS NULL` (бот был удалён) попадают только в `total`, в `by_bot` не выводятся.
+
+Кэш отсутствует: engine PATCH-ит закрытие сразу после fill-а, и любой кэш заметно задерживал бы виджет «PnL за сегодня». При росте объёма сделок добавить индекс на `(owner_id, closed_at)` и `(bot__owner_id, closed_at)` в миграции; на текущих объёмах простой `closed_at__gte`-фильтр обходится без него.
 
 ## 10. Интеграция с bot-engine
 

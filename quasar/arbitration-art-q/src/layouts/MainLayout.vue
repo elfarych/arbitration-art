@@ -8,6 +8,8 @@
         
         <q-space />
 
+        <TodayPnlChip v-if="authStore.currentUser" class="q-mr-md" />
+
         <div class="row q-gutter-sm q-mr-md text-weight-medium">
           <q-btn flat no-caps label="Мои боты" to="/" />
           <q-btn flat no-caps label="Скринер" text-color="warning" to="/screener" />
@@ -34,6 +36,7 @@
 import { computed } from 'vue';
 import { useRouter } from 'vue-router';
 import { useAuthStore } from 'stores/auth';
+import TodayPnlChip from 'src/components/pnl/TodayPnlChip.vue';
 
 const router = useRouter();
 const authStore = useAuthStore();

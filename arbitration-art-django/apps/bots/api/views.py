@@ -1,8 +1,11 @@
+from datetime import datetime
+
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import APIException
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
+from rest_framework.views import APIView
 
 from apps.bots.api.serializers import (
     BotConfigSerializer,
@@ -26,6 +29,7 @@ from apps.bots.services.lifecycle import (
     check_bot_engine_health,
     sync_bot_lifecycle,
 )
+from apps.bots.services.pnl import PnlFilters, aggregate_pnl
 from apps.bots.services.trader_runtime_shared import build_trader_runtime_payload
 from apps.bots.services.trader_runtime_info import (
     TraderRuntimeInfoError,
@@ -388,6 +392,68 @@ class EmulationTradeViewSet(viewsets.ModelViewSet):
             queryset = queryset.filter(bot_id=bot_id)
 
         return queryset
+
+
+def _parse_iso_datetime(raw: str | None) -> datetime | None:
+    """Tolerate the JS toISOString trailing-Z form (`...Z` → `...+00:00`)."""
+    if raw is None or raw == "":
+        return None
+    candidate = raw[:-1] + "+00:00" if raw.endswith("Z") else raw
+    try:
+        return datetime.fromisoformat(candidate)
+    except ValueError as exc:
+        raise APIException(detail=f"Invalid datetime: {raw}") from exc
+
+
+class _BadRequest(APIException):
+    status_code = status.HTTP_400_BAD_REQUEST
+    default_detail = "Bad request."
+    default_code = "bad_request"
+
+
+class PnlSummaryView(APIView):
+    """Aggregate PnL across real and emulation trades for the current user.
+
+    Query params (all optional):
+      - `from`, `to`: ISO 8601 datetimes bounding `closed_at` (inclusive).
+        Omit to skip the bound. The frontend translates "today" / "current
+        month" / "custom range" into explicit bounds in the user's locale so
+        the backend stays timezone-agnostic.
+      - `bot_id`: restrict aggregation to a single bot.
+      - `trade_mode`: `real` | `emulator` — defaults to both.
+
+    Closed-out trades only: rows with `closed_at IS NULL` are excluded so
+    in-flight positions never inflate the realized PnL.
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        params = request.query_params
+        date_from = _parse_iso_datetime(params.get("from"))
+        date_to = _parse_iso_datetime(params.get("to"))
+
+        bot_id_raw = params.get("bot_id")
+        bot_id: int | None = None
+        if bot_id_raw:
+            try:
+                bot_id = int(bot_id_raw)
+            except ValueError as exc:
+                raise _BadRequest(detail="bot_id must be an integer.") from exc
+
+        trade_mode = params.get("trade_mode")
+        if trade_mode not in (None, "", "real", "emulator"):
+            raise _BadRequest(detail="trade_mode must be 'real' or 'emulator'.")
+
+        filters = PnlFilters(
+            user_id=request.user.id,
+            date_from=date_from,
+            date_to=date_to,
+            bot_id=bot_id,
+            trade_mode=trade_mode or None,
+        )
+
+        return Response(aggregate_pnl(filters))
 
 
 class TradeViewSet(viewsets.ModelViewSet):

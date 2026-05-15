@@ -617,7 +617,7 @@ Emulator payload без exchange names/order IDs/commission.
 1. Reads active trade open prices + order type.
 2. `drawdownLimit = bot.max_leg_drawdown_percent || 80.0`.
 3. Если `emergencyPrices`: `checkLegDrawdown` → если >= drawdownLimit → close reason `liquidation`.
-4. Если `strictPrices`: `calculateTruePnL` → если >= `bot.exit_spread` → close reason `profit`.
+4. Если `strictPrices`: `calculateCloseSpread(prices, orderType)` → если `<= bot.exit_spread` → close reason `profit`. Формула совпадает с frontend `spreadMonitor.closeSpread`, чтобы UI-таргет «Цель: <= X%» и реальный триггер выхода описывали одно и то же.
 
 Exit priority: liquidation guard → profit target. Timeout exits — отдельный timer (`checkTimeouts`).
 
@@ -676,8 +676,8 @@ Django `Trade.CloseReason` choices: `profit`, `timeout`, `manual`, `shutdown`, `
 
 Файл: `src/utils/math.ts`. Без изменений по контракту:
 
-- `calculateOpenSpread(prices, orderType)` — buy/sell variants.
-- `calculateTruePnL(openPrices, currentPrices, orderType)` — signal-evaluation PnL с estimated fee 0.20%.
+- `calculateOpenSpread(prices, orderType)` — buy/sell variants (entry-side spread).
+- `calculateCloseSpread(prices, orderType)` — live exit-side spread по orderbook-сторонам, которые реально хитнем на закрытии (buy: `(sAsk - pBid)/pBid * 100`; sell: `(pAsk - sBid)/sBid * 100`). Зеркалит frontend `spreadMonitor`, используется в `checkExit` для сравнения с `bot.exit_spread`.
 - `calculateRealPnL(...)` — окончательный PnL по fill prices и фактической комиссии.
 - `d(value, decimals=8)` — rounding для Django DecimalFields.
 - `checkLegDrawdown(...)` — leveraged drawdown per leg.

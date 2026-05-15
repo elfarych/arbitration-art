@@ -44,6 +44,7 @@ import { ref, onMounted, onUnmounted } from 'vue';
 import { useQuasar } from 'quasar';
 import type { BotConfig } from 'src/stores/bots/api/botConfig';
 import { useBotsStore } from 'src/stores/bots/bots.store';
+import { usePnlStore } from 'src/stores/pnl/pnl.store';
 import { storeToRefs } from 'pinia';
 import BotCard from 'src/components/bots/BotCard.vue';
 import BotFormDialog from 'src/components/bots/BotFormDialog.vue';
@@ -52,6 +53,7 @@ import { extractApiErrorMessage } from 'src/utils/apiError';
 
 const $q = useQuasar();
 const botsStore = useBotsStore();
+const pnlStore = usePnlStore();
 const { bots, loading } = storeToRefs(botsStore);
 
 const isFormOpen = ref(false);
@@ -73,6 +75,17 @@ const loadBots = async (options: { silent?: boolean } = {}) => {
     if (!options.silent) {
       $q.notify({ color: 'negative', message: extractApiErrorMessage(e, 'Не удалось загрузить ботов') });
     }
+  }
+};
+
+// Lifetime PnL drives the per-card PnL chip. One round-trip serves every bot
+// card, so we refresh it alongside the bot list rather than from each
+// BotCard.onMounted (which would N+1 the request).
+const loadPnl = async (options: { silent?: boolean } = {}) => {
+  try {
+    await pnlStore.fetchLifetimeByBot(options);
+  } catch {
+    // Silent: PnL is informational; never block the bot list UI on it.
   }
 };
 
@@ -136,8 +149,11 @@ const forceCloseBot = (id: number) => {
 };
 
 onMounted(async () => {
-  await loadBots();
-  pollHandle = window.setInterval(() => { void loadBots({ silent: true }); }, BOT_LIST_POLL_MS);
+  await Promise.all([loadBots(), loadPnl({ silent: true })]);
+  pollHandle = window.setInterval(() => {
+    void loadBots({ silent: true });
+    void loadPnl({ silent: true });
+  }, BOT_LIST_POLL_MS);
 });
 
 onUnmounted(() => {

@@ -1,19 +1,29 @@
 import axios from 'axios';
-import type { ExchangeTickerInfo, TickerData, AggTrade, DepthData, KlineData } from './binanceApi';
+import type { ExchangeTickerInfo, TickerData, AggTrade, DepthData, KlineData, TickerSnapshot } from './binanceApi';
 
 const binanceSpotHttp = axios.create({ baseURL: '/binance-spot-api/api/v3' });
 
 export const binanceSpotApi = {
-  async getAllTickers(): Promise<Record<string, { bid: number; ask: number }>> {
+  async getAllTickers(): Promise<Record<string, TickerSnapshot>> {
     try {
-      const { data } = await binanceSpotHttp.get<Array<{ symbol: string; bidPrice: string; askPrice: string }>>('/ticker/bookTicker');
-      const result: Record<string, { bid: number; ask: number }> = {};
-      for (const item of data) {
+      const [bookReq, statsReq] = await Promise.all([
+        binanceSpotHttp.get<Array<{ symbol: string; bidPrice: string; askPrice: string }>>('/ticker/bookTicker'),
+        binanceSpotHttp.get<Array<{ symbol: string; quoteVolume: string }>>('/ticker/24hr').catch(() => ({ data: [] as Array<{ symbol: string; quoteVolume: string }> })),
+      ]);
+      const volumes: Record<string, number> = {};
+      for (const item of statsReq.data) {
+        if (item.symbol.endsWith('USDT')) {
+          volumes[item.symbol.replace('USDT', '')] = parseFloat(item.quoteVolume) || 0;
+        }
+      }
+      const result: Record<string, TickerSnapshot> = {};
+      for (const item of bookReq.data) {
         if (item.symbol.endsWith('USDT')) {
           const coin = item.symbol.replace('USDT', '');
           result[coin] = {
             bid: parseFloat(item.bidPrice),
-            ask: parseFloat(item.askPrice)
+            ask: parseFloat(item.askPrice),
+            quoteVolume: volumes[coin] ?? 0,
           };
         }
       }

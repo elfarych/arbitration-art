@@ -25,40 +25,28 @@ export function calculateOpenSpread(prices: OrderbookPrices, orderType: 'buy' | 
 }
 
 /**
- * Classic "True" PnL in percent.
- * Calculates absolute profit in base (USDT) by summing the open profit
- * and close reversal cost, then dividing by the initial capital.
+ * Live "Close Spread" computed from the orderbook sides we would actually hit
+ * when reversing the position. Mirrors the frontend spreadMonitor formula so
+ * UI's "Цель: <= exit_spread" stays semantically aligned with the engine's
+ * exit trigger.
+ *
+ * Buy:  close = sell primary @ pBid, buy secondary @ sAsk -> (sAsk - pBid) / pBid * 100
+ * Sell: close = buy primary @ pAsk, sell secondary @ sBid -> (pAsk - sBid) / sBid * 100
+ *
+ * A positive value means the legs have not converged yet (residual spread);
+ * the bot closes once this narrows down to <= bot.exit_spread.
  */
-export function calculateTruePnL(
-    openPrices: { pOpen: number; sOpen: number },
-    currentPrices: OrderbookPrices,
-    orderType: 'buy' | 'sell'
-): number {
-    if (orderType === 'sell') {
-        // Short on Binance (pOpen = pBid), long on Bybit (sOpen = sAsk).
-        // Close: buy on Binance (pAsk), sell on Bybit (sBid).
-        const profitUsdt =
-            (openPrices.pOpen - openPrices.sOpen) +
-            (currentPrices.secondaryBid - currentPrices.primaryAsk);
-
-        const entryPrice = openPrices.sOpen;
-        // This is an estimated fee model used for signal evaluation, not the
-        // final accounting metric. Real closes use calculateRealPnL with actual
-        // commissions from exchange responses.
-        const estimatedFeesUsdt = entryPrice * 0.0020;
-        return ((profitUsdt - estimatedFeesUsdt) / entryPrice) * 100;
+export function calculateCloseSpread(prices: OrderbookPrices, orderType: 'buy' | 'sell'): number {
+    if (orderType === 'buy') {
+        const pBid = prices.primaryBid;
+        const sAsk = prices.secondaryAsk;
+        if (!pBid) return Infinity;
+        return ((sAsk - pBid) / pBid) * 100;
     } else {
-        // Long on Binance (pOpen = pAsk), short on Bybit (sOpen = sBid).
-        // Close: sell on Binance (pBid), buy on Bybit (sAsk).
-        const profitUsdt =
-            (openPrices.sOpen - openPrices.pOpen) +
-            (currentPrices.primaryBid - currentPrices.secondaryAsk);
-
-        const entryPrice = openPrices.pOpen;
-        // Keep the same fee estimate as the sell direction so exit signals are
-        // directionally comparable.
-        const estimatedFeesUsdt = entryPrice * 0.0020;
-        return ((profitUsdt - estimatedFeesUsdt) / entryPrice) * 100;
+        const pAsk = prices.primaryAsk;
+        const sBid = prices.secondaryBid;
+        if (!sBid) return Infinity;
+        return ((pAsk - sBid) / sBid) * 100;
     }
 }
 

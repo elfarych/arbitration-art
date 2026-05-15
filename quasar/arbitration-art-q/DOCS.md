@@ -287,6 +287,7 @@ Routes:
 | `/trader-runtime` | `MainLayout` | `TraderRuntimePage` | Standalone trader runtime |
 | `/profile` | `MainLayout` | `ProfilePage` | Профиль и API-ключи бирж |
 | `/screener` | `MainLayout` | `ScreenerPage` | Скринер спредов |
+| `/pnl` | `MainLayout` | `PnlPage` | Агрегированный PnL с выбором периода |
 | `/:catchAll(.*)*` | none | `ErrorNotFound` | 404 |
 
 `/` route имеет:
@@ -430,6 +431,7 @@ success: 'Action was successful'
 
 - темный header;
 - brand button `Arbitration Art` -> `/`;
+- виджет `TodayPnlChip` справа от центра — лейбл «Сегодня» + сумма PnL за текущий день в USDT, ссылка на `/pnl`;
 - nav:
   - `Мои боты` -> `/`
   - `Trader Runtime` -> `/trader-runtime`
@@ -647,6 +649,30 @@ Exchange options:
 - `Oops. Nothing here...`
 - button `Go Home`.
 
+### 12.7. PnlPage
+
+Файл: `src/pages/PnlPage.vue`. Route: `/pnl`.
+
+UI:
+
+- заголовок «PnL» + кнопка обновления;
+- карточка фильтров: q-select периода (`today`, `yesterday`, `week`, `month` (default), `prev_month`, `year`, `all`, `custom`), `q-input type=date` для `from`/`to` в режиме `custom`, фильтр режима торговли (`real` / `emulator` / `all`), q-select бота;
+- ряд из четырёх `PnlStatCard`: «Всего PnL» (USDT, окрашен), «Сделок» (+ winrate %), «Прибыльных / Убыточных», «Реал / Эмулятор» (разбивка USDT);
+- `q-table` с разбивкой по ботам: монета+режим, маршрут бирж, кол-во сделок, PnL (USDT), wins/losses + winrate, статус бота.
+
+Состояние:
+
+- читает `pnlStore.current` (см. §15A);
+- query-параметры route (`period`, `bot_id`, `trade_mode`, `from`, `to`) синхронизированы с локальным состоянием через `watch` + `router.replace`. Это позволяет переход с BotCard `?bot_id=N` приземлиться сразу на отфильтрованном виде;
+- `rangeForPeriod` (см. `src/stores/pnl/periods.ts`) считает границы в локальном TZ браузера и сериализует в ISO; Django фильтрует `closed_at__gte/__lte` по этим границам.
+
+Принципы UX:
+
+- по умолчанию открывается период «Текущий месяц»;
+- если запрошен `?bot_id=N`, селект бота пред-заполнен (используя `bots` store, который грузится lazy если ещё не был);
+- если за период нет закрытых сделок, таблица показывает «За выбранный период закрытых сделок нет.»;
+- сортировка `by_bot` приходит с сервера (по `abs(profit_usdt)` DESC), но `q-table` дополнительно сортируется пользователем кликом по колонкам.
+
 ## 13. Auth store
 
 Файл: `src/stores/auth.ts`.
@@ -812,6 +838,51 @@ Endpoints:
 Critical: фильтр идёт по `bot_id`, который Django принимает в `TradeViewSet.get_queryset` / `EmulationTradeViewSet.get_queryset`. Прежнее `?bot=...` тихо игнорировалось и возвращало все user-trades.
 
 **Frontend больше не создаёт и не закрывает trade-ы**: engine (`arbitration-bot-engine`) — единственный источник истины. И real, и emulation сделки engine пишет в Django через service-token API. Frontend периодически (5s) перезапрашивает open/closed списки через `*TradesApi.list` для отображения статусов и счётчиков.
+
+### 15.4. PnL store и API
+
+Файлы:
+
+- `src/stores/pnl/api/pnl.ts` — клиент `pnlApi` (один метод `summary(query)`).
+- `src/stores/pnl/periods.ts` — `rangeForPeriod(key, custom?)` и `PERIOD_LABELS` (русские лейблы периодов).
+- `src/stores/pnl/pnl.store.ts` — Pinia store `usePnlStore` (Options Store).
+
+State:
+
+```ts
+{
+  today: PnlSummary | null,       // для TodayPnlChip в шапке
+  todayLoading: boolean,
+  todayError: string | null,
+  lifetimeByBot: Record<number, PnlByBotEntry>, // для BotCard, индекс bot_id -> запись
+  lifetimeLoading: boolean,
+  lifetimeError: string | null,
+  current: PnlSummary | null,     // для PnlPage
+  currentLoading: boolean,
+  currentError: string | null,
+}
+```
+
+Getters:
+
+- `todayProfitUsdt`, `todayTradesCount` — для виджета в шапке.
+- `pnlForBot(botId)` — возвращает `PnlByBotEntry | null` из `lifetimeByBot`; используется в `BotCard` для чипа лайфтайм-PnL.
+
+Actions:
+
+- `fetchToday({ silent })` — `GET /bots/pnl/?from=<сегодня 00:00>&to=<сегодня 23:59>`. Запускается из `TodayPnlChip.onMounted` и периодически (60s).
+- `fetchLifetimeByBot({ silent })` — `GET /bots/pnl/` (без границ). Один round-trip раскидывается по всем карточкам через индекс `bot_id`. Вызывается из `IndexPage` параллельно с `botsStore.fetchBots()` и на тике `BOT_LIST_POLL_MS` (15s).
+- `fetchSummary(query)` — произвольный фильтр для страницы `/pnl`.
+
+API client (`pnlApi.summary`):
+
+| Method | Path | Назначение |
+|---|---|---|
+| `GET` | `/bots/pnl/?from&to&bot_id&trade_mode` | Агрегированный PnL текущего user-а (см. Django §9.6). |
+
+Все денежные поля приходят строками (DRF Decimal): UI парсит их `parseFloat` только перед отрисовкой, чтобы не терять precision в state.
+
+`periods.ts` считает границы периода в локальном TZ браузера (через `Date.setHours(0,0,0,0)` и `Date.setHours(23,59,59,999)`) и сериализует `Date.toISOString()` → UTC c суффиксом `Z`. Django принимает оба формата (`...Z` нормализуется в `+00:00` в `_parse_iso_datetime`).
 
 ## 16. Trader runtime store и API
 
@@ -996,6 +1067,7 @@ Displays:
 - max open spread / min close spread (локальный rolling-stat);
 - статус активной сделки и счётчик закрытых (из Django через polling);
 - live PnL по open prices + текущему WS-стрим спреду;
+- лайфтайм-PnL чип (всего USDT, winrate в tooltip) — читает `pnlStore.pnlForBot(bot.id)`; данные приходят из общего `fetchLifetimeByBot`, который IndexPage запускает параллельно с `fetchBots` и обновляет каждые 15s. Клик по чипу ведёт на `/pnl?bot_id=<id>`;
 - compact canvas chart;
 - funding info;
 - depth insufficiency warnings;
@@ -1007,6 +1079,7 @@ Uses:
 - `useSpreadMonitor()` — только для отображения live-спреда и графика;
 - `useExchangesStore()` — funding/exchange info;
 - `useBotsStore()` — actions toggle/update/forceClose;
+- `usePnlStore()` — лайфтайм-PnL через `pnlForBot(id)` (без отдельного fetch — IndexPage уже грузит данные);
 - `botTradesApi` / `realTradesApi` — read-only polling списков сделок;
 - `SpreadChart`;
 - `BotTradesDialog`.
@@ -1073,7 +1146,7 @@ For `sell`:
 
 Then divided by `secondary_open_price`.
 
-Это та же формула, что использует `calculateTruePnL` в engine, только без вычета комиссии.
+Frontend-only метрика для отображения PnL в карточке активной сделки. Триггер выхода engine использует `calculateCloseSpread` по orderbook-сторонам закрытия, не PnL.
 
 ## 19. SpreadMonitor
 

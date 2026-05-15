@@ -1,20 +1,22 @@
 import axios from 'axios';
-import type { ExchangeTickerInfo, TickerData, AggTrade, KlineData, DepthData } from './binanceApi';
+import type { ExchangeTickerInfo, TickerData, AggTrade, KlineData, DepthData, TickerSnapshot } from './binanceApi';
 
 const mexcHttp = axios.create({ baseURL: '/mexc-api/api/v1/contract' });
 
 export const mexcApi = {
-  async getAllTickers(): Promise<Record<string, { bid: number; ask: number }>> {
+  async getAllTickers(): Promise<Record<string, TickerSnapshot>> {
     try {
-      const { data } = await mexcHttp.get<{ success: boolean; data: Array<{ symbol: string; bid1: number; ask1: number }> }>('/ticker');
-      const result: Record<string, { bid: number; ask: number }> = {};
+      const { data } = await mexcHttp.get<{ success: boolean; data: Array<{ symbol: string; bid1: number; ask1: number; amount24?: number }> }>('/ticker');
+      const result: Record<string, TickerSnapshot> = {};
       if (data.success && data.data) {
         for (const item of data.data) {
           if (item.symbol.endsWith('_USDT')) {
             const coin = item.symbol.replace('_USDT', '');
             result[coin] = {
               bid: item.bid1,
-              ask: item.ask1
+              ask: item.ask1,
+              // MEXC contract ticker exposes `amount24` as 24h notional in USDT.
+              quoteVolume: Number(item.amount24) || 0,
             };
           }
         }

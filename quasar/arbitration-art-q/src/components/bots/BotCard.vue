@@ -58,6 +58,31 @@
            </div>
          </div>
       </div>
+      <!-- Lifetime PnL — bot-level realized profit aggregated by Django -->
+      <div class="bg-surface q-pa-sm border-radius-sm q-mb-xs row items-center justify-between cursor-pointer pnl-row" @click="goToPnlPage">
+        <div class="row items-center q-gutter-x-sm">
+          <q-icon name="paid" size="14px" class="opacity-50" />
+          <span class="opacity-70 text-weight-bold" style="font-size: 10px">PnL за всё время</span>
+        </div>
+        <div class="row items-baseline q-gutter-x-sm">
+          <span class="text-weight-bold" :class="lifetimeProfitClass" style="font-size: 14px">
+            {{ formatUsdtSigned(lifetimeProfitUsdt) }} USDT
+          </span>
+          <span v-if="lifetimeTradesCount > 0" class="opacity-50" style="font-size: 10px">
+            · {{ lifetimeWins }}/{{ lifetimeTradesCount }} · {{ lifetimeWinRate.toFixed(0) }}%
+          </span>
+          <span v-else class="opacity-50" style="font-size: 10px">
+            · нет закрытых
+          </span>
+        </div>
+        <q-tooltip class="bg-dark text-white border-radius-sm" max-width="260px">
+          Лайфтайм PnL по всем закрытым сделкам бота.
+          <template v-if="bot.trade_mode === 'emulator'">
+            <br><span class="opacity-70">Эмулятор: USDT-эквивалент рассчитан как процент × капитал на открытии.</span>
+          </template>
+          <br>Нажмите, чтобы открыть страницу PnL с фильтром по этому боту.
+        </q-tooltip>
+      </div>
     </q-card-section>
 
     <q-card-section>
@@ -99,8 +124,22 @@
                 <div class="row items-center cursor-pointer hover-opacity-100" :class="spreadStats.current.openSpread >= localEntrySpread ? 'text-positive' : 'opacity-50'">
                   <span>Цель: >= {{ localEntrySpread }}%</span>
                   <q-icon name="edit" size="10px" class="q-ml-xs" />
-                  <q-popup-edit v-model.number="localEntrySpread" v-slot="scope" class="bg-bg-color text-white border-radius-sm border-dark" auto-save @save="debouncedSaveSettings">
-                    <q-input v-model.number="scope.value" type="number" dense dark autofocus color="primary" label="Спред входа (%)" @keyup.enter="scope.set" />
+                  <q-popup-edit
+                    v-model.number="localEntrySpread"
+                    v-slot="scope"
+                    class="bg-dark text-white"
+                    @save="saveSpreadSettings"
+                  >
+                    <q-input v-model.number="scope.value" type="number" dense dark autofocus color="primary" label="Спред входа (%)" @keyup.enter="scope.set">
+                      <template v-slot:append>
+                        <q-btn flat round dense size="sm" icon="close" @click="scope.cancel">
+                          <q-tooltip class="bg-dark text-white">Отмена</q-tooltip>
+                        </q-btn>
+                        <q-btn flat round dense size="sm" icon="check" color="positive" @click="scope.set">
+                          <q-tooltip class="bg-dark text-white">Применить</q-tooltip>
+                        </q-btn>
+                      </template>
+                    </q-input>
                   </q-popup-edit>
                 </div>
                 <div v-if="maxOpenSpread > -Infinity" class="text-warning text-weight-bold" style="font-size: 10px">
@@ -128,8 +167,22 @@
                 <div class="row items-center cursor-pointer hover-opacity-100 opacity-50">
                   <span>Цель: &lt;= {{ localExitSpread }}%</span>
                   <q-icon name="edit" size="10px" class="q-ml-xs" />
-                  <q-popup-edit v-model.number="localExitSpread" v-slot="scope" class="bg-bg-color text-white border-radius-sm border-dark" auto-save @save="debouncedSaveSettings">
-                    <q-input v-model.number="scope.value" type="number" dense dark autofocus color="primary" label="Спред выхода (%)" @keyup.enter="scope.set" />
+                  <q-popup-edit
+                    v-model.number="localExitSpread"
+                    v-slot="scope"
+                    class="bg-dark text-white"
+                    @save="saveSpreadSettings"
+                  >
+                    <q-input v-model.number="scope.value" type="number" dense dark autofocus color="primary" label="Спред выхода (%)" @keyup.enter="scope.set">
+                      <template v-slot:append>
+                        <q-btn flat round dense size="sm" icon="close" @click="scope.cancel">
+                          <q-tooltip class="bg-dark text-white">Отмена</q-tooltip>
+                        </q-btn>
+                        <q-btn flat round dense size="sm" icon="check" color="positive" @click="scope.set">
+                          <q-tooltip class="bg-dark text-white">Применить</q-tooltip>
+                        </q-btn>
+                      </template>
+                    </q-input>
                   </q-popup-edit>
                 </div>
                 <div v-if="minCloseSpread < Infinity" class="text-warning text-weight-bold" style="font-size: 10px">
@@ -250,7 +303,8 @@
       </div>
     </q-card-section>
 
-    <!-- Amount input — read/display only; PATCH is debounced + locked while saving -->
+    <!-- Amount input — explicit confirm icon; nothing is sent to the engine
+         or saved to Django until the operator presses ✓ (or Enter). -->
     <q-card-section class="q-pt-none text-caption q-mt-sm">
       <div class="q-mb-md">
         <q-input
@@ -264,13 +318,27 @@
           :disable="amountSaving"
           @focus="onFocusAmount"
           @blur="onBlurAmount"
-          @update:model-value="amountInputChanged"
+          @keyup.enter="applyAmount"
         >
           <template v-slot:append>
-            <span class="text-caption opacity-50" style="font-size: 12px">
-              <span v-if="spreadStats?.primaryAsk">~{{ formatUsdt(localAmount * spreadStats.primaryAsk) }} USDT</span>
+            <span class="text-caption opacity-50 q-mr-sm" style="font-size: 12px">
+              <span v-if="spreadStats?.primaryAsk">~{{ formatUsdt(parsedDisplayAmount * spreadStats.primaryAsk) }} USDT</span>
               <q-spinner v-else size="12px" />
             </span>
+            <q-btn
+              v-if="amountDirty"
+              flat
+              round
+              dense
+              size="sm"
+              icon="check"
+              color="positive"
+              :loading="amountSaving"
+              :disable="!isAmountValid"
+              @click="applyAmount"
+            >
+              <q-tooltip class="bg-dark text-white">Применить</q-tooltip>
+            </q-btn>
           </template>
         </q-input>
       </div>
@@ -316,12 +384,14 @@
 
 <script setup lang="ts">
 import { ref, watch, onMounted, onUnmounted, computed } from 'vue';
+import { useRouter } from 'vue-router';
 import type { BotConfig, EmulationTrade, RealTrade } from 'src/stores/bots/api/botConfig';
 import { botTradesApi, realTradesApi } from 'src/stores/bots/api/botConfig';
 import { useSpreadMonitor, type SpreadStats } from 'src/stores/exchanges/spreadMonitor';
 import type { BotExchangeInfo } from 'src/stores/exchanges/api/exchangeInfo';
 import { useExchangesStore } from 'src/stores/exchanges/exchanges.store';
 import { useBotsStore } from 'src/stores/bots/bots.store';
+import { usePnlStore } from 'src/stores/pnl/pnl.store';
 import SpreadChart from './SpreadChart.vue';
 import BotTradesDialog from './BotTradesDialog.vue';
 import { useQuasar } from 'quasar';
@@ -337,8 +407,14 @@ const emit = defineEmits<{
 }>();
 
 const $q = useQuasar();
+const router = useRouter();
 const exchangesStore = useExchangesStore();
 const botsStore = useBotsStore();
+const pnlStore = usePnlStore();
+
+const goToPnlPage = () => {
+  void router.push({ path: '/pnl', query: { bot_id: String(props.bot.id) } });
+};
 
 const { start, stop, setAmount, setOrderType } = useSpreadMonitor();
 const spreadStats = ref<SpreadStats | undefined>();
@@ -435,41 +511,42 @@ const onBlurAmount = () => {
   displayAmount.value = formatNum(localAmount.value);
 };
 
-const amountInputChanged = (val: string | number | null) => {
-  if (val === null) return;
-  const parsed = parseFloat(val.toString().replace(/\s/g, '').replace(',', '.'));
-  if (!isNaN(parsed) && parsed > 0) {
-    localAmount.value = parsed;
-    setAmount(props.bot.id, parsed);
-    debouncedSaveAmount();
-  }
-};
+// Pure parser — typing in the field updates `displayAmount` but does NOT
+// mutate `localAmount`, the spread-monitor amount, or the Django row until
+// the operator presses the "Применить" button. Keeps live amounts stable
+// while the operator is mid-keystroke.
+const parsedDisplayAmount = computed(() => {
+  const raw = displayAmount.value ?? '';
+  const parsed = parseFloat(String(raw).replace(/\s/g, '').replace(',', '.'));
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+});
+const isAmountValid = computed(() => parsedDisplayAmount.value > 0);
+const amountDirty = computed(() => isAmountValid.value && parsedDisplayAmount.value !== localAmount.value);
 
 const amountSaving = ref(false);
-let amountSaveTimeout: number | undefined;
-// Longer debounce for active bots: each PATCH triggers an inline engine sync
-// (up to SERVICE_LIFECYCLE_TIMEOUT_SECONDS × retries), so saving on every
-// keystroke is wasteful and slow.
-const AMOUNT_DEBOUNCE_MS = 4000;
 
-const debouncedSaveAmount = () => {
-  if (amountSaveTimeout) clearTimeout(amountSaveTimeout);
-  amountSaveTimeout = window.setTimeout(async () => {
-    if (localAmount.value === Number(props.bot.coin_amount)) return;
-    const original = Number(props.bot.coin_amount);
-    amountSaving.value = true;
-    try {
-      await botsStore.updateBot(props.bot.id, { coin_amount: localAmount.value });
-      $q.notify({ color: 'positive', message: 'Количество сохранено', position: 'top-right', timeout: 1500 });
-    } catch (e) {
-      const message = extractApiErrorMessage(e, 'Ошибка при сохранении количества');
-      $q.notify({ color: 'negative', message });
-      localAmount.value = original;
-      displayAmount.value = formatNum(original);
-    } finally {
-      amountSaving.value = false;
-    }
-  }, AMOUNT_DEBOUNCE_MS);
+const applyAmount = async () => {
+  if (amountSaving.value) return;
+  if (!isAmountValid.value) {
+    $q.notify({ color: 'warning', message: 'Введите положительное число' });
+    return;
+  }
+  const next = parsedDisplayAmount.value;
+  if (next === localAmount.value) return;
+  amountSaving.value = true;
+  try {
+    await botsStore.updateBot(props.bot.id, { coin_amount: next });
+    localAmount.value = next;
+    setAmount(props.bot.id, next);
+    displayAmount.value = formatNum(next);
+    $q.notify({ color: 'positive', message: 'Количество сохранено', position: 'top-right', timeout: 1500 });
+  } catch (e) {
+    const message = extractApiErrorMessage(e, 'Ошибка при сохранении количества');
+    $q.notify({ color: 'negative', message });
+    displayAmount.value = formatNum(localAmount.value);
+  } finally {
+    amountSaving.value = false;
+  }
 };
 
 watch(() => props.bot.coin_amount, (val) => {
@@ -483,24 +560,23 @@ watch(() => props.bot.coin_amount, (val) => {
 const localEntrySpread = ref(entrySpreadNum.value);
 const localExitSpread = ref(exitSpreadNum.value);
 
-let saveSettingsTimeout: number | undefined;
-const debouncedSaveSettings = () => {
-  if (saveSettingsTimeout) clearTimeout(saveSettingsTimeout);
-  saveSettingsTimeout = window.setTimeout(async () => {
-    if (localEntrySpread.value === entrySpreadNum.value && localExitSpread.value === exitSpreadNum.value) return;
-    try {
-      await botsStore.updateBot(props.bot.id, {
-        entry_spread: localEntrySpread.value,
-        exit_spread: localExitSpread.value,
-      });
-      $q.notify({ color: 'positive', message: 'Спреды сохранены', position: 'top-right', timeout: 1500 });
-    } catch (e) {
-      const message = extractApiErrorMessage(e, 'Ошибка при сохранении спредов');
-      $q.notify({ color: 'negative', message });
-      localEntrySpread.value = entrySpreadNum.value;
-      localExitSpread.value = exitSpreadNum.value;
-    }
-  }, 1500);
+// Explicit save invoked from the q-popup-edit "Применить" button. No debounce:
+// the user already confirmed the change, so we PATCH immediately and revert
+// localEntrySpread/localExitSpread on failure to keep UI in sync with Django.
+const saveSpreadSettings = async () => {
+  if (localEntrySpread.value === entrySpreadNum.value && localExitSpread.value === exitSpreadNum.value) return;
+  try {
+    await botsStore.updateBot(props.bot.id, {
+      entry_spread: localEntrySpread.value,
+      exit_spread: localExitSpread.value,
+    });
+    $q.notify({ color: 'positive', message: 'Спреды сохранены', position: 'top-right', timeout: 1500 });
+  } catch (e) {
+    const message = extractApiErrorMessage(e, 'Ошибка при сохранении спредов');
+    $q.notify({ color: 'negative', message });
+    localEntrySpread.value = entrySpreadNum.value;
+    localExitSpread.value = exitSpreadNum.value;
+  }
 };
 
 watch(entrySpreadNum, (val) => { localEntrySpread.value = val; });
@@ -555,6 +631,30 @@ const tradesBadgeShadow = computed(() => {
   if (totalTradesOpened.value > 0) return '0 0 0 1px rgba(33,186,69,0.3) inset';
   return '0 0 0 1px rgba(255,255,255,0.15) inset';
 });
+
+// Lifetime PnL is fetched once by IndexPage (shared across all cards) and
+// refreshed on the same 15s cadence; here we just read the per-bot slice.
+const lifetimePnl = computed(() => pnlStore.pnlForBot(props.bot.id));
+const lifetimeProfitUsdt = computed(() => parseFloat(lifetimePnl.value?.profit_usdt ?? '0') || 0);
+const lifetimeTradesCount = computed(() => lifetimePnl.value?.trades_count ?? 0);
+const lifetimeWins = computed(() => lifetimePnl.value?.wins ?? 0);
+const lifetimeWinRate = computed(() => {
+  const total = lifetimeTradesCount.value;
+  if (total === 0) return 0;
+  return (lifetimeWins.value / total) * 100;
+});
+const lifetimeProfitClass = computed(() => {
+  if (lifetimeProfitUsdt.value > 0) return 'text-positive';
+  if (lifetimeProfitUsdt.value < 0) return 'text-negative';
+  return 'text-text-color opacity-70';
+});
+const formatUsdtSigned = (val: number) => {
+  const sign = val > 0 ? '+' : val < 0 ? '−' : '';
+  return `${sign}${new Intl.NumberFormat('ru-RU', {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  }).format(Math.abs(val))}`;
+};
 
 const currentPnL = computed(() => {
   if (!activeTrade.value || !spreadStats.value?.current) return 0;
@@ -658,8 +758,6 @@ onUnmounted(() => {
   stop(props.bot.id);
   if (countdownInterval) window.clearInterval(countdownInterval);
   if (tradesPollHandle) window.clearInterval(tradesPollHandle);
-  if (amountSaveTimeout) window.clearTimeout(amountSaveTimeout);
-  if (saveSettingsTimeout) window.clearTimeout(saveSettingsTimeout);
 });
 </script>
 
@@ -675,6 +773,16 @@ onUnmounted(() => {
 
 .bg-surface
   background-color: rgba(255, 255, 255, 0.03)
+
+.pnl-row
+  border: 1px solid rgba(255, 255, 255, 0.05)
+  transition: border-color 0.2s ease, background-color 0.2s ease
+  &:hover
+    border-color: rgba(255, 255, 255, 0.18)
+    background-color: rgba(255, 255, 255, 0.05)
+
+.text-text-color
+  color: $text-color
 
 .border-radius-sm
   border-radius: 6px

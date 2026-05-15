@@ -1,4 +1,4 @@
-import { calculateOpenSpread, calculateTruePnL, calculateRealPnL, d, checkLegDrawdown, calculateVWAP } from '../utils/math.js';
+import { calculateOpenSpread, calculateCloseSpread, calculateRealPnL, d, checkLegDrawdown, calculateVWAP } from '../utils/math.js';
 import { api } from '../services/api.js';
 import { logger } from '../utils/logger.js';
 import { config as engineConfig } from '../config.js';
@@ -598,8 +598,10 @@ export class BotTrader {
         }
 
         if (strictPrices) {
-            const currentPnL = calculateTruePnL({ pOpen, sOpen }, strictPrices, orderType);
-            if (currentPnL >= this.bot.exit_spread) {
+            // Exit trigger matches the UI: close once the live close-spread
+            // narrows down to bot.exit_spread or below.
+            const closeSpread = calculateCloseSpread(strictPrices, orderType);
+            if (closeSpread <= this.bot.exit_spread) {
                 await this.executeClose('profit', strictPrices);
             }
         }

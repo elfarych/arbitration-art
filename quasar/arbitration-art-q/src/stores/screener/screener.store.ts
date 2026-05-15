@@ -1,5 +1,5 @@
 import { defineStore } from 'pinia';
-import { ref } from 'vue';
+import { computed, ref } from 'vue';
 import { binanceApi } from 'src/stores/exchanges/api/binanceApi';
 import { binanceSpotApi } from 'src/stores/exchanges/api/binanceSpotApi';
 import { mexcApi } from 'src/stores/exchanges/api/mexcApi';
@@ -10,6 +10,11 @@ export interface ScreenerResult {
   primaryPrice: number;
   secondaryPrice: number;
   spread: number;
+  // 24h turnover in USDT per leg. Frontend usually displays the min — that's
+  // the practical ceiling for an arbitrage execution since both legs must
+  // clear together.
+  primaryQuoteVolume: number;
+  secondaryQuoteVolume: number;
 }
 
 const apiMap: Record<string, any> = {
@@ -69,11 +74,17 @@ export const useScreenerStore = defineStore('screener', () => {
             sPrice = s.ask;
           }
 
+          // Volume filter is applied reactively in `filteredResults` below —
+          // not here. The raw scan keeps every cross-listed pair so the user
+          // can tweak the min-volume threshold without re-hitting the
+          // exchange REST endpoints.
           matched.push({
             coin,
             primaryPrice: pPrice,
             secondaryPrice: sPrice,
-            spread: openSpread
+            spread: openSpread,
+            primaryQuoteVolume: p.quoteVolume ?? 0,
+            secondaryQuoteVolume: s.quoteVolume ?? 0,
           });
         }
       }
@@ -90,11 +101,22 @@ export const useScreenerStore = defineStore('screener', () => {
     }
   };
 
+  // Client-side reactive filter over the last scan. Changing `minVolume`
+  // re-derives this immediately, no REST round-trip required.
+  const filteredResults = computed(() => {
+    const threshold = minVolume.value;
+    if (threshold === null || !(threshold > 0)) return results.value;
+    return results.value.filter(
+      (row) => Math.min(row.primaryQuoteVolume, row.secondaryQuoteVolume) >= threshold,
+    );
+  });
+
   return {
     primaryExchange,
     secondaryExchange,
     orderType,
     results,
+    filteredResults,
     loading,
     minVolume,
     scanSpreads
