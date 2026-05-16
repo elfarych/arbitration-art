@@ -484,6 +484,8 @@ Choices:
 Meta:
 
 - `ordering = ["-opened_at"]`
+- Constraints:
+  - `unique_open_emulation_trade_per_bot` — partial unique index `UNIQUE (bot) WHERE status = 'open'`. Гарантирует, что у одного бота не может быть больше одной активной эмуляционной сделки. Без этого index-а network-флап между engine и Django мог оставлять orphan-записи (POST дошёл, ответ — нет → engine открывал ещё одну параллельно). При повторном POST на занятый bot Django вернёт 400, engine ловит ошибку и через `findOrphanOpenTrade` подхватывает существующий row, не создавая дубль. Миграция `0021_unique_open_trade_per_bot` перед AddConstraint автоматически закрывает существующие orphan-дубликаты (оставляет самый свежий open, остальные → `closed`).
 
 ### 8.3. `Trade`
 
@@ -539,6 +541,9 @@ Choices:
 Meta:
 
 - `ordering = ["-opened_at"]`
+- Constraints:
+  - `CheckConstraint('trade_single_runtime_source')` — запрещает одновременную привязку и к `bot`, и к `runtime_config`.
+  - `unique_open_trade_per_bot` — partial unique index `UNIQUE (bot) WHERE status = 'open' AND bot IS NOT NULL`. Bot-owned trades должны быть уникальны по active-открытию (как `EmulationTrade`). `runtime_config`-owned trades не покрыты: для трейдер-рантайма max-concurrent контролируется в самом сервисе. Миграция `0021_unique_open_trade_per_bot` подчищает legacy-дубликаты (старые → `status='closed'`, `close_reason='error'`) перед AddConstraint.
 
 ## 9. Bots API
 

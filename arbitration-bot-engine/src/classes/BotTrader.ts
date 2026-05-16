@@ -36,6 +36,10 @@ const STALE_LOG_THROTTLE_MS = 5_000;
 // Same throttle reasoning as STALE_LOG_THROTTLE_MS: once max_trades is hit,
 // every orderbook tick would otherwise emit the same "budget reached" line.
 const MAX_TRADES_LOG_THROTTLE_MS = 60_000;
+// Diagnostic close-spread sampler interval. Emitted at INFO so operators can
+// see why an active trade is or isn't closing without flipping LOG_LEVEL; the
+// 10s throttle keeps the journal readable even with many bots.
+const CLOSE_SPREAD_LOG_THROTTLE_MS = 10_000;
 // Approximate taker fee per exchange. The engine writes an estimated commission
 // to Django immediately on close and replaces it with the actual value once the
 // exchange surfaces userTrades.
@@ -75,6 +79,11 @@ export class BotTrader {
     private storeUnsubscribe: (() => void) | null = null;
     private lastStaleLogAtMs = 0;
     private lastMaxTradesLogAtMs = 0;
+    // Diagnostic sampler for the exit-spread trigger. Logs the latest
+    // close-spread vs target at most once per CLOSE_SPREAD_LOG_THROTTLE_MS so
+    // operators can see why a trade is or isn't being closed without flooding
+    // the journal on every WS tick.
+    private lastCloseSpreadLogAtMs = 0;
 
     constructor(
         public bot: any,
@@ -102,33 +111,64 @@ export class BotTrader {
         this.bot = newConfig;
     }
 
-    public restoreOpenTrades(openTrades: TradeRecord[]): void {
+    public async restoreOpenTrades(openTrades: TradeRecord[]): Promise<void> {
         const matching = openTrades.filter(t => t.coin === this.bot.coin && t.status === 'open');
         if (matching.length === 0) return;
-        if (matching.length > 1) {
-            // Django enforces at most one open trade per (bot, coin) via the
-            // engine writing path, so seeing >1 here means either a manual
-            // admin edit or a recovery race left ghost rows in the table.
-            // Restoring an arbitrary one would silently mis-track the position;
-            // surface it loudly so operators can reconcile before trading.
-            const ids = matching.map(t => t.id).join(', ');
+
+        // Pick the most recently opened record as the active one. Older
+        // duplicates are orphans from a previous engine crash, deploy race,
+        // or a half-completed POST that managed to persist before the engine
+        // could attach to the row.
+        const sorted = [...matching].sort(
+            (a, b) => new Date(b.opened_at).getTime() - new Date(a.opened_at).getTime(),
+        );
+        const trade = sorted[0]!;
+        const stale = sorted.slice(1);
+
+        if (stale.length > 0) {
+            const ids = stale.map(t => t.id).join(', ');
             logger.error(
                 this.tag,
-                `🚨 Data inconsistency: ${matching.length} open trades found for ${this.bot.coin} (IDs: ${ids}). ` +
-                `Restoring most recent and ignoring older duplicates; reconcile Django state manually.`,
+                `🚨 Data inconsistency: ${matching.length} open trades found for ${this.bot.coin} ` +
+                `(adopting ${trade.id}, reconciling ${ids} as orphan_closed).`,
             );
+            const isReal = this.bot.trade_mode === 'real';
+            await Promise.allSettled(stale.map(t => this.reconcileOrphanTrade(t, isReal)));
         }
-        // Pick the most recently opened record. Older duplicates, if they exist,
-        // most likely correspond to positions that were already closed on the
-        // exchange but failed to PATCH back to Django — engine cannot recover
-        // those automatically.
-        const trade = matching.reduce((latest, t) => {
-            return new Date(t.opened_at).getTime() > new Date(latest.opened_at).getTime() ? t : latest;
-        }, matching[0]!);
+
         if (!this.state.activeTrade) {
             this.state.activeTrade = trade;
             this.state.openedAtMs = new Date(trade.opened_at).getTime();
             logger.info(this.tag, `♻️ Restored open trade (ID: ${trade.id}, ${trade.order_type})`);
+        }
+    }
+
+    /**
+     * PATCH an orphan `open` row to `closed`. We do NOT touch the exchange:
+     * for emulator trades there are no positions to close, and for real
+     * trades the orphan rows typically correspond to positions that were
+     * already closed by a prior engine instance (or never opened at all
+     * because the open POST raced with a failure). The reconcile only
+     * cleans the Django record so the new unique constraint stays satisfied
+     * and the engine can attach to a single source of truth going forward.
+     */
+    private async reconcileOrphanTrade(trade: TradeRecord, isReal: boolean): Promise<void> {
+        try {
+            const payload: any = {
+                status: 'closed',
+                closed_at: new Date().toISOString(),
+            };
+            if (isReal) {
+                payload.close_reason = 'error';
+            }
+            if (isReal) {
+                await api.updateTrade(trade.id, payload);
+            } else {
+                await api.updateEmulationTrade(trade.id, payload);
+            }
+            logger.warn(this.tag, `Reconciled orphan trade ${trade.id} → status=closed`);
+        } catch (e: any) {
+            logger.error(this.tag, `Failed to reconcile orphan trade ${trade.id}: ${e.message}`);
         }
     }
 
@@ -137,20 +177,16 @@ export class BotTrader {
 
         // Hydrate the all-time opened-trades counter from Django before any
         // WS update can trigger checkSpreads(). The counter is the source of
-        // truth for max_trades enforcement; if Django is briefly unreachable
-        // we log and start from 0 — the cap is loose for this run but the
-        // operator still has BotConfig.is_active to cut things off manually.
-        try {
-            const isReal = this.bot.trade_mode === 'real';
-            this.state.tradesOpenedCount = await api.getTotalTradesCount(this.bot.id, isReal);
-            logger.info(
-                this.tag,
-                `Trades budget: ${this.state.tradesOpenedCount}/${this.bot.max_trades ?? '∞'}`,
-            );
-        } catch (e: any) {
-            logger.warn(this.tag, `getTotalTradesCount failed at start (${e.message}); starting counter from 0`);
-            this.state.tradesOpenedCount = 0;
-        }
+        // truth for max_trades enforcement; if Django stays unreachable across
+        // all retries we throw — Engine.startBot will then remove the
+        // half-initialised trader rather than booting a bot that could blow
+        // through max_trades because it thinks the counter is 0.
+        const isReal = this.bot.trade_mode === 'real';
+        this.state.tradesOpenedCount = await api.getTotalTradesCount(this.bot.id, isReal);
+        logger.info(
+            this.tag,
+            `Trades budget: ${this.state.tradesOpenedCount}/${this.bot.max_trades ?? '∞'}`,
+        );
 
         // Subscribe to the store BEFORE connecting WS clients so the first
         // snapshot that arrives is delivered to checkSpreads().
@@ -469,11 +505,49 @@ export class BotTrader {
             try {
                 tradeRecord = isReal ? await api.openTrade(payload) : await api.openEmulationTrade(payload);
             } catch (e: any) {
+                // Two failure shapes land here:
+                //   (a) Network/timeout AFTER Django persisted the row — the
+                //       trade exists but the engine doesn't know its ID.
+                //   (b) Django rejected the POST with 400 because the new
+                //       unique-open-trade constraint matched an existing row
+                //       (typically a leftover from a previous flap).
+                // In both cases the safe move is the same: probe Django for
+                // any active `open` row on this bot+coin and adopt it as the
+                // active trade so the next tick goes into checkExit() instead
+                // of opening another duplicate.
+                logger.error(
+                    this.tag,
+                    `${isReal ? '🚨 DB write failed AFTER exchange open' : '❌ DB write failed during emulation open'}: ${e.message}`,
+                );
+
+                let adopted: TradeRecord | null = null;
+                try {
+                    // Small grace so a slow Django commit can land before we
+                    // read it back. 750ms is well under COOLDOWN_MS but enough
+                    // to cover typical Traefik retry latency.
+                    await sleep(750);
+                    adopted = await api.findOrphanOpenTrade(this.bot.id, symbol, isReal);
+                } catch (probeErr: any) {
+                    logger.error(this.tag, `Orphan probe failed: ${probeErr.message}`);
+                }
+
+                if (adopted) {
+                    logger.warn(
+                        this.tag,
+                        `🩹 Adopted orphan trade ${adopted.id} after failed open POST — engine is back in sync without a duplicate.`,
+                    );
+                    this.state.activeTrade = adopted;
+                    this.state.openedAtMs = new Date(adopted.opened_at).getTime();
+                    this.state.tradesOpenedCount += 1;
+                    // Skip the cooldown bump: the bot already has an active
+                    // trade and the next tick will run checkExit, not a new
+                    // open, so cooldown is irrelevant.
+                    return;
+                }
+
                 if (isReal) {
-                    logger.error(this.tag, `🚨 DB write failed AFTER exchange open; rolling back positions: ${e.message}`);
+                    logger.error(this.tag, `🚨 No orphan to adopt; rolling back exchange positions.`);
                     await this.rollbackOpenLegs(primaryResult, secondaryResult, primarySide, secondarySide, runPrimary, runSecondary);
-                } else {
-                    logger.error(this.tag, `❌ DB write failed during emulation open: ${e.message}`);
                 }
                 this.state.cooldownUntil = Date.now() + COOLDOWN_MS;
                 return;
@@ -599,10 +673,44 @@ export class BotTrader {
 
         if (strictPrices) {
             // Exit trigger matches the UI: close once the live close-spread
-            // narrows down to bot.exit_spread or below.
+            // narrows down to bot.exit_spread or below. bot.exit_spread arrives
+            // from Django as a DecimalField string ("0.8000"); coerce to a
+            // finite Number before comparing so a stray NaN/empty value can't
+            // silently make every tick return false.
             const closeSpread = calculateCloseSpread(strictPrices, orderType);
-            if (closeSpread <= this.bot.exit_spread) {
+            const target = Number(this.bot.exit_spread);
+            const targetIsValid = Number.isFinite(target);
+
+            const now = Date.now();
+            if (now - this.lastCloseSpreadLogAtMs > CLOSE_SPREAD_LOG_THROTTLE_MS) {
+                this.lastCloseSpreadLogAtMs = now;
+                logger.info(
+                    this.tag,
+                    `📉 closeSpread=${closeSpread.toFixed(4)}% target<=${targetIsValid ? target : 'INVALID'} ` +
+                    `(pBid=${strictPrices.primaryBid} pAsk=${strictPrices.primaryAsk} ` +
+                    `sBid=${strictPrices.secondaryBid} sAsk=${strictPrices.secondaryAsk})`,
+                );
+            }
+
+            if (!targetIsValid) {
+                logger.warn(this.tag, `Invalid bot.exit_spread=${JSON.stringify(this.bot.exit_spread)}; skipping profit-exit check`);
+                return;
+            }
+
+            if (closeSpread <= target) {
+                logger.info(this.tag, `🎯 Exit trigger: closeSpread=${closeSpread.toFixed(4)}% <= target=${target}%`);
                 await this.executeClose('profit', strictPrices);
+            }
+        } else {
+            // strictPrices is null => stale orderbook or cross-leg skew. The
+            // logStale() throttled warning already surfaces the underlying
+            // reason; emit a separate, throttled hint so operators can match
+            // "trade not closing" reports to the freshness guard rather than
+            // suspecting the trigger logic itself.
+            const now = Date.now();
+            if (now - this.lastCloseSpreadLogAtMs > CLOSE_SPREAD_LOG_THROTTLE_MS) {
+                this.lastCloseSpreadLogAtMs = now;
+                logger.info(this.tag, `📉 Exit check skipped: strictPrices=null (stale/skew or VWAP NaN — see stale warnings above)`);
             }
         }
     }

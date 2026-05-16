@@ -114,14 +114,18 @@ export class Engine {
                 marketInfo,
             );
 
-            try {
-                const openTrades = isReal
-                    ? await api.getOpenTrades(botId)
-                    : await api.getOpenEmulationTrades(botId);
-                trader.restoreOpenTrades(openTrades);
-            } catch (e: any) {
-                logger.warn('Engine', `Could not fetch open trades for bot ${botId}: ${e.message}`);
-            }
+            // Restore is mandatory: if Django is briefly unreachable and we
+            // start the bot without knowing about its open trade, the first
+            // tick that meets entry_spread would open a duplicate. Retries
+            // live inside api.getOpenTrades / api.getOpenEmulationTrades;
+            // when they're exhausted we propagate the error to the outer
+            // try/catch so the half-initialised trader is removed and the
+            // operator sees a clear lifecycle failure instead of a silent
+            // orphan trade.
+            const openTrades = isReal
+                ? await api.getOpenTrades(botId)
+                : await api.getOpenEmulationTrades(botId);
+            await trader.restoreOpenTrades(openTrades);
 
             this.traders.set(botId, trader);
             // Start subscribes to OrderBookStore and connects WS. We await

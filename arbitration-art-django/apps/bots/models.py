@@ -389,6 +389,19 @@ class EmulationTrade(models.Model):
         verbose_name = "emulation trade"
         verbose_name_plural = "emulation trades"
         ordering = ["-opened_at"]
+        constraints = [
+            # Hard safety-net against duplicate active trades on the same bot.
+            # The engine already serialises opens in memory, but a network
+            # failure mid-POST or a misbehaving client could otherwise leave
+            # multiple `open` rows for one bot and the engine has no way to
+            # reattach to more than one of them. Partial unique index keeps
+            # historical closed trades free to repeat without restriction.
+            models.UniqueConstraint(
+                fields=("bot",),
+                condition=Q(status="open"),
+                name="unique_open_emulation_trade_per_bot",
+            ),
+        ]
 
     def __str__(self) -> str:
         label = self.coin or (self.bot.coin if self.bot else "unknown")
@@ -540,6 +553,14 @@ class Trade(models.Model):
             models.CheckConstraint(
                 condition=~(Q(bot__isnull=False) & Q(runtime_config__isnull=False)),
                 name="trade_single_runtime_source",
+            ),
+            # Same rationale as EmulationTrade.unique_open_emulation_trade_per_bot.
+            # Scoped to bot-owned trades only; runtime-config trades can run
+            # multiple concurrently by design (max_concurrent_trades).
+            models.UniqueConstraint(
+                fields=("bot",),
+                condition=Q(status="open") & Q(bot__isnull=False),
+                name="unique_open_trade_per_bot",
             ),
         ]
 

@@ -425,10 +425,10 @@ Flow:
 6. Если `trade_mode === 'real'`: на каждой ноге параллельно через `Promise.allSettled([setIsolatedMargin, setLeverage, prefetchAccountSettings?])` (последний — опционально, только если адаптер его реализует); обе ноги параллельно через `Promise.all`; rejected задачи логируются как WARN.
 7. Через factory создаёт `primaryMarketWs` и `secondaryMarketWs` (native WS), пишущие в `orderBookStore`.
 8. Создаёт `BotTrader` с обоими REST клиентами, обоими WS клиентами, общим store и market-info.
-9. Получает открытые сделки из Django (`api.getOpenTrades` / `api.getOpenEmulationTrades`); ошибка fetch не блокирует старт.
-10. `trader.restoreOpenTrades(openTrades)`.
+9. Получает открытые сделки из Django (`api.getOpenTrades` / `api.getOpenEmulationTrades`). Эти GET-ы внутри обёрнуты в `withRetry` (3 попытки, exponential backoff 500ms → 1s → 2s). Если все три попытки падают — ошибка пробрасывается наружу, `catch` блока удаляет полу-инициализированный trader из `traders` map. Это умышленно: продолжать без знания о текущей open-сделке = риск открыть дубликат на первом же тике; лучше явный startup-fail, который оператор увидит и поретраит.
+10. `await trader.restoreOpenTrades(openTrades)` (async) — адоптирует самую свежую open-row и реконсилит orphan-дубликаты.
 11. `traders.set(botId, trader)`.
-12. `await trader.start()` — подписывает trader на `OrderBookStore.onUpdate` и параллельно открывает оба WS соединения.
+12. `await trader.start()` — подписывает trader на `OrderBookStore.onUpdate`, параллельно открывает оба WS соединения. Перед подпиской `start()` хидратит `tradesOpenedCount` через `api.getTotalTradesCount` (тоже retry); если все попытки упали — ошибка пробрасывается и Engine откатит trader, иначе можно проскочить max_trades cap из-за заведомо устаревшего `0`.
 13. `finally`: `starting.delete(botId)` независимо от исхода. Если start упал после `traders.set`, запись удаляется в `catch`.
 
 Важно:
@@ -507,12 +507,13 @@ Constants:
 
 - Replaces `this.bot`. Существующий open trade продолжает мониториться с новыми порогами.
 
-`restoreOpenTrades(openTrades)`:
+`restoreOpenTrades(openTrades)` (async):
 
-- Finds first trade where `t.coin === this.bot.coin && t.status === 'open'`.
-- Sets `activeTrade` + `openedAtMs` из `trade.opened_at`.
+- Фильтрует все `t.coin === this.bot.coin && t.status === 'open'`, сортирует по `opened_at` убывающе.
+- Самый свежий row становится `activeTrade` + `openedAtMs = new Date(trade.opened_at).getTime()`.
+- Остальные orphan-row-ы реконсилятся в фоне через `reconcileOrphanTrade`: PATCH `{status: 'closed', closed_at: now()}` (для real ещё `close_reason: 'error'`). Биржа не трогается — orphan-ы либо ничего не открывали (failed POST), либо были закрыты прошлым инстансом engine; держать ровно один источник правды в Django важнее, чем пытаться угадать состояние позиции.
 
-Risk: если в БД оказались две open-записи на одной паре (регрессия или manual admin), engine восстанавливает только первую.
+DB-side safety-net: `unique_open_emulation_trade_per_bot` / `unique_open_trade_per_bot` partial unique indexes в Django (`bots_0021`) физически запрещают второй active row на одного бота, поэтому даже если engine баги пройдут через все слои — Postgres вернёт `400` на POST и `executeOpen` ловит это в стандартной error-recovery ветке (см. ниже).
 
 `start()`:
 
@@ -593,7 +594,10 @@ Entry direction semantics:
 4. Если хотя бы одна нога `rejected`: reverse reduceOnly для fulfilled fillQty, далее в real mode `handleOpenCleanup()` для residue, cooldown, return.
 5. Иначе берутся fill prices, либо orderbook VWAP для skipped/emulator-ноги. Real spread пересчитывается по фактическим ценам.
 6. Build payload (см. ниже).
-7. `api.openTrade` / `api.openEmulationTrade` пишет trade в Django. Если падает в real mode — `rollbackOpenLegs` + `handleOpenCleanup`, чтобы не остаться с orphan-позицией.
+7. `api.openTrade` / `api.openEmulationTrade` пишет trade в Django. Если падает — engine не считает это «нет открытой сделки»: после `sleep(750ms)` он зовёт `api.findOrphanOpenTrade(bot.id, coin, isReal)`, который тянет open-row через `getOpenTrades`/`getOpenEmulationTrades` (с retry) и возвращает самый свежий matching. Покрывает два сценария:
+   - **Network/timeout после успешного INSERT** в Django: row есть, ответа не было; engine адоптирует row → `activeTrade = adopted`, `tradesOpenedCount += 1`, никакого cooldown (следующий тик сразу идёт в `checkExit`).
+   - **Django 400 от `unique_open_*_per_bot`**: значит open-row уже существует (старый orphan или активная сделка предыдущего инстанса). Engine адоптирует её ровно так же.
+   Если orphan-probe ничего не нашёл — в real mode выполняется `rollbackOpenLegs` + `handleOpenCleanup`, ставится cooldown, return.
 8. При успехе сохраняется `activeTrade` и `openedAtMs`.
 9. Background: `backfillOpenCommission` — параллельно тянет точные комиссии с обеих бирж и PATCH-ит Django.
 
@@ -617,7 +621,8 @@ Emulator payload без exchange names/order IDs/commission.
 1. Reads active trade open prices + order type.
 2. `drawdownLimit = bot.max_leg_drawdown_percent || 80.0`.
 3. Если `emergencyPrices`: `checkLegDrawdown` → если >= drawdownLimit → close reason `liquidation`.
-4. Если `strictPrices`: `calculateCloseSpread(prices, orderType)` → если `<= bot.exit_spread` → close reason `profit`. Формула совпадает с frontend `spreadMonitor.closeSpread`, чтобы UI-таргет «Цель: <= X%» и реальный триггер выхода описывали одно и то же.
+4. Если `strictPrices`: `calculateCloseSpread(prices, orderType)` → если `<= Number(bot.exit_spread)` → close reason `profit`. Формула совпадает с frontend `spreadMonitor.closeSpread`, чтобы UI-таргет «Цель: <= X%» и реальный триггер выхода описывали одно и то же. `bot.exit_spread` приходит из Django как DecimalField-строка (`"0.8000"`); engine явно прогоняет её через `Number(...)` и валидирует `Number.isFinite` перед сравнением — невалидное значение логируется warn и profit-выход скипается на тике.
+5. Diagnostic sampler: раз в `CLOSE_SPREAD_LOG_THROTTLE_MS` (10s) — INFO-лог `📉 closeSpread=... target<=... (pBid/pAsk/sBid/sAsk)` или `📉 Exit check skipped: strictPrices=null`, чтобы оператор по логам мог понять, считает ли trigger вообще и что мешает закрытию (skew/stale vs «не дотягивает до target»).
 
 Exit priority: liquidation guard → profit target. Timeout exits — отдельный timer (`checkTimeouts`).
 
