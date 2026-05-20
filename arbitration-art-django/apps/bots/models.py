@@ -124,6 +124,10 @@ class BotConfig(models.Model):
     trade_on_secondary_exchange = models.BooleanField("trade on secondary", default=True)
     max_trade_duration_seconds = models.PositiveIntegerField("max trade duration (s)", default=3600)
     max_leg_drawdown_percent = models.FloatField("max leg drawdown %", default=80.0)
+    # Minimum gap between two consecutive trades on this bot. The engine arms
+    # this cooldown on every executeClose (success and error) and blocks new
+    # opens until the timer expires. 0 disables the gating.
+    min_trade_interval_seconds = models.PositiveIntegerField("min trade interval (s)", default=10)
     is_active = models.BooleanField("active", default=True)
     status = models.CharField(
         "runtime status",

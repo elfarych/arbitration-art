@@ -19,7 +19,19 @@ interface PairState {
     tradesOpenedCount: number;
 }
 
-const COOLDOWN_MS = 30_000;
+// Fallback cooldown used only when bot.min_trade_interval_seconds is missing
+// (older Django releases that pre-date the field). Production payload always
+// carries the per-bot value; this default exists so the engine still gates
+// repeated opens during partial deploys.
+const DEFAULT_TRADE_INTERVAL_MS = 10_000;
+
+function tradeIntervalMs(bot: any): number {
+    // Field is PositiveIntegerField in Django, so anything legitimate is a
+    // non-negative number. Negative / NaN fall through to the safety default.
+    const raw = Number(bot?.min_trade_interval_seconds);
+    if (!Number.isFinite(raw) || raw < 0) return DEFAULT_TRADE_INTERVAL_MS;
+    return raw * 1_000;
+}
 // 2s gives the engine enough resolution to honour the 10s minimum
 // max_trade_duration_seconds the operator can set in Django, while keeping
 // per-bot CPU cost negligible (one timer + one elapsed-time compare per tick).
@@ -449,7 +461,7 @@ export class BotTrader {
                     await sleep(1000);
                     await this.handleOpenCleanup();
                 }
-                this.state.cooldownUntil = Date.now() + COOLDOWN_MS;
+                this.state.cooldownUntil = Date.now() + tradeIntervalMs(this.bot);
                 return;
             }
 
@@ -523,8 +535,9 @@ export class BotTrader {
                 let adopted: TradeRecord | null = null;
                 try {
                     // Small grace so a slow Django commit can land before we
-                    // read it back. 750ms is well under COOLDOWN_MS but enough
-                    // to cover typical Traefik retry latency.
+                    // read it back. 750ms is well under the configured trade
+                    // interval but enough to cover typical Traefik retry
+                    // latency.
                     await sleep(750);
                     adopted = await api.findOrphanOpenTrade(this.bot.id, symbol, isReal);
                 } catch (probeErr: any) {
@@ -549,7 +562,7 @@ export class BotTrader {
                     logger.error(this.tag, `🚨 No orphan to adopt; rolling back exchange positions.`);
                     await this.rollbackOpenLegs(primaryResult, secondaryResult, primarySide, secondarySide, runPrimary, runSecondary);
                 }
-                this.state.cooldownUntil = Date.now() + COOLDOWN_MS;
+                this.state.cooldownUntil = Date.now() + tradeIntervalMs(this.bot);
                 return;
             }
 
@@ -568,7 +581,7 @@ export class BotTrader {
             }
         } catch (e: any) {
             logger.error(this.tag, `❌ Failed to open: ${e.message}`);
-            this.state.cooldownUntil = Date.now() + COOLDOWN_MS;
+            this.state.cooldownUntil = Date.now() + tradeIntervalMs(this.bot);
         } finally {
             this.state.busy = false;
         }
@@ -876,6 +889,13 @@ export class BotTrader {
 
             this.state.activeTrade = null;
             this.state.openedAtMs = null;
+            // Arm the configured cool-down so the next entry waits at least
+            // bot.min_trade_interval_seconds before opening. `shutdown` is a
+            // user-initiated stop — the trader is about to be torn down by
+            // stop(), so a cool-down would only delay a restart. Skip it.
+            if (reason !== 'shutdown') {
+                this.state.cooldownUntil = Date.now() + tradeIntervalMs(this.bot);
+            }
 
             logger.info(this.tag, `✅ Closed (${reason}). PnL est: ${profitPercentage.toFixed(3)}%`);
 

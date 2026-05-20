@@ -438,7 +438,8 @@ success: 'Action was successful'
   - `Скринер` -> `/screener`
 - user avatar/email если `authStore.currentUser`;
 - spinner while loading user;
-- `router-view` в `q-page-container`.
+- `router-view` в `q-page-container`;
+- глобальный `ScreenerWidget` (см. §25A) поверх всех страниц, монтируется только если `authStore.currentUser` есть.
 
 On mount:
 
@@ -1039,8 +1040,11 @@ order_type: 'buy'
 trade_mode: 'emulator'
 max_trade_duration_seconds: 3600
 max_leg_drawdown_percent: 80
+min_trade_interval_seconds: 10
 is_active: true
 ```
+
+`min_trade_interval_seconds` — минимальный gap между сделками в секундах. Engine на стороне `arbitration-bot-engine` использует это значение как cool-down после успешного `executeClose` (кроме `shutdown`) и на всех error-путях open (см. `tradeIntervalMs` в `BotTrader.ts`). `0` отключает gating. Поле уходит в payload `botsStore.createBot` / `updateBot` без преобразований.
 
 Save:
 
@@ -1090,15 +1094,17 @@ On mount:
 
 1. Запустить spread-монитор (`start(bot.id, baseCoin, ...)`) — WebSocket stream от бирж для UI.
 2. Загрузить exchange info / funding.
-3. Запустить countdown-таймер для funding.
+3. Запустить countdown-таймер для funding (1s).
 4. `refreshTradeState(initial=true)` — загружает active trade и closed count из Django.
 5. Запустить `setInterval(refreshTradeState, 5000)` для синхронизации с состоянием engine.
+6. Запустить `setInterval(fetchExchangeInfo, 60s)` — refresh funding rate и `nextFundingTimestamp`, чтобы открытая карточка не показывала stale данные при долгом сеансе (>8h) или после прохождения funding event-а. Запрос лёгкий (2 symbol-specific REST: один на primary, один на secondary).
 
 On unmount:
 
 - `stop(bot.id)` (WS-стрим);
 - очистить countdown interval;
 - очистить trade polling interval;
+- очистить funding polling interval;
 - очистить debounce-timeout-ы.
 
 ### 18.2. Inline editing
@@ -1114,6 +1120,15 @@ Card supports autosave:
   - popup edit;
   - debounced backend save через 1.5s;
   - аналогичная обработка ошибок.
+
+### 18.3A. Аудио-cue открытия/закрытия
+
+Watch на `activeTrade` ловит переходы и проигрывает звуки:
+
+- `null → Trade` → `playTradeOpen()` (`/sounds/open_p.wav`);
+- `Trade → null` → `playTradeClose()` (`/sounds/close_p.mp3`).
+
+Источники — статические файлы из `public/sounds/`, утилита `src/utils/tradeAudio.ts` создаёт новый `Audio` на каждый вызов (чтобы одновременные сработки нескольких карточек не перебивали друг друга) и тихо проглатывает rejected promise при autoplay-блоке до первого клика. Флаг `tradesInitialized` подавляет звук на первой загрузке, чтобы предсуществующая `open`-сделка не триггерила «открытие» при mount-е карточки. Работает и для `emulator`, и для `real` (та же ветка watch).
 
 ### 18.3. Trade state поступает из engine
 
@@ -1520,6 +1535,87 @@ Important:
 - No pagination beyond table pagination.
 - No volume filtering despite `minVolume` state.
 - Uses ticker bid/ask, not depth VWAP.
+
+## 25A. Screener widget (плавающий)
+
+Глобальный мини-скринер, который висит справа снизу на всех страницах под `MainLayout`. По умолчанию свёрнут до круглой кнопки; разворачивается в карточку 380px шириной.
+
+Файлы:
+
+- `src/stores/screener/screenerWidget.store.ts` — Pinia store (composition style) с persist в localStorage.
+- `src/components/screener-widget/ScreenerWidget.vue` — корневой контейнер (кнопка + панель + уведомления).
+- `src/components/screener-widget/ScreenerWidgetSettings.vue` — форма первичной настройки и редактирования.
+- `src/components/screener-widget/ScreenerWidgetTopList.vue` — список топ-N монет.
+- `src/components/screener-widget/ScreenerWidgetNotifications.vue` — стек floating-уведомлений.
+
+### 25A.1. Поведение UI
+
+- Свёрнутое состояние — круглая warning-кнопка с иконкой `radar`. Badge с количеством активных уведомлений рисуется поверх кнопки.
+- Стек уведомлений живёт в отдельной floating-карточке справа снизу (над свёрнутой кнопкой): max-height `70vh`, вертикальный скролл, sticky-шапка с count-бейджом и кнопкой «Скрыть все»; каждая карточка имеет кнопку копирования тикера (бер base — `BTC`, без `USDT`) через `copyToClipboard` Quasar и кнопку закрытия. Auto-dismiss отключён.
+- Развёрнутое состояние — карточка `bg-dark` с шапкой (название, кнопка настроек, кнопка ручного refresh, кнопка закрытия) и контентом:
+  - если `settings === null` (первый запуск или после сброса) — форма настроек, кнопка «Отмена» скрыта;
+  - если настройки заданы и `showSettings === false` — список топ-монет с колонками `# / Монета / Спред / В топе`;
+  - иначе — та же форма, но с кнопкой «Отмена».
+- При развёрнутом виджете уведомления скрываются — пользователь видит топ напрямую.
+
+### 25A.2. Store: state и actions
+
+State (composition store `screenerWidget`):
+
+- `settings: WidgetSettings | null` — `{ primaryExchange, secondaryExchange, orderType: 'buy' | 'sell', minVolume: number, topCount: number, notifyOnNew: boolean }`. `null` = виджет ещё не настроен.
+- `expanded: boolean` — раскрытие панели.
+- `loading, error` — состояние текущего scan.
+- `results: WidgetResult[]` — текущий топ; каждый элемент содержит `position`, `appearances`.
+- `appearances: Record<string, number>` — сколько раз каждая монета попадала в топ за всё время (с момента сброса).
+- `notifications: WidgetNotification[]` — активные уведомления; auto-dismiss нет, копятся пока пользователь не закроет; hard cap `MAX_NOTIFICATIONS = 200` чтобы длинная сессия не накопила бесконечный стек.
+- `lastScanAt` — timestamp последнего успешного scan.
+
+Actions:
+
+| Action | Что делает |
+|---|---|
+| `init` | вызывается из mount `MainLayout`; если settings есть → `scanOnce` + `startPolling` |
+| `saveSettings` | сохраняет новые settings, при смене пары/направления/topCount сбрасывает `appearances` и `lastTop`, запускает polling |
+| `resetSettings` | сбрасывает settings и счётчики |
+| `scanOnce` | один проход REST-тикеров обеих бирж + пересчёт топа |
+| `startPolling` / `stopPolling` | внутренние, scan каждые 10s |
+| `toggleExpanded` | свернуть/развернуть |
+| `dismissNotification` | удалить уведомление по id |
+| `dismissAllNotifications` | очистить стек уведомлений |
+
+### 25A.3. Логика счётчика и уведомлений
+
+При каждом `scanOnce`:
+
+1. Получить тикеры обеих бирж через те же API-клиенты, что использует `useScreenerStore` (`binanceApi`, `binanceSpotApi`, `mexcApi`, `bybitApi`).
+2. Посчитать spread по `orderType` (формула совпадает с обычным скринером, см. §25).
+3. Отфильтровать по `minVolume` (берётся `min(primaryQuoteVolume, secondaryQuoteVolume)` — это потолок для арбитража, как и в `useScreenerStore.filteredResults`).
+4. Отсортировать по spread desc, взять `topCount` элементов.
+5. Сравнить новый топ с `lastTop`: для каждой монеты, которой не было в предыдущем топе, инкрементировать `appearances[coin]` и (если `notifyOnNew`) поставить уведомление с `(coin, position, count)`.
+6. Сохранить новые `appearances` и `lastTop` в state и localStorage.
+
+Таким образом: монета зашла в топ → counter = 1 + уведомление; ушла из топа → counter не трогается; вернулась → counter = 2 + новое уведомление.
+
+Защитные guard-ы в `scanOnce`:
+
+- **Re-entry guard**: `if (loading.value) return` — manual refresh во время polling-scan не плодит конкурирующие записи в `appearances`/`lastTop`.
+- **Empty-feed guard**: если `pData` или `sData` пустые (наши биржевые адаптеры `getAllTickers` тихо возвращают `{}` при network/CORS-ошибке), scan делает `error.value = ...` и выходит **без** мутации `lastTop`/`appearances`. Иначе следующий успешный scan пометил бы все монеты топа как «новые» и выдал бы флуд уведомлений + ложные инкременты.
+- **First-scan suppression**: при `prevSet.size === 0` (свежая настройка / context change / `lastTop` пустой по любой причине) счётчики корректно стартуют с 1, но уведомления не пушатся — иначе сразу после сохранения настроек пользователь получает `topCount` нотификаций пачкой.
+
+### 25A.4. Persistence
+
+Хранится в `localStorage`:
+
+- `screenerWidget.settings` — JSON `WidgetSettings`;
+- `screenerWidget.appearances` — JSON `Record<coin, number>`;
+- `screenerWidget.lastTop` — JSON `string[]` (последний снапшот топа, нужен чтобы корректно определять «вернулась» после reload страницы);
+- `screenerWidget.expanded` — `'0' | '1'`.
+
+При смене пары бирж, направления или `topCount` `saveSettings` зануляет `appearances` и `lastTop` — счётчики осмысленны только в рамках конкретного контекста (с другим `N` понятие «в топе» меняется и накопленные значения теряют смысл).
+
+### 25A.5. Polling
+
+Один setInterval с шагом `SCAN_INTERVAL_MS = 30s`, общий на всё приложение (store — singleton Pinia). Интервал выбран с запасом по weight-лимитам Binance (`/ticker/24hr` без symbol = weight 40), особенно с учётом того, что на prod все пользователи идут к биржам через один IP nginx-прокси. При `stopPolling` (logout / unmount MainLayout) таймер и таймеры auto-dismiss уведомлений останавливаются.
 
 ## 26. Styling and theme
 

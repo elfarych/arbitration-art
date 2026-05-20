@@ -101,6 +101,7 @@ def build_bot_runtime_payload(bot: BotConfig) -> dict[str, Any]:
             "trade_on_secondary_exchange": bot.trade_on_secondary_exchange,
             "max_trade_duration_seconds": bot.max_trade_duration_seconds,
             "max_leg_drawdown_percent": bot.max_leg_drawdown_percent,
+            "min_trade_interval_seconds": bot.min_trade_interval_seconds,
             "is_active": bot.is_active,
         },
         # Only the keys for the two exchanges this bot uses. Sending the full

@@ -256,6 +256,7 @@ Payload от Django:
     "trade_on_secondary_exchange": true,
     "max_trade_duration_seconds": 3600,
     "max_leg_drawdown_percent": 80,
+    "min_trade_interval_seconds": 10,
     "is_active": true
   },
   "keys": {
@@ -485,12 +486,12 @@ Constructor dependencies:
 | `activeTrade` | Current Django trade record or `null`. |
 | `openedAtMs` | Local timestamp for timeout checks. |
 | `busy` | Re-entrancy lock for open/close operations. |
-| `cooldownUntil` | Timestamp until next entry attempt is blocked after failure. |
+| `cooldownUntil` | Timestamp until next entry attempt is blocked. Armed after every successful `executeClose` (кроме reason=`shutdown`) на `bot.min_trade_interval_seconds`, а также на всех error-путях `executeOpen` (rejection легов / DB-write failure / catch-all) на ту же величину. |
 | `tradesOpenedCount` | All-time count of trades the bot has opened. Hydrated in `start()` via `api.getTotalTradesCount(botId, isReal)` (no status filter — includes `open + closed + force_closed`). Incremented after every successful Django write in `executeOpen`. Persists across engine restart through Django; resets only on bot deletion + recreation. |
 
 Constants:
 
-- `COOLDOWN_MS = 30_000` — пауза между неудачной попыткой open и следующей.
+- `DEFAULT_TRADE_INTERVAL_MS = 10_000` — fallback на случай, если payload от Django не несёт `min_trade_interval_seconds` (старый релиз). Боевое значение всегда берётся из `bot.min_trade_interval_seconds` через `tradeIntervalMs(bot)` — это и пауза между сделками после успешного close, и cooldown на error-путях open.
 - `TIMEOUT_CHECK_INTERVAL_MS = 2_000` — частота проверки `max_trade_duration_seconds`. 2s выбраны как нижняя граница, при которой минимально допустимое значение `max_trade_duration_seconds=10` (форсится Django serializer) даёт детект таймаута с дрейфом ≤2s; больше резолюции тут не нужно, меньше — CPU-носер ни за что.
 - `STOP_BUSY_WAIT_MS = 30_000` — макс. время ожидания в `stop()`.
 - `FORCE_CLOSE_BUSY_WAIT_MS = 10_000` — макс. время ожидания в `forceClose`.

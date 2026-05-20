@@ -94,6 +94,7 @@ class BotConfigSerializer(serializers.ModelSerializer):
             "trade_on_secondary_exchange",
             "max_trade_duration_seconds",
             "max_leg_drawdown_percent",
+            "min_trade_interval_seconds",
             "is_active",
             "status",
             "sync_status",

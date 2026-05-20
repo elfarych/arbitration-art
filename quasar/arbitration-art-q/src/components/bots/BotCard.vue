@@ -396,6 +396,7 @@ import SpreadChart from './SpreadChart.vue';
 import BotTradesDialog from './BotTradesDialog.vue';
 import { useQuasar } from 'quasar';
 import { extractApiErrorMessage } from 'src/utils/apiError';
+import { playTradeOpen, playTradeClose } from 'src/utils/tradeAudio';
 
 const props = defineProps<{ bot: BotConfig }>();
 const emit = defineEmits<{
@@ -429,7 +430,22 @@ type AnyTrade = EmulationTrade | RealTrade;
 const activeTrade = ref<AnyTrade | null>(null);
 const closedTradesCount = ref(0);
 const tradesLoading = ref(false);
+// Set after the first refreshTradeState resolves. Suppresses the audio cue on
+// initial hydration so a pre-existing open trade doesn't play the "open"
+// sound when the card mounts.
+const tradesInitialized = ref(false);
 let tradesPollHandle: number | undefined;
+
+watch(activeTrade, (next, prev) => {
+  if (!tradesInitialized.value) return;
+  if (!prev && next) playTradeOpen();
+  else if (prev && !next) playTradeClose();
+});
+let fundingPollHandle: number | undefined;
+// Funding rate and next-funding timestamp drift relative to the snapshot taken
+// on mount. Refresh once a minute so cards left open across funding events
+// keep showing the live rate and a non-stale countdown.
+const FUNDING_POLL_MS = 60000;
 
 const maxOpenSpread = ref(-Infinity);
 const minCloseSpread = ref(Infinity);
@@ -746,18 +762,32 @@ onMounted(async () => {
   info.value = await exchangesStore.fetchExchangeInfo(coinDisplay.value, props.bot.primary_exchange, props.bot.secondary_exchange);
 
   await refreshTradeState(true);
+  tradesInitialized.value = true;
   tradesPollHandle = window.setInterval(() => { void refreshTradeState(); }, TRADE_POLL_MS);
 
   countdownInterval = window.setInterval(() => {
     if (info.value?.primary) nextFundingTimePrimary.value = formatCountdown(info.value.primary.nextFundingTimestamp);
     if (info.value?.secondary) nextFundingTimeSecondary.value = formatCountdown(info.value.secondary.nextFundingTimestamp);
   }, 1000);
+
+  fundingPollHandle = window.setInterval(async () => {
+    try {
+      info.value = await exchangesStore.fetchExchangeInfo(
+        coinDisplay.value,
+        props.bot.primary_exchange,
+        props.bot.secondary_exchange,
+      );
+    } catch (e) {
+      console.warn('Funding refresh failed', e);
+    }
+  }, FUNDING_POLL_MS);
 });
 
 onUnmounted(() => {
   stop(props.bot.id);
   if (countdownInterval) window.clearInterval(countdownInterval);
   if (tradesPollHandle) window.clearInterval(tradesPollHandle);
+  if (fundingPollHandle) window.clearInterval(fundingPollHandle);
 });
 </script>
 

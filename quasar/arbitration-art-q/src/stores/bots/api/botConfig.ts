@@ -35,6 +35,7 @@ export interface BotConfig {
   trade_on_secondary_exchange: boolean;
   max_trade_duration_seconds: number;
   max_leg_drawdown_percent: number;
+  min_trade_interval_seconds: number;
   is_active: boolean;
   // Engine integration status — populated by Django from the inline lifecycle
   // sync in BotConfigViewSet. UI uses these to surface engine availability and

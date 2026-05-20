@@ -179,6 +179,19 @@
             <div>
               <q-input v-model.number="form.max_leg_drawdown_percent" type="number" step="0.1" label="Просадка ликвидации (%)" outlined dense dark />
             </div>
+            <div>
+              <q-input
+                v-model.number="form.min_trade_interval_seconds"
+                type="number"
+                min="0"
+                step="1"
+                label="Интервал между сделками (сек)"
+                hint="После закрытия следующая сделка не откроется раньше этого срока"
+                outlined
+                dense
+                dark
+              />
+            </div>
           </div>
 
           <q-toggle v-if="isEdit" v-model="form.is_active" label="Активен" color="primary" dark class="q-mt-md" />
@@ -280,6 +293,7 @@ const defaultForm: BotConfigPayload = {
   trade_on_secondary_exchange: true,
   max_trade_duration_seconds: 3600,
   max_leg_drawdown_percent: 80.0,
+  min_trade_interval_seconds: 10,
   is_active: true,
 };
 
@@ -447,6 +461,7 @@ watch(() => props.modelValue, (isOpen) => {
       trade_on_secondary_exchange: props.bot.trade_on_secondary_exchange,
       max_trade_duration_seconds: props.bot.max_trade_duration_seconds,
       max_leg_drawdown_percent: props.bot.max_leg_drawdown_percent,
+      min_trade_interval_seconds: props.bot.min_trade_interval_seconds ?? 10,
       is_active: props.bot.is_active,
     };
     coinBase.value = baseFromCcxt(props.bot.coin) || props.bot.coin.toUpperCase();

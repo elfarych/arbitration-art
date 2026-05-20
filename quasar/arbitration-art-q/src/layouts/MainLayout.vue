@@ -29,6 +29,8 @@
     <q-page-container>
       <router-view />
     </q-page-container>
+
+    <ScreenerWidget v-if="authStore.currentUser" />
   </q-layout>
 </template>
 
@@ -37,6 +39,7 @@ import { computed } from 'vue';
 import { useRouter } from 'vue-router';
 import { useAuthStore } from 'stores/auth';
 import TodayPnlChip from 'src/components/pnl/TodayPnlChip.vue';
+import ScreenerWidget from 'src/components/screener-widget/ScreenerWidget.vue';
 
 const router = useRouter();
 const authStore = useAuthStore();

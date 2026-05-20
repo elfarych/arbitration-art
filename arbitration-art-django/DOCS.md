@@ -424,6 +424,7 @@ Choices:
 | `trade_on_secondary_exchange` | `BooleanField` | `True` | Торговать ли на secondary leg. |
 | `max_trade_duration_seconds` | `PositiveIntegerField` | `3600` | Максимальная длительность сделки в секундах. Сериализатор форсит `min_value=10` (см. §api/serializers, `BotConfigSerializer`). Engine проверяет таймаут раз в `TIMEOUT_CHECK_INTERVAL_MS=2s`, так что нижняя граница 10s рабочая. Миграция `0020` переименовала поле из `_minutes` и умножила существующие значения на 60. |
 | `max_leg_drawdown_percent` | `FloatField` | `80.0` | Максимальная просадка leg в процентах. |
+| `min_trade_interval_seconds` | `PositiveIntegerField` | `10` | Минимальный интервал между сделками в секундах. Engine ставит cooldown ровно на это время после каждого `executeClose` (кроме `shutdown`-причины) и на всех error-путях `executeOpen`; следующая сделка не откроется раньше срока. `0` — gating отключён. Поле уходит в engine через `lifecycle.bot_payload`. |
 | `is_active` | `BooleanField` | `True` | Активность бота. |
 | `created_at` | `DateTimeField(auto_now_add)` | - | Дата создания. |
 | `updated_at` | `DateTimeField(auto_now)` | - | Дата обновления. |
@@ -619,6 +620,7 @@ trade_on_primary_exchange
 trade_on_secondary_exchange
 max_trade_duration_seconds
 max_leg_drawdown_percent
+min_trade_interval_seconds
 is_active
 status
 sync_status
@@ -686,6 +688,7 @@ Side effects (inline, без `transaction.on_commit`):
   "trade_on_secondary_exchange": true,
   "max_trade_duration_seconds": 3600,
   "max_leg_drawdown_percent": 80.0,
+  "min_trade_interval_seconds": 10,
   "is_active": true
 }
 ```
@@ -1105,6 +1108,7 @@ Service token прокидывается обратной стороной: Djan
     "trade_on_secondary_exchange": true,
     "max_trade_duration_seconds": 3600,
     "max_leg_drawdown_percent": 80.0,
+    "min_trade_interval_seconds": 10,
     "is_active": true
   },
   "keys": {
