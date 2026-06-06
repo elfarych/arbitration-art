@@ -20,6 +20,11 @@ env = environ.Env(
     LANGUAGE_CODE=(str, "ru"),
     TIME_ZONE=(str, "Asia/Almaty"),
     BOT_ENGINE_SERVICE_URL_DEFAULT=(str, "http://127.0.0.1:3001"),
+    # art-level-screener levels-api: Django proxies + persists breakout analyses.
+    LEVELS_API_URL=(str, "http://127.0.0.1:3000"),
+    # Analysis is expensive (fetches candles + trades from Binance) — generous,
+    # single-attempt timeout (no retries on this slow call).
+    LEVELS_API_REQUEST_TIMEOUT_SECONDS=(int, 120),
     SERVICE_SHARED_TOKEN=(str, ""),
     # SERVICE_REQUEST_TIMEOUT_SECONDS is kept as a fallback used by the
     # standalone trader runtime info client. Lifecycle commands now use
@@ -54,6 +59,7 @@ INSTALLED_APPS = [
     # Local apps
     "apps.users",
     "apps.bots",
+    "apps.levels",
 ]
 
 MIDDLEWARE = [
@@ -176,6 +182,8 @@ SIMPLE_JWT = {
 
 
 BOT_ENGINE_SERVICE_URL_DEFAULT = env("BOT_ENGINE_SERVICE_URL_DEFAULT")
+LEVELS_API_URL = env("LEVELS_API_URL")
+LEVELS_API_REQUEST_TIMEOUT_SECONDS = env("LEVELS_API_REQUEST_TIMEOUT_SECONDS")
 SERVICE_SHARED_TOKEN = env("SERVICE_SHARED_TOKEN")
 SERVICE_REQUEST_TIMEOUT_SECONDS = env("SERVICE_REQUEST_TIMEOUT_SECONDS")
 SERVICE_LIFECYCLE_TIMEOUT_SECONDS = env("SERVICE_LIFECYCLE_TIMEOUT_SECONDS")

@@ -27,6 +27,21 @@ export interface Config {
     timeframe: string;
     lookback: number;
   };
+  /** Binance USDⓈ-M Futures REST — source of candles and trades for breakout analysis. */
+  binance: {
+    restUrl: string;
+    /** Per-minute request-weight budget (Binance Futures default is 2400). */
+    weightLimitPerMin: number;
+  };
+  /** Breakout-analysis defaults and safety caps (`GET /analysis/:tf/:symbol`). */
+  analysis: {
+    defaultCandles: number;
+    maxCandles: number;
+    /** Per-request aggTrades page size (Binance max 1000). */
+    aggTradesLimit: number;
+    /** Max aggTrades pages fetched per breakout window before giving up. */
+    maxTradePages: number;
+  };
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
@@ -55,6 +70,16 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     volume: {
       timeframe: env.VOLUME_TIMEFRAME ?? '1h',
       lookback: parseNumber(env.VOLUME_LOOKBACK, 24),
+    },
+    binance: {
+      restUrl: env.BINANCE_FUTURES_REST_URL ?? 'https://fapi.binance.com',
+      weightLimitPerMin: parseNumber(env.BINANCE_WEIGHT_LIMIT_PER_MIN, 2400),
+    },
+    analysis: {
+      defaultCandles: parseNumber(env.ANALYSIS_DEFAULT_CANDLES, 1000),
+      maxCandles: parseNumber(env.ANALYSIS_MAX_CANDLES, 3000),
+      aggTradesLimit: parseNumber(env.ANALYSIS_AGG_TRADES_LIMIT, 1000),
+      maxTradePages: parseNumber(env.ANALYSIS_MAX_TRADE_PAGES, 12),
     },
   };
 }

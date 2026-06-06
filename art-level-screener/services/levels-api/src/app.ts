@@ -8,7 +8,9 @@ import { SHARED_MODELS } from './schemas/level';
 import { healthRoutes } from './routes/health';
 import { screenerRoutes } from './routes/screener';
 import { timeframesRoutes } from './routes/timeframes';
+import { analysisRoutes } from './routes/analysis';
 import redisPlugin from './plugins/redis';
+import binancePlugin from './plugins/binance';
 import swaggerPlugin from './plugins/swagger';
 import type { Config } from './config/env';
 
@@ -26,10 +28,12 @@ export async function buildApp(config: Config): Promise<FastifyInstance> {
   await app.register(cors, { origin: config.cors.origin });
   await app.register(swaggerPlugin);
   await app.register(redisPlugin);
+  await app.register(binancePlugin);
 
   await app.register(healthRoutes);
   await app.register(timeframesRoutes);
   await app.register(screenerRoutes);
+  await app.register(analysisRoutes);
 
   return app;
 }

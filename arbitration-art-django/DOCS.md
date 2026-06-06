@@ -83,14 +83,21 @@ arbitration-art-django/
     │   │   ├── views.py
     │   │   └── serializers.py
     │   └── migrations/
-    └── bots/
+    ├── bots/
+    │   ├── models.py
+    │   ├── admin.py
+    │   ├── apps.py
+    │   ├── api/
+    │   │   ├── urls.py
+    │   │   ├── views.py
+    │   │   └── serializers.py
+    │   └── migrations/
+    └── levels/                # сохранённые анализы пробоев (см. §10A)
         ├── models.py
         ├── admin.py
         ├── apps.py
-        ├── api/
-        │   ├── urls.py
-        │   ├── views.py
-        │   └── serializers.py
+        ├── api/               # urls/views/serializers
+        ├── services/          # analysis_client.py — прокси в levels-api
         └── migrations/
 ```
 
@@ -230,6 +237,8 @@ TIME_ZONE=Asia/Almaty
 | `SECURE_SSL_REDIRECT` | production | нет | Дефолт `True`. |
 | `SERVICE_SHARED_TOKEN` | Django -> trader/bot-engine | да для service calls | Shared token для запросов между Django и runtime-сервисами. Без него `is_service_request` всегда False, и engine не сможет писать trade-ы в Django. |
 | `BOT_ENGINE_SERVICE_URL_DEFAULT` | base | нет | Дефолтный `service_url` для новых `BotConfig`. Это поле read-only через API, что закрывает SSRF-вектор «юзер шлёт ключи на свой произвольный host». Поле остаётся в БД для multi-engine deployment-ов через admin. |
+| `LEVELS_API_URL` | Django -> levels-api | нет | Дефолт `http://127.0.0.1:3000`. База `art-level-screener/levels-api` для прокси анализа пробоев (`apps.levels`, §10A). |
+| `LEVELS_API_REQUEST_TIMEOUT_SECONDS` | Django -> levels-api | нет | Дефолт `120`. Таймаут одного (без ретраев) запроса анализа — расчёт дорогой (свечи+трейды Binance). |
 | `SERVICE_LIFECYCLE_TIMEOUT_SECONDS` | Django -> bot-engine | нет | Дефолт `30`. Используется для START/STOP/FORCE-CLOSE, которым нужен запас на `loadMarkets`, `setIsolatedMargin`, `setLeverage`. |
 | `SERVICE_SYNC_TIMEOUT_SECONDS` | Django -> bot-engine | нет | Дефолт `5`. Используется для SYNC: in-memory edit на стороне engine должен возвращаться за миллисекунды. |
 | `SERVICE_REQUEST_TIMEOUT_SECONDS` | Django -> arbitration-trader (legacy) | нет | Дефолт `30`. Используется только клиентом standalone trader runtime info; для bot-engine используются split-таймауты выше. |
@@ -249,6 +258,7 @@ Root URL config: `arbitration_art_django/urls.py`.
 | `/admin/` | Django admin |
 | `/api/auth/` | Auth/profile endpoints из `apps.users.api.urls` |
 | `/api/bots/` | Bot/trade endpoints из `apps.bots.api.urls`, включая агрегированный PnL `GET /api/bots/pnl/` (см. §9.6) |
+| `/api/levels/` | Сохранённые анализы пробоев уровней из `apps.levels.api.urls` (см. §10A) |
 
 ## 7. Пользователи и auth
 
@@ -1156,6 +1166,42 @@ Lifecycle sync **inline** в `BotConfigViewSet.perform_create` / `perform_update
 ### Engine response contract
 
 Engine отвечает `{ success: true }` или `{ success: false, error: "..." }` со статусом 200/500. `_perform_post` бросает `LifecycleSyncError` на любой non-2xx ответ и на network errors; retry-policy: `SERVICE_REQUEST_RETRIES` попыток с паузой `SERVICE_REQUEST_RETRY_DELAY_SECONDS`.
+
+## 10A. Levels domain (сохранённые анализы пробоев)
+
+Приложение `apps.levels` хранит результаты анализа пробоев горизонтальных уровней (фича страницы монеты во фронтенде, `art-level-screener`). Django **проксирует** расчёт в `levels-api` и **сохраняет** результат в БД под пользователем — история анализов переживает перезагрузку.
+
+### Модели (`apps/levels/models.py`)
+
+- **`LevelAnalysis`** — один запуск анализа. Поля: `owner` (FK на `users.User`, `related_name="level_analyses"`), `symbol`, `timeframe`; параметры запуска (`natr_multiplier`, `min_gap`, `direction` `up`/`down`/`both`, `max_breakout_seconds`, `min_move_pct`, `candles`); `candles_analyzed`, `range_from`/`range_to` (мс); тоталы (`breakouts_found`, `evaluated`, `matched`, `unmatched`, `match_rate`, `up_found`/`up_matched`/`down_found`/`down_matched`); `created_at`. `ordering = ["-created_at"]`, индекс `(owner, symbol, -created_at)`. Запуски **иммутабельны** (только create/read/delete).
+- **`LevelAnalysisBreakout`** — один пробой внутри анализа (`analysis` FK, `related_name="breakouts"`). Поля повторяют контракт пробоя: `price`, `level_time`, `kind`, `direction`, `touches`, `breakout_candle_time`, `cross_time`/`reach_time`/`elapsed_ms`/`move_pct` (nullable), `matched`, `reason`. Времена — `BigIntegerField` (мс Unix), цены/проценты — `FloatField` (research-данные, не деньги).
+
+### API (`/api/levels/`, `apps/levels/api/`)
+
+`LevelAnalysisViewSet` (`IsAuthenticated`, queryset фильтруется по `owner=request.user`; `http_method_names` без PUT/PATCH).
+
+| Метод | Путь | Назначение |
+|-------|------|------------|
+| GET | `/api/levels/analyses/?symbol=BTCUSDT` | История анализов пользователя по монете (summary без пробоев), newest-first |
+| POST | `/api/levels/analyses/` | Запустить + сохранить анализ (тело — параметры) |
+| GET | `/api/levels/analyses/{id}/` | Анализ с полным списком пробоев (`breakouts`) |
+| DELETE | `/api/levels/analyses/{id}/` | Удалить анализ |
+
+**Контракт ответа — camelCase, вложенный** (`params`, `range`, `summary.byDirection`, `breakouts[]`), один-в-один с `AnalysisResult` из `levels-api/API.md` плюс `id` и `createdAt` — чтобы фронт рендерил сохранённые и «живые» анализы одними компонентами. Сериализаторы: `AnalysisRunSerializer` (вход), `AnalysisSummarySerializer` (список), `AnalysisDetailSerializer` (+`breakouts`).
+
+**`POST` flow** (`views.create`): валидирует параметры → строит query (необязательные `natrMultiplier`/`minGap`/`candles` шлёт только если заданы, иначе дефолты `levels-api`) → `run_analysis` зовёт `levels-api` → `_persist_analysis` создаёт `LevelAnalysis` + `bulk_create` пробоев → отдаёт detail (201). Ошибки `levels-api` (404/502/таймаут) маппятся в `AnalysisServiceError` (502).
+
+### Проксирование в levels-api (`apps/levels/services/analysis_client.py`)
+
+`run_analysis(symbol, timeframe, query)` — `requests.get` на `GET {LEVELS_API_URL}/analysis/{tf}/{symbol}?...`, **один запрос без ретраев** (анализ дорогой: свечи+трейды Binance; ретраить долгий таймаут нельзя), таймаут `LEVELS_API_REQUEST_TIMEOUT_SECONDS` (120с). Бросает `LevelsAnalysisError` на любой сбой. Синхронно (dev runserver многопоточный; на проде учесть worker timeout). `levels-api` без auth — Django ходит во внутреннюю сеть.
+
+### Settings / env
+
+`settings/base.py`: `LEVELS_API_URL` (env, дефолт `http://127.0.0.1:3000`), `LEVELS_API_REQUEST_TIMEOUT_SECONDS` (env, дефолт 120). Внесены в `.env`/`.env.example`. Приложение — в `INSTALLED_APPS` (`apps.levels`), маршрут — в root `urls.py`.
+
+### Контракт Django ↔ levels-api
+
+`POST /api/levels/analyses/` → `GET {LEVELS_API_URL}/analysis/:tf/:symbol`. Меняешь форму ответа `levels-api` (`AnalysisResult`) — синхронизируй `_persist_analysis`, сериализаторы и `art-level-screener/services/levels-api/API.md`. Фронт **больше не зовёт `/analysis` напрямую** — только через Django (секундные графики деталей по-прежнему тянут Binance напрямую).
 
 ## 11. Django admin
 

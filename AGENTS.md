@@ -111,9 +111,9 @@ arbitration-art/
 
 ### 5.3 Локальный запуск через PM2
 
-`ecosystem.config.cjs` в корне поднимает backend одной командой `pm2 start ecosystem.config.cjs`: `django` (8000), `bot-engine` (3001), `levels-connector` / `levels-processor` / `levels-api` (3000). Фронтенд не входит (запускается отдельно через `quasar dev` / nginx).
+`ecosystem.config.cjs` в корне поднимает backend одной командой `pm2 start ecosystem.config.cjs`: `django` (8000), `bot-engine` (3001), `levels-connector` / `levels-api` (3000); `levels-processor` в конфиге закомментирован. Фронтенд не входит (запускается отдельно через `quasar dev` / nginx).
 
-Запускает **скомпилированный** вывод (`dist/`), поэтому перед первым стартом и после изменений собрать сервисы (`npm run build` / `pnpm build`). Внешние зависимости PM2 не поднимает: Redis (для levels), PostgreSQL (`make db-up`) и миграции (`make migrate`) для Django. Детали — в шапке `ecosystem.config.cjs`.
+Конфиг — **локальный dev с hot-reload**, сборка не нужна: Node/TS-сервисы запускаются через `tsx watch src/<entry>.ts` (PM2 трекает `tsx`, он перезапускает приложение при правках), Django — `runserver` без `--noreload` (свой автоперезапуск). Правки `src/` подхватываются автоматически — `npm run build` локально не требуется. Требуется только установленные зависимости (для `node_modules/.bin/tsx`): `pnpm install` / `npm install` в каждом сервисе. Внешние зависимости PM2 не поднимает: Redis (для levels), PostgreSQL (`make db-up`) и миграции (`make migrate`) для Django. Для прода вместо этого запускать скомпилированный вывод (`npm run build` → `dist/`). Детали и caveat про Django autoreload — в шапке `ecosystem.config.cjs`.
 
 В репозитории физически присутствуют и другие директории (`arbitration-trader`, `arbitration-ws-futures-trader`, `arbitration-scanner`), но по правилу §3.0 они вне scope и не учитываются ни в чтении, ни в правках, ни в анализе контрактов.
 
@@ -292,6 +292,7 @@ pnpm build
 - Exchange enum/choices -> frontend exchange options and engine mappings.
 - `art-level-screener` Redis keys: connector (`binance-futures:*`) -> processor (`levels:*`) -> `levels-api` reader.
 - `levels-api` HTTP API (`/screener/:tf`, `/screener/:tf/:symbol`) -> раздел скринера во `quasar/arbitration-art-q` (контракт — `art-level-screener/services/levels-api/API.md`).
+- `levels-api` `/analysis/:tf/:symbol` -> Django (`apps.levels`, проксирует и сохраняет) -> Quasar `analysisApi`. Фронт зовёт анализ только через Django (`/api/levels/analyses/`), не напрямую `levels-api`. Меняешь форму `AnalysisResult` — синхронизируй Django `_persist_analysis`/сериализаторы и `API.md`.
 
 Контрактные изменения всегда документировать в `DOCS.md` всех затронутых приложений.
 

@@ -287,6 +287,8 @@ Routes:
 | `/trader-runtime` | `MainLayout` | `TraderRuntimePage` | Standalone trader runtime |
 | `/profile` | `MainLayout` | `ProfilePage` | Профиль и API-ключи бирж |
 | `/screener` | `MainLayout` | `ScreenerPage` | Скринер спредов |
+| `/levels` | `MainLayout` | `LevelsScreenerPage` | Скринер уровней (§25B) |
+| `/levels/:symbol` | `MainLayout` | `LevelDetailPage` | Страница монеты + анализ пробоев (§25B.6) |
 | `/pnl` | `MainLayout` | `PnlPage` | Агрегированный PnL с выбором периода |
 | `/:catchAll(.*)*` | none | `ErrorNotFound` | 404 |
 
@@ -1633,6 +1635,15 @@ Actions:
 - `src/stores/levels/api/levelsApi.ts` — клиент `levels-api` (отдельный axios instance, без auth) + типы `LevelView`/`ScreenerEntry`/`ScreenerPage`.
 - `src/stores/levels/api/binanceKlines.ts` — REST-снапшот свечей Binance Futures через прокси `/binance-api` (стартовая загрузка + lazy-load истории).
 - `src/stores/levels/api/klineStream.ts` — общий WebSocket-менеджер live-свечей Binance Futures (combined streams). Один сокет на весь грид с reference-counted подписками по `<symbol>@kline_<tf>`, авто-reconnect c backoff и resubscribe. API: `subscribeKline(symbol, interval, listener) => unsubscribe`.
+- `src/pages/LevelDetailPage.vue` — страница монеты (route `/levels/:symbol`, §25B.6): шапка (назад, символ, кнопка «Анализ») + список сохранённых анализов + результаты выбранного. **Графика сверху нет.**
+- `src/components/levels/LevelsAnalysisDialog.vue` — диалог настроек анализа (7 параметров), `v-model` показа + `@run` с настройками.
+- `src/components/levels/LevelsAnalysisList.vue` — список сохранённых анализов монеты (строки с тоталами: время, ТФ, пробитие, найдено/совпало/match rate); клик по строке → `@select`, корзина → `@remove`. Подсветка выбранной строки.
+- `src/components/levels/LevelsAnalysisResults.vue` — сводка (найдено/проверено·совпало/match rate/по направлениям) + `q-table` пробоев выбранного анализа; клик по строке открывает `BreakoutDetailDialog`. Принимает объект формы `AnalysisResult` (подходит и сохранённый `SavedAnalysisDetail`).
+- `src/components/levels/BreakoutDetailDialog.vue` — попап с двумя графиками выбранного пробоя: на ТФ анализа и посекундный.
+- `src/components/levels/MiniBreakoutChart.vue` — переиспользуемый мини-график (свечи + price-line уровня + маркеры) для диалога пробоя.
+- `src/stores/levels/api/binanceAggTrades.ts` — посекундные OHLC из `aggTrades` Binance (у futures klines нет `1s`-интервала) через прокси `/binance-api`.
+- `src/stores/levels/api/analysisApi.ts` — клиент **Django** `/api/levels/analyses/` (authed `api` из `boot/axios`): `list(symbol)`, `create(payload)`, `get(id)`, `remove(id)`. Типы `SavedAnalysis`/`SavedAnalysisDetail`/`AnalysisRunPayload` (camelCase, форма `AnalysisResult` + `id`/`createdAt`).
+- `src/stores/levels/analysis.store.ts` — Pinia Options Store (`useAnalysisStore` → `defineStore('levelsAnalysis')`): история `items` по монете, выбранный `selected` (с пробоями), `running`/`listLoading`/`detailLoading`; actions `fetchList(symbol)`, `run(symbol, settings)` (POST в Django → prepend+select), `select(id)`, `remove(id)`, `reset()`. `ANALYSIS_DEFAULTS` — дефолты диалога.
 
 ### 25B.2. Данные и контракт
 
@@ -1641,6 +1652,7 @@ Actions:
   - `GET /screener/:tf?sort=distance&order=asc&limit=20&offset=N` → `{ timeframe, total, count, items: ScreenerEntry[] }`. Список уже отсортирован по близости (`distanceNatr ↑`). `ScreenerEntry.levels` — все активные уровни монеты; `nearest` — ближайший. Сервис считает экран **под запрос** из свечей коннектора — каждый ответ свежий.
   - **Параметры расчёта** в query (задаются в шапке через `LevelsFilters`): `minVolume` (минимальный оборот в USDT, пре-фильтр; опускается/0 — выкл), `natrMultiplier` (погрешность зоны касания), `minGap` (свечей между касаниями). Опущенные → дефолты сервера.
   - База — `process.env.LEVELS_API_URL` (см. §28). CORS на сервисе по умолчанию `*`.
+- **Анализ пробоев — через Django** (`/api/levels/analyses/`, app `apps.levels`), не напрямую в `levels-api`. Django проксирует расчёт в `levels-api` (`GET /analysis/:tf/:symbol`) и сохраняет результат под пользователем. Клиент — `analysisApi` (authed `api`), типы `SavedAnalysis`/`SavedAnalysisDetail` (camelCase, форма `AnalysisResult` + `id`/`createdAt`). См. §25B.6.
 - **Свечи (OHLC)** — два источника, как в фиче exchanges (§24):
   - **REST-снапшот + история** — `/binance-api/fapi/v1/klines` через прокси (`binanceKlines.ts`): стартовая загрузка `CANDLE_LIMIT` свечей и lazy-load старших батчей.
   - **Live-обновления** — combined-stream WebSocket напрямую на `wss://fstream.binance.com/market/stream`, подписка `<symbol>@kline_<tf>` через `SUBSCRIBE`/`UNSUBSCRIBE` (`klineStream.ts`). Путь именно `/market/stream`: `/ws` принимает подписку, но данные больше не шлёт — отдаёт только `/market/stream` (так же, как в коннекторе `art-level-screener`). WS подключается к бирже напрямую (у WS нет CORS; прокси нужен только REST). Один сокет мультиплексирует все карточки грида.
@@ -1676,6 +1688,29 @@ REST-свечи перезагружаются при смене ТФ/стран
 `:key="entry.symbol"` (стабильный инстанс графика при переупорядочивании). Watch: смена `timeframe` → перезагрузка свечей; смена `entry` (перезапрос данных) → пересоздание series-лучей (`chart.removeSeries` + заново) без перезагрузки свечей. Очистка `chart.remove()` в `onBeforeUnmount`.
 
 > Примечание: существующий `SpreadHistoryDialog.vue` (§22) всё ещё использует v4-метод `addLineSeries`, которого нет в установленной `lightweight-charts@5.1.0` — это предсуществующий баг того компонента (не покрывается esbuild-сборкой, т.к. типы не проверяются). Новый раздел уровней написан на корректном v5 API.
+
+### 25B.6. Страница монеты и анализ пробоев
+
+**Навигация.** Клик по шапке карточки (`LevelChartCard` эмитит `@open` с символом) ведёт на `/levels/:symbol`; страница скринера в обработчике (`onOpenCoin`) делает `router.push({ path: '/levels/<symbol>', query: { tf: store.timeframe } })` — переносит текущий ТФ скринера. `LevelChartCard` навигацию не выполняет сам (остаётся переиспользуемым; на детальной странице `@open` не слушается).
+
+**`LevelDetailPage` (без графика).** Читает `route.params.symbol`. Графика сверху **нет**. На странице: шапка (назад, символ, кнопка «Анализ») → список сохранённых анализов монеты (`LevelsAnalysisList`) → результаты выбранного анализа (`LevelsAnalysisResults`). На смену монеты — `watch(symbol, init, { immediate: true })`: грузит ТФ скринера (для селекта в диалоге) и `analysisStore.fetchList(symbol)`.
+
+**Сохранение в Django (история).** Анализы хранятся в Django (`/api/levels/analyses/`, app `apps.levels`), привязаны к пользователю. Django **проксирует** расчёт в `levels-api` и сохраняет результат — история переживает перезагрузку. Фронт ходит в Django через `analysisApi` (authed `api`), **не** в `levels-api` напрямую для анализа.
+
+**Запуск.** Кнопка «Анализ» открывает `LevelsAnalysisDialog` с 7 параметрами: **таймфрейм** (дефолт = ТФ скринера / `query.tf` / первый / `1h`), **погрешность** (доли NATR = `natrMultiplier`), **свечей между касаниями** (`minGap`), **пробитие** (`up`/`down`/`both`), **макс. время пробоя, сек** (`maxBreakoutSeconds`), **мин. движение, %** (`minMovePct`), **свечей для анализа** (`candles`, 61–3000, дефолт 1000). По «Запустить» страница сохраняет настройки в `localStorage` (`levels.analysisSettings`, кроме `timeframe`) и зовёт `analysisStore.run(symbol, settings)` → `POST /api/levels/analyses/`. Django считает (levels-api), сохраняет, отдаёт detail; стор добавляет запись в начало списка и делает её выбранной.
+
+**Список (`LevelsAnalysisList`).** Строки: время, ТФ, пробитие, найдено, совпало (`matched/evaluated`), match rate; параметры — в тултипе; корзина — удалить (`@remove` → `analysisStore.remove`). Клик по строке (`@select`) грузит detail (`analysisStore.select(id)` → `GET /api/levels/analyses/:id/`) и показывает результаты ниже.
+
+**Результаты (`LevelsAnalysisResults`).** Принимает выбранный `SavedAnalysisDetail` (форма `AnalysisResult` + `id`/`createdAt`). Сводка плитками (найдено / проверено·совпало / match rate % / вверх·вниз) + `q-table` пробоев: время пробоя, сторона (▲/▼), цена уровня, касаний, движение %, время до цели (сек), статус (чип `matched` + причина: `соответствует` / `нет трейдов` / `нет трейда за уровнем` / `движение мало`). Клик по строке открывает `BreakoutDetailDialog`.
+
+**`evaluated` и matchRate.** `summary.evaluated` = сколько пробоев реально проверено по трейдам (без `reason='no_trades'`); `matchRate = matched / evaluated`. Сам расчёт — на `levels-api` (уровни тем же кодом, что и скринер; пробои по закрытию свечи; дедуп; проверка по трейдам Binance — см. `art-level-screener/DOCS.md`).
+
+**Детали пробоя (`BreakoutDetailDialog`).** Клик по строке таблицы (`@row-click`) открывает попап с двумя графиками выбранного пробоя:
+
+1. **На ТФ анализа** — свечи вокруг пробоя через `fetchKlines(symbol, timeframe, …, endTime=breakoutCandleTime + N·ТФ)`; price-line на цене уровня + маркер-стрелка на свече пробоя.
+2. **Посекундный** — 1s-OHLC из `aggTrades` (`fetchAggTradeCandles`, окно `[crossTime−pad, crossTime + maxBreakoutSeconds + pad]`, ≤1ч); price-line уровня + маркеры пересечения (`crossTime`) и достижения цели (`reachTime`). Маркеры ставятся в поле **со стороны, противоположной движению** (чтобы не перекрывать цену), мелкие; при `elapsed=0` (cross и reach в одной секунде) — один объединённый маркер «пробой → цель». Если `crossTime` нет (пробой не подтверждён трейдами), секундный график не строится — показывается пояснение (`emptyText`), а не разреженная каша.
+
+Графики строит `MiniBreakoutChart` (lightweight-charts v5: `addSeries(CandlestickSeries)`, `createPriceLine`, `createSeriesMarkers`). Оба графика тянут данные напрямую с Binance через прокси `/binance-api` — бэкенд `levels-api` тут не участвует (использует `crossTime`/`reachTime`/`maxBreakoutSeconds` из уже полученного ответа анализа).
 
 ## 26. Styling and theme
 
@@ -1780,11 +1815,23 @@ Response assumptions:
 
 Раздел уровней (§25B) ходит в отдельный сервис `levels-api` под `process.env.LEVELS_API_URL` (не Django, без auth, CORS `*`). Контракт целиком — `art-level-screener/services/levels-api/API.md`. Используемые эндпоинты:
 
-- `GET /timeframes`
-- `GET /screener/{tf}` (query: `sort`, `order`, `limit`, `offset`, опц. `side`, `maxDistanceNatr`, `minActive`, `search`)
-- `GET /screener/{tf}/{symbol}` (детали монаты; в разделе пока не используется)
+- `GET /timeframes` (`levelsApi.timeframes`)
+- `GET /screener/{tf}` (query: `sort`, `order`, `limit`, `offset`, опц. `side`, `maxDistanceNatr`, `minActive`, `search`, `minVolume`, `natrMultiplier`, `minGap`) — `levelsApi.screener`
+
+`GET /analysis/{tf}/{symbol}` фронт **напрямую не вызывает** — анализ идёт через Django (`/api/levels/analyses/`, §27.2), которое само проксирует `levels-api`.
 
 Свечи для графиков берутся напрямую с Binance через прокси `/binance-api` (§24, §28.1) и не входят в контракт `levels-api`.
+
+### 27.2. Levels analyses (Django)
+
+Сохранённые анализы пробоев (§25B.6) — через Django (authed `api`), не `levels-api`. Клиент `analysisApi`:
+
+- `GET /api/levels/analyses/?symbol=` → `SavedAnalysis[]` (история по монете)
+- `POST /api/levels/analyses/` → `SavedAnalysisDetail` (запустить + сохранить; Django проксирует `levels-api` и пишет в БД)
+- `GET /api/levels/analyses/{id}/` → `SavedAnalysisDetail` (с пробоями)
+- `DELETE /api/levels/analyses/{id}/`
+
+Форма ответа — camelCase, как `AnalysisResult` `levels-api` + `id`/`createdAt`. Детали Django — `arbitration-art-django/DOCS.md` §10A.
 
 ## 28. Environment
 

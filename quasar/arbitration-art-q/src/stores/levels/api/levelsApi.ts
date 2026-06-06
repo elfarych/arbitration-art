@@ -88,6 +88,76 @@ function buildQuery(params: ScreenerQuery): string {
   return tail ? `?${tail}` : '';
 }
 
+// --- Breakout analysis (GET /analysis/:tf/:symbol) ---
+
+export type BreakoutDirection = 'up' | 'down' | 'both';
+
+// Request params for the breakout analysis. Omitted fields fall back to the
+// levels-api env defaults (natrMultiplier/minGap/candles) or schema defaults.
+export interface AnalysisParams {
+  natrMultiplier?: number;
+  minGap?: number;
+  direction?: BreakoutDirection;
+  maxBreakoutSeconds?: number;
+  minMovePct?: number;
+  candles?: number;
+}
+
+// One detected level breakout and its trade-based verdict. Mirrors the
+// AnalysisBreakout model from API.md.
+export interface AnalysisBreakout {
+  price: number;
+  // Level formation time — open of the extremum candle (ms, Unix).
+  levelTime: number;
+  kind: LevelKind;
+  direction: 'up' | 'down';
+  // Touches counted before the breakout.
+  touches: number;
+  // Open time of the first candle that broke the level (ms).
+  breakoutCandleTime: number;
+  // First trade leaving the level zone (ms); null when unconfirmed by trades.
+  crossTime: number | null;
+  // First trade reaching minMovePct beyond the level (ms); null otherwise.
+  reachTime: number | null;
+  // reachTime - crossTime (ms); null when either is missing.
+  elapsedMs: number | null;
+  // Max move beyond the level after the cross, %; null without a cross.
+  movePct: number | null;
+  matched: boolean;
+  // ok | no_trades | no_cross | min_move_not_reached | too_slow
+  reason: string;
+}
+
+export interface AnalysisResult {
+  symbol: string;
+  timeframe: string;
+  // Effective params after defaults/caps applied by the server.
+  params: {
+    natrMultiplier: number;
+    minGap: number;
+    direction: BreakoutDirection;
+    maxBreakoutSeconds: number;
+    minMovePct: number;
+    candles: number;
+  };
+  candlesAnalyzed: number;
+  range: { from: number; to: number };
+  summary: {
+    breakoutsFound: number;
+    // Breakouts verifiable against trades (excludes ones with no trades in the
+    // window). matchRate is over this.
+    evaluated: number;
+    matched: number;
+    unmatched: number;
+    matchRate: number;
+    byDirection: {
+      up: { found: number; matched: number };
+      down: { found: number; matched: number };
+    };
+  };
+  breakouts: AnalysisBreakout[];
+}
+
 export const levelsApi = {
   // Timeframes that currently have data (GET /timeframes).
   async timeframes(): Promise<string[]> {

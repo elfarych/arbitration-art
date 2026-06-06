@@ -100,6 +100,7 @@
         :key="entry.symbol"
         :entry="entry"
         :timeframe="store.timeframe"
+        @open="onOpenCoin"
       />
     </div>
   </q-page>
@@ -107,12 +108,20 @@
 
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue';
+import { useRouter } from 'vue-router';
 import { useLevelsStore } from 'src/stores/levels/levels.store';
 import LevelChartCard from 'src/components/levels/LevelChartCard.vue';
 import LevelsGridPicker from 'src/components/levels/LevelsGridPicker.vue';
 import LevelsFilters from 'src/components/levels/LevelsFilters.vue';
 
 const store = useLevelsStore();
+const router = useRouter();
+
+// Open the coin detail page; carry the current screener timeframe so the detail
+// chart opens on the same TF the user was viewing.
+function onOpenCoin(symbol: string) {
+  void router.push({ path: `/levels/${symbol}`, query: { tf: store.timeframe } });
+}
 
 // Grid layout: columns × rows, chosen via the dropdown picker (max 5×5) and
 // persisted so the choice sticks. Page size = columns × rows.

@@ -1,9 +1,13 @@
 <template>
   <q-card class="bg-dark level-card column" flat>
     <q-card-section class="q-py-sm q-px-md row items-center justify-between no-wrap level-header">
-      <div class="row items-center no-wrap ellipsis">
+      <div
+        class="row items-center no-wrap ellipsis cursor-pointer symbol-link"
+        @click="emit('open', entry.symbol)"
+      >
         <span class="text-title-color text-weight-bold">{{ entry.symbol }}</span>
         <span class="q-ml-sm text-grey-5 text-caption">NATR {{ entry.natr.toFixed(2) }}%</span>
+        <q-tooltip :delay="400">Открыть страницу монеты</q-tooltip>
       </div>
       <div class="row items-center no-wrap q-gutter-x-sm text-caption">
         <q-chip
@@ -50,6 +54,10 @@ import { fetchKlines } from 'src/stores/levels/api/binanceKlines';
 import { subscribeKline, type LiveCandle } from 'src/stores/levels/api/klineStream';
 
 const props = defineProps<{ entry: ScreenerEntry; timeframe: string }>();
+
+// Emitted when the header is clicked — the screener page navigates to the coin
+// detail page. Left unhandled on the detail page itself (no re-navigation).
+const emit = defineEmits<{ open: [symbol: string] }>();
 
 // Candles shown by default; older bars lazy-load on scroll (HISTORY_BATCH).
 const CANDLE_LIMIT = 400;
@@ -397,6 +405,10 @@ onBeforeUnmount(() => {
 .level-header
   border-bottom: 1px solid $blue-dark
   min-height: 36px
+
+// Header symbol acts as a link to the coin detail page.
+.symbol-link:hover .text-title-color
+  text-decoration: underline
 
 .chart-container
   position: absolute

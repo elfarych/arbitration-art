@@ -71,6 +71,125 @@ export const ScreenerResponse = Type.Object(
 
 export const TimeframesResponse = Type.Array(Type.String(), { $id: 'TimeframesResponse' });
 
+export const AnalysisBreakout = Type.Object(
+  {
+    price: Type.Number({ description: 'Цена уровня' }),
+    levelTime: Type.Integer({ description: 'Формирование уровня — открытие свечи-экстремума (мс)' }),
+    kind: Type.Union([Type.Literal('top'), Type.Literal('bottom')], {
+      description: 'top — пробой сопротивления вверх, bottom — пробой поддержки вниз',
+    }),
+    direction: Type.Union([Type.Literal('up'), Type.Literal('down')], {
+      description: 'Направление пробоя',
+    }),
+    touches: Type.Integer({ description: 'Число касаний уровня до пробоя' }),
+    breakoutCandleTime: Type.Integer({ description: 'Открытие свечи первого пробоя (мс)' }),
+    crossTime: Type.Union([Type.Integer(), Type.Null()], {
+      description: 'Трейд, первым вышедший за уровень (мс); null — за свечу трейда за уровнем не было',
+    }),
+    reachTime: Type.Union([Type.Integer(), Type.Null()], {
+      description: 'Трейд, на котором достигнуто мин. движение (мс); null — не достигнуто',
+    }),
+    elapsedMs: Type.Union([Type.Integer(), Type.Null()], {
+      description: 'Время от пересечения уровня до пикового движения (мс)',
+    }),
+    movePct: Type.Union([Type.Number(), Type.Null()], {
+      description: 'Пиковый ход за уровень в окне [cross, +maxBreakoutSeconds], %',
+    }),
+    matched: Type.Boolean({ description: 'Пробой соответствует параметрам' }),
+    reason: Type.String({
+      description: 'ok | no_trades | no_cross | min_move_not_reached | too_slow',
+    }),
+  },
+  { $id: 'AnalysisBreakout', description: 'Один пробой уровня и его проверка по трейдам' },
+);
+
+export const AnalysisResponse = Type.Object(
+  {
+    symbol: Type.String(),
+    timeframe: Type.String(),
+    params: Type.Object(
+      {
+        natrMultiplier: Type.Number(),
+        minGap: Type.Integer(),
+        direction: Type.Union([
+          Type.Literal('up'),
+          Type.Literal('down'),
+          Type.Literal('both'),
+        ]),
+        maxBreakoutSeconds: Type.Integer(),
+        minMovePct: Type.Number(),
+        candles: Type.Integer(),
+      },
+      { description: 'Эффективные параметры анализа (после дефолтов и кэпов)' },
+    ),
+    candlesAnalyzed: Type.Integer({ description: 'Сколько свечей реально загружено' }),
+    range: Type.Object(
+      {
+        from: Type.Integer({ description: 'Открытие первой свечи окна (мс)' }),
+        to: Type.Integer({ description: 'Открытие последней свечи окна (мс)' }),
+      },
+      { description: 'Временной диапазон проанализированных свечей' },
+    ),
+    summary: Type.Object(
+      {
+        breakoutsFound: Type.Integer({ description: 'Всего найдено пробоев в окне' }),
+        evaluated: Type.Integer({
+          description: 'Проверено по трейдам (исключая пробои без трейдов в окне)',
+        }),
+        matched: Type.Integer(),
+        unmatched: Type.Integer({ description: 'evaluated − matched' }),
+        matchRate: Type.Number({ description: 'matched / evaluated, 0..1' }),
+        byDirection: Type.Object({
+          up: Type.Object({ found: Type.Integer(), matched: Type.Integer() }),
+          down: Type.Object({ found: Type.Integer(), matched: Type.Integer() }),
+        }),
+      },
+      { description: 'Агрегированная статистика пробоев' },
+    ),
+    breakouts: Type.Array(Type.Ref(AnalysisBreakout), {
+      description: 'Все найденные пробои (слева направо по breakoutCandleTime)',
+    }),
+  },
+  { $id: 'AnalysisResponse', description: 'Результат анализа пробоев уровней по монете' },
+);
+
+export const AnalysisQuery = Type.Object({
+  natrMultiplier: Type.Optional(
+    Type.Number({
+      minimum: 0,
+      description: 'Погрешность зоны касания/пробоя в долях NATR (полоса = natr·natrMultiplier); нет — env-дефолт',
+    }),
+  ),
+  minGap: Type.Optional(
+    Type.Integer({
+      minimum: 1,
+      description: 'Минимальный разрыв в свечах между касаниями уровня; нет — env-дефолт',
+    }),
+  ),
+  direction: Type.Optional(
+    Type.Union([Type.Literal('up'), Type.Literal('down'), Type.Literal('both')], {
+      default: 'both',
+      description: 'Какие пробои анализировать',
+    }),
+  ),
+  maxBreakoutSeconds: Type.Optional(
+    Type.Integer({
+      minimum: 1,
+      default: 300,
+      description: 'Макс. время пробоя по трейдам, сек (от пересечения зоны до мин. движения)',
+    }),
+  ),
+  minMovePct: Type.Optional(
+    Type.Number({ minimum: 0, default: 0.5, description: 'Минимальное движение за уровень, %' }),
+  ),
+  candles: Type.Optional(
+    Type.Integer({
+      minimum: 61,
+      description: 'Сколько свечей анализировать; нет — env-дефолт, сверху ограничено ANALYSIS_MAX_CANDLES',
+    }),
+  ),
+});
+
 export const HealthResponse = Type.Object(
   {
     status: Type.Literal('ok'),
@@ -145,6 +264,9 @@ export const ScreenerQuery = Type.Object({
 export type ScreenerEntryType = Static<typeof ScreenerEntry>;
 export type SymbolDetailType = Static<typeof SymbolDetail>;
 export type ScreenerQueryType = Static<typeof ScreenerQuery>;
+export type AnalysisBreakoutType = Static<typeof AnalysisBreakout>;
+export type AnalysisResponseType = Static<typeof AnalysisResponse>;
+export type AnalysisQueryType = Static<typeof AnalysisQuery>;
 
 /** Общие модели для регистрации в Fastify (по $id ссылаются схемы маршрутов). */
 export const SHARED_MODELS = [
@@ -155,4 +277,6 @@ export const SHARED_MODELS = [
   TimeframesResponse,
   HealthResponse,
   ErrorResponse,
+  AnalysisBreakout,
+  AnalysisResponse,
 ];
