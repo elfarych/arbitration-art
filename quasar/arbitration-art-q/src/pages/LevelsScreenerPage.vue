@@ -1,0 +1,212 @@
+<template>
+  <q-page class="q-pa-md text-white column no-wrap">
+    <div class="row items-center q-gutter-x-sm q-mb-sm header-row">
+      <h4 class="q-my-none text-h6 text-weight-bold">Скринер уровней</h4>
+      <span v-if="updatedAt" class="text-caption text-grey-5">обновлено {{ updatedAt }}</span>
+
+      <q-space />
+
+      <div class="row items-center no-wrap q-gutter-x-xs">
+        <q-btn
+          v-for="tf in store.timeframes"
+          :key="tf"
+          :label="tf"
+          no-caps
+          dense
+          unelevated
+          :color="tf === store.timeframe ? 'primary' : 'dark'"
+          :text-color="tf === store.timeframe ? 'white' : 'grey-5'"
+          class="ctrl-btn"
+          @click="onTimeframe(tf)"
+        />
+      </div>
+
+      <div v-if="store.pageCount > 1" class="row items-center no-wrap q-gutter-x-xs">
+        <q-btn
+          flat
+          dense
+          round
+          icon="first_page"
+          color="grey-5"
+          :disable="store.page <= 1"
+          @click="onPage(1)"
+        >
+          <q-tooltip>На первую страницу</q-tooltip>
+        </q-btn>
+        <q-btn
+          flat
+          dense
+          round
+          icon="chevron_left"
+          color="grey-5"
+          :disable="store.page <= 1"
+          @click="onPage(store.page - 1)"
+        >
+          <q-tooltip>Назад</q-tooltip>
+        </q-btn>
+        <span class="text-grey-4 text-weight-medium q-px-xs">{{ store.page }}</span>
+        <q-btn
+          flat
+          dense
+          round
+          icon="chevron_right"
+          color="grey-5"
+          :disable="store.page >= store.pageCount"
+          @click="onPage(store.page + 1)"
+        >
+          <q-tooltip>Вперёд</q-tooltip>
+        </q-btn>
+      </div>
+
+      <LevelsFilters
+        :min-volume="store.minVolume"
+        :natr-multiplier="store.natrMultiplier"
+        :min-gap="store.minGap"
+        @apply="onParams"
+      />
+
+      <LevelsGridPicker :columns="columns" :rows="rows" :max="5" @select="onSelectGrid" />
+
+      <q-btn
+        unelevated
+        dense
+        no-caps
+        color="dark"
+        text-color="grey-5"
+        icon="refresh"
+        class="ctrl-btn"
+        :loading="store.loading"
+        @click="store.fetchScreener()"
+      >
+        <q-tooltip>Обновить</q-tooltip>
+      </q-btn>
+    </div>
+
+    <q-banner v-if="store.error" dense class="bg-negative text-white q-mb-md rounded-borders">
+      {{ store.error }}
+    </q-banner>
+
+    <div v-if="store.loading && !store.entries.length" class="flex flex-center q-pa-xl">
+      <q-spinner color="primary" size="lg" />
+    </div>
+
+    <div v-else-if="!store.entries.length" class="text-center text-grey-5 q-pa-xl">
+      Нет данных по выбранному таймфрейму
+    </div>
+
+    <div v-else class="levels-grid" :style="{ '--cols': columns, '--rows': rows }">
+      <LevelChartCard
+        v-for="entry in store.entries"
+        :key="entry.symbol"
+        :entry="entry"
+        :timeframe="store.timeframe"
+      />
+    </div>
+  </q-page>
+</template>
+
+<script setup lang="ts">
+import { ref, computed, onMounted } from 'vue';
+import { useLevelsStore } from 'src/stores/levels/levels.store';
+import LevelChartCard from 'src/components/levels/LevelChartCard.vue';
+import LevelsGridPicker from 'src/components/levels/LevelsGridPicker.vue';
+import LevelsFilters from 'src/components/levels/LevelsFilters.vue';
+
+const store = useLevelsStore();
+
+// Grid layout: columns × rows, chosen via the dropdown picker (max 5×5) and
+// persisted so the choice sticks. Page size = columns × rows.
+const GRID_MAX = 5;
+const GRID_COLS_KEY = 'levels.gridColumns';
+const GRID_ROWS_KEY = 'levels.gridRows';
+
+function loadAxis(key: string, fallback: number): number {
+  const stored = Number(localStorage.getItem(key));
+  return Number.isInteger(stored) && stored >= 1 && stored <= GRID_MAX ? stored : fallback;
+}
+const columns = ref<number>(loadAxis(GRID_COLS_KEY, 2));
+const rows = ref<number>(loadAxis(GRID_ROWS_KEY, 3));
+
+async function onSelectGrid({ columns: c, rows: r }: { columns: number; rows: number }) {
+  columns.value = c;
+  rows.value = r;
+  localStorage.setItem(GRID_COLS_KEY, String(c));
+  localStorage.setItem(GRID_ROWS_KEY, String(r));
+  await store.setPageSize(c * r);
+}
+
+// Calculation params (volume / NATR tolerance / touch gap) are held in the store
+// and persisted so the choice sticks across reloads.
+const PARAM_MIN_VOLUME_KEY = 'levels.minVolume';
+const PARAM_NATR_MULT_KEY = 'levels.natrMultiplier';
+const PARAM_MIN_GAP_KEY = 'levels.minGap';
+
+function loadNumber(key: string, fallback: number): number {
+  const raw = localStorage.getItem(key);
+  if (raw === null) return fallback;
+  const value = Number(raw);
+  return Number.isFinite(value) ? value : fallback;
+}
+
+async function onParams(p: { minVolume: number; natrMultiplier: number; minGap: number }) {
+  localStorage.setItem(PARAM_MIN_VOLUME_KEY, String(p.minVolume));
+  localStorage.setItem(PARAM_NATR_MULT_KEY, String(p.natrMultiplier));
+  localStorage.setItem(PARAM_MIN_GAP_KEY, String(p.minGap));
+  await store.setParams(p);
+}
+
+// Wall-clock time of the last manual refresh (no live ticking — updates only
+// when the data is refetched).
+const updatedAt = computed(() => {
+  if (!store.fetchedAt) return '';
+  return new Date(store.fetchedAt).toLocaleTimeString('ru-RU');
+});
+
+async function onTimeframe(timeframe: string) {
+  await store.setTimeframe(timeframe);
+}
+
+async function onPage(page: number) {
+  await store.setPage(page);
+}
+
+onMounted(async () => {
+  // Apply the persisted grid size and calculation params before the first fetch
+  // so the page loads the right charts and screen immediately. Data refreshes
+  // only on manual action (refresh button, timeframe/grid/page/param change) —
+  // no background polling.
+  store.pageSize = columns.value * rows.value;
+  store.minVolume = loadNumber(PARAM_MIN_VOLUME_KEY, store.minVolume);
+  store.natrMultiplier = loadNumber(PARAM_NATR_MULT_KEY, store.natrMultiplier);
+  store.minGap = loadNumber(PARAM_MIN_GAP_KEY, store.minGap);
+  await store.fetchTimeframes();
+  await store.fetchScreener();
+});
+</script>
+
+<style lang="sass" scoped>
+// Uniform header control buttons (timeframe + refresh): even width, modest
+// radius — a clean restrained set, not chunky pills or round icons.
+.ctrl-btn
+  min-width: 40px
+  border-radius: 6px
+
+// Fill the remaining viewport height so all rows fit without page scroll;
+// min-height:0 lets the grid shrink instead of overflowing the flex column.
+.levels-grid
+  flex: 1 1 0
+  min-height: 0
+  display: grid
+  grid-template-columns: repeat(var(--cols, 2), minmax(0, 1fr))
+  grid-template-rows: repeat(var(--rows, 3), minmax(0, 1fr))
+  gap: 8px
+
+// On phones a viewport-fit grid of N rows is unusable: fall back to a single
+// scrollable column with a sane fixed row height.
+@media (max-width: 599.98px)
+  .levels-grid
+    flex: none
+    grid-template-columns: minmax(0, 1fr)
+    grid-template-rows: none
+    grid-auto-rows: 280px
+</style>

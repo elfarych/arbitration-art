@@ -1617,6 +1617,66 @@ Actions:
 
 Один setInterval с шагом `SCAN_INTERVAL_MS = 30s`, общий на всё приложение (store — singleton Pinia). Интервал выбран с запасом по weight-лимитам Binance (`/ticker/24hr` без symbol = weight 40), особенно с учётом того, что на prod все пользователи идут к биржам через один IP nginx-прокси. При `stopPolling` (logout / unmount MainLayout) таймер и таймеры auto-dismiss уведомлений останавливаются.
 
+## 25B. Levels screener (скринер уровней)
+
+Раздел показывает монеты, отсортированные по близости к горизонтальным уровням, в виде свечных графиков с разметкой уровней. Бэкенд — сервис `levels-api` из `art-level-screener` (отдельный от Django), контракт: `art-level-screener/services/levels-api/API.md`.
+
+Не путать с §25 «Screener store» (сканер спредов между биржами) и §25A (плавающий виджет) — это другая фича.
+
+### 25B.1. Файлы
+
+- `src/pages/LevelsScreenerPage.vue` — страница (route `/levels`, пункт меню «Уровни» в `MainLayout`). Всё в одной шапке-строке: заголовок + время последнего обновления + кнопки ТФ (отдельные `q-btn`, активная — primary, остальные — тёмные) + **пагинация** (компактная: «на первую» + назад/вперёд + только номер текущей страницы, без списка всех) + фильтры расчёта `LevelsFilters` (объём ≥ в M$, погрешность в NATR, свечей между касаниями) + грид-пикер `LevelsGridPicker` (выбор **колонки × ряды**, максимум 5×5) + кнопка обновления (иконка). Размер страницы = `columns × rows` (см. `pageSize` в сторе) — запрашивается ровно столько графиков, сколько в сетке. Вёрстка — CSS grid (`grid-template-columns: repeat(var(--cols), …)`, `grid-template-rows: repeat(var(--rows), minmax(0,1fr))`); q-page — flex-колонка, сетка `flex: 1` заполняет оставшуюся высоту вьюпорта, поэтому **все ряды видны без вертикального скролла** (высота карточек выводится из сетки, не фиксированная). На телефоне (`<600px`) — коллапс в 1 скроллируемую колонку с фикс-высотой ряда. Выбор сетки и параметры расчёта сохраняются в `localStorage` (`levels.gridColumns`, `levels.gridRows`, `levels.minVolume`, `levels.natrMultiplier`, `levels.minGap`).
+- `src/components/levels/LevelChartCard.vue` — одна карточка-график (свечи + уровни-лучи от времени появления). Свечи обновляются в реальном времени через kline-WS (см. §25B.4).
+- `src/components/levels/LevelsGridPicker.vue` — выпадающий грид-пикер (как «вставка таблицы»): 5×5 ячеек, подсветка `columns × rows` при наведении, `@select` отдаёт выбор. Иконка-кнопка показывает текущие `C × R`.
+- `src/components/levels/LevelsFilters.vue` — три компактных поля в шапке: объём (в M$, контракт — raw USDT), погрешность (NATR), свечей между касаниями. Привязан к стору через props; применяет по Enter/blur, эмитит `@apply` с тройкой значений (по одному пересчёту, не на каждый символ). Пустые/невалидные значения нормализуются (объём → 0/выкл, остальное → к текущему).
+- `src/stores/levels/levels.store.ts` — Pinia Options Store (`useLevelsStore`).
+- `src/stores/levels/api/levelsApi.ts` — клиент `levels-api` (отдельный axios instance, без auth) + типы `LevelView`/`ScreenerEntry`/`ScreenerPage`.
+- `src/stores/levels/api/binanceKlines.ts` — REST-снапшот свечей Binance Futures через прокси `/binance-api` (стартовая загрузка + lazy-load истории).
+- `src/stores/levels/api/klineStream.ts` — общий WebSocket-менеджер live-свечей Binance Futures (combined streams). Один сокет на весь грид с reference-counted подписками по `<symbol>@kline_<tf>`, авто-reconnect c backoff и resubscribe. API: `subscribeKline(symbol, interval, listener) => unsubscribe`.
+
+### 25B.2. Данные и контракт
+
+- **Уровни и список монет** — из `levels-api`:
+  - `GET /timeframes` → `string[]` (доступные ТФ);
+  - `GET /screener/:tf?sort=distance&order=asc&limit=20&offset=N` → `{ timeframe, total, count, items: ScreenerEntry[] }`. Список уже отсортирован по близости (`distanceNatr ↑`). `ScreenerEntry.levels` — все активные уровни монеты; `nearest` — ближайший. Сервис считает экран **под запрос** из свечей коннектора — каждый ответ свежий.
+  - **Параметры расчёта** в query (задаются в шапке через `LevelsFilters`): `minVolume` (минимальный оборот в USDT, пре-фильтр; опускается/0 — выкл), `natrMultiplier` (погрешность зоны касания), `minGap` (свечей между касаниями). Опущенные → дефолты сервера.
+  - База — `process.env.LEVELS_API_URL` (см. §28). CORS на сервисе по умолчанию `*`.
+- **Свечи (OHLC)** — два источника, как в фиче exchanges (§24):
+  - **REST-снапшот + история** — `/binance-api/fapi/v1/klines` через прокси (`binanceKlines.ts`): стартовая загрузка `CANDLE_LIMIT` свечей и lazy-load старших батчей.
+  - **Live-обновления** — combined-stream WebSocket напрямую на `wss://fstream.binance.com/market/stream`, подписка `<symbol>@kline_<tf>` через `SUBSCRIBE`/`UNSUBSCRIBE` (`klineStream.ts`). Путь именно `/market/stream`: `/ws` принимает подписку, но данные больше не шлёт — отдаёт только `/market/stream` (так же, как в коннекторе `art-level-screener`). WS подключается к бирже напрямую (у WS нет CORS; прокси нужен только REST). Один сокет мультиплексирует все карточки грида.
+  - Свечи — только визуальный контекст; смысловые данные (уровни) приходят с бэкенда. Symbol из `ScreenerEntry.symbol` уже в формате `BTCUSDT`, ТФ совпадает с интервалом Binance.
+
+### 25B.3. Store
+
+Options Store `levels`. State: `timeframes`, `timeframe`, `entries`, `total`, `page` (1-based), `pageSize` (= `columns × rows`, дефолт `LEVELS_DEFAULT_PAGE_SIZE = 6`), параметры расчёта `minVolume` / `natrMultiplier` / `minGap` (дефолты `LEVELS_DEFAULT_MIN_VOLUME = 0` / `LEVELS_DEFAULT_NATR_MULTIPLIER = 0.3` / `LEVELS_DEFAULT_MIN_GAP = 12`, совпадают с env-дефолтами сервиса), `loading`, `error`, `fetchedAt`. Getter `pageCount = ceil(total / pageSize)`. Пагинация серверная (`limit = pageSize`, `offset = (page-1)*pageSize`); параметры расчёта уходят в тот же запрос (`minVolume` — только если `> 0`). Actions: `fetchTimeframes` (выбирает первый ТФ, если текущий невалиден), `fetchScreener` (грузит страницу скринера), `setTimeframe` (сброс на стр. 1), `setPage`, `setPageSize` (смена сетки → сброс на стр. 1 + перезапрос), `setParams` (применяет объём/погрешность/minGap, сброс на стр. 1 + перезапрос; no-op, если ничего не изменилось). Ошибки — через общий `extractApiErrorMessage` (§утиль).
+
+### 25B.4. Обновление данных
+
+Разделено на два слоя:
+
+- **Свечи — live (WebSocket).** Каждая карточка после REST-снапшота подписывается на kline-WS (`subscribeKline`, см. §25B.2) и обновляет график в реальном времени: формирующаяся свеча тикает (`candleSeries.update`), на закрытии добавляется новая. Подписка переустанавливается при смене ТФ, снимается при размонтировании карточки. Текущей цены в шапке карточки нет — актуальная цена видна на ценовой шкале графика (priceLine).
+- **Уровни и список монет — без авто-поллинга.** `entries`/уровни/`nearest`/NATR обновляются только по действию пользователя: кнопка обновления (иконка `refresh` в шапке), смена ТФ, сетки или страницы пагинации. Время в шапке страницы (`updatedAt`, `HH:MM:SS`) — момент последней такой загрузки, без живого тикания. Лучи уровней перерисовываются in-place при замене `entry` (watch), без перезагрузки свечей.
+
+REST-свечи перезагружаются при смене ТФ/страницы; смена сетки без изменения числа карточек (напр. 2×3 → 3×2) только перекладывает грид без запроса.
+
+### 25B.5. График (lightweight-charts v5)
+
+`LevelChartCard` использует API **v5**: `chart.addSeries(CandlestickSeries, …)` (не v4 `addCandlestickSeries`). Каждый уровень рисуется **лучом от времени появления** (`LevelView.time`, открытие свечи-экстремума) **до правого края графика** — это отдельный line-series из двух точек на одной цене `[{time: появление}, {time: правый край}]` (support — зелёный, resistance — красный, тонкая **полупрозрачная сплошная** линия, `rgba(...,0.5)`). Уровни рисуются **без подписей** (`title`/`lastValueVisible` выключены) — чистые лучи; дистанция ближайшего уровня — в чипе шапки карточки: **NATR и проценты** (`«1.12 NATR · 3.29%»`; при `natr = 0` только проценты), цвет чипа = сторона (`support`/`resistance`), без слов «поддержка/сопротивление». Шапка карточки: слева **символ + NATR монеты** (`entry.natr`), справа — чип дистанции; отдельной текущей цены в шапке нет. Время начала клампится в окно загруженных свечей (уровни старше левого края / без валидного `time` начинаются от левого края). Чтобы луч доходил **ровно до правого края** при наличии отступа справа: `RIGHT_OFFSET` хвостовых **whitespace-баров** живут в **отдельной невидимой line-серии** (`whitespaceSeries`, `applyWhitespace`), а свечная серия держит **только реальные свечи**. Whitespace резервирует тайм-слоты правого отступа, `timeScale.rightOffset = 0`, поэтому последний whitespace-бар = правый край, и `rayTimes.end = rightEdgeTime()` (= последний whitespace) дотягивает луч туда. Разделение серий критично для live-режима: `candleSeries.update()` требует `time ≥` последней точки **своей** серии — будь whitespace в свечной серии, апдейт формирующейся свечи (её время раньше хвостовых баров) падал бы. `tfSeconds(timeframe)` кладёт whitespace и правый край на ту же временную сетку, что и свечи.
+
+**Live-свечи (WebSocket).** После загрузки REST-снапшота `loadCandles` вызывает `subscribeLive` → `subscribeKline(symbol, timeframe, onLiveCandle)` (см. §25B.2). `onLiveCandle`: тик с тем же временем открытия = формирующаяся свеча → `candleSeries.update()` (частый путь); новое время открытия = предыдущая свеча закрылась → append + сдвиг whitespace (`applyWhitespace`) + перерасчёт лучей (`applyLevels`, правый край уехал на бар вперёд); более старые тики игнорируются. Локальный массив `candles` держится в синхроне (нужен для lazy-load и `rayTimes`). Подписка пересоздаётся в `loadCandles` (смена ТФ), снимается в `onBeforeUnmount` (до `chart.remove()`, чтобы тик не попал на удалённый график). Так как это видимые line-series, они сами тянут ценовую шкалу к уровням — отдельный «якорный» series не нужен (далёкие уровни остаются в кадре через autoscale).
+
+`priceFormat` (precision/minMove) свечного и level-series выводится из величины цены монеты (`priceFormat()`): дефолт lightweight-charts (precision 2 / minMove 0.01) показывал бы дешёвые монеты (напр. `0.0001234`) как `0` на ценовой шкале — для sub-cent цен берётся больше знаков. Текст ценовой/временной осей и линия текущей цены — светло-серые (`PRICE_GRAY`, `layout.textColor` + `priceLineColor`). Отступ справа делают хвостовые whitespace-бары (см. выше), `timeScale.rightOffset = 0`; `fitContent` не вызывается — график скроллится/зумится.
+
+**Свечи и стартовый вид.** По умолчанию грузится и показывается `CANDLE_LIMIT = 400` свечей; `loadCandles` сразу показывает их все через `setVisibleLogicalRange({from: 0, to: length-1 + RIGHT_OFFSET})` плюс небольшой отступ справа `RIGHT_OFFSET = 8` баров (старшая история догружается lazy-load при скролле влево).
+
+**Лучи до ценовой шкалы.** Луч заканчивается в `rightEdgeTime()` (= последний whitespace-бар у правого края). Так как луч — горизонтальный отрезок на цене уровня от времени появления до правого края, при скролле в историю (влево) он перекрывает всю ширину видимой области и доходит до ценовой шкалы. `fixRightEdge` **не включаем**: он трактует хвостовые whitespace-бары как пустоту правее последней реальной свечи и не даёт их показать — из-за этого схлопывается правый отступ (`setVisibleLogicalRange(..., to: length-1+RIGHT_OFFSET)` клампится к последней свече).
+
+**Lazy-load истории.** `buildChart` подписывается на `subscribeVisibleLogicalRangeChange`: когда видимый диапазон уходит **левее самой старой загруженной свечи** (`barsInLogicalRange().barsBefore < 0` — слева появляется пустота от скролла/зума), `loadMoreHistory()` тянет старший батч (`HISTORY_BATCH = 500`, `fetchKlines(..., endTime = oldest-1)`), префиксует к серии и **сдвигает видимый logical range на число добавленных баров**, чтобы кадр не прыгнул. Порог `< 0` (а не упреждающий буфер) выбран намеренно: иначе стартовый показ всех 500 (левый край = первая свеча) тут же дёргал бы догрузку на маунте. Гарды: `loadingMore` (без гонок), `noMoreHistory` (биржа отдала пусто → стоп). Флаги сбрасываются в `loadCandles` при смене ТФ/символа.
+
+`:key="entry.symbol"` (стабильный инстанс графика при переупорядочивании). Watch: смена `timeframe` → перезагрузка свечей; смена `entry` (перезапрос данных) → пересоздание series-лучей (`chart.removeSeries` + заново) без перезагрузки свечей. Очистка `chart.remove()` в `onBeforeUnmount`.
+
+> Примечание: существующий `SpreadHistoryDialog.vue` (§22) всё ещё использует v4-метод `addLineSeries`, которого нет в установленной `lightweight-charts@5.1.0` — это предсуществующий баг того компонента (не покрывается esbuild-сборкой, т.к. типы не проверяются). Новый раздел уровней написан на корректном v5 API.
+
 ## 26. Styling and theme
 
 ### 26.1. Variables
@@ -1716,23 +1776,37 @@ Response assumptions:
 - Decimal fields can be parsed as numbers or are already numeric.
 - JWT header is `Authorization: Bearer <access>`.
 
+### 27.1. Levels API (art-level-screener)
+
+Раздел уровней (§25B) ходит в отдельный сервис `levels-api` под `process.env.LEVELS_API_URL` (не Django, без auth, CORS `*`). Контракт целиком — `art-level-screener/services/levels-api/API.md`. Используемые эндпоинты:
+
+- `GET /timeframes`
+- `GET /screener/{tf}` (query: `sort`, `order`, `limit`, `offset`, опц. `side`, `maxDistanceNatr`, `minActive`, `search`)
+- `GET /screener/{tf}/{symbol}` (детали монаты; в разделе пока не используется)
+
+Свечи для графиков берутся напрямую с Binance через прокси `/binance-api` (§24, §28.1) и не входят в контракт `levels-api`.
+
 ## 28. Environment
 
 `.env` для разработки и `.env.example` как шаблон находятся в корне Quasar-проекта.
 
-Используемая переменная:
+Используемые переменные:
 
 ```ts
-process.env.API_URL
+process.env.API_URL          // Django REST API
+process.env.LEVELS_API_URL   // art-level-screener levels-api (раздел уровней, §25B)
 ```
 
 Локальный `.env` (dev):
 
 ```env
 API_URL=http://127.0.0.1:8000/api
+LEVELS_API_URL=http://127.0.0.1:3000
 ```
 
-Должен совпадать с `arbitration-art-django/.env` host/port и `/api` prefix из `arbitration_art_django/urls.py`. Если `API_URL` не задан, Axios baseURL = `undefined` и запросы становятся относительными от origin фронта — в production это сломает все API вызовы.
+`API_URL` должен совпадать с `arbitration-art-django/.env` host/port и `/api` prefix из `arbitration_art_django/urls.py`. Если `API_URL` не задан, Axios baseURL = `undefined` и запросы становятся относительными от origin фронта — в production это сломает все API вызовы.
+
+`LEVELS_API_URL` — база сервиса `levels-api` (host/port из его `.env`, без `/api`-префикса). Дефолт в коде — `http://127.0.0.1:3000`. Сервис должен быть доступен из браузера с CORS, разрешающим origin фронта, и по HTTPS, если фронт под HTTPS (иначе mixed content). Как и `API_URL`, переменная **build-time** (см. §28.1): на проде задаётся build-arg-ом, иначе в бандл попадёт localhost-дефолт. Альтернатива на будущее — проксировать `levels-api` через nginx тем же приёмом, что и биржевые прокси (§28.1), и ходить same-origin.
 
 Quasar для browser-side env инжектит через `quasar.config.ts build.env`. Сейчас build.env не настроен явно, переменная попадает через стандартный dotenv pipeline Quasar (`.env` + `process.env.*`).
 

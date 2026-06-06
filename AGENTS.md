@@ -13,7 +13,11 @@
 - не делай quick-and-dirty фиксы без явного согласования;
 - учитывай edge cases, ошибки сети, гонки, восстановление после сбоев и безопасность;
 - используй строгую типизацию в TypeScript и type hints в Python там, где это уместно;
-- не ломай существующие пользовательские изменения и не откатывай чужие правки без прямой просьбы.
+- не ломай существующие пользовательские изменения и не откатывай чужие правки без прямой просьбы;
+- следи за производительностью: алгоритмическая сложность, лишние re-render/перерасчёты, N+1-запросы, аллокации на горячем пути;
+- **спорь и предлагай лучшее**: видишь более удачное решение, риск или возможность улучшения — скажи, аргументируй, оспорь при несогласии. Но не внедряй без согласования: сначала предложение → согласие пользователя → реализация;
+- не додумывай требования: при неоднозначности задай короткий уточняющий вопрос, а не угадывай;
+- без воды: отвечай коротко и по факту.
 
 ## 2. Язык
 
@@ -27,11 +31,12 @@
 
 ### 3.0 Scope активных приложений
 
-В задачах работаем **только** с тремя приложениями:
+В задачах работаем **только** с четырьмя приложениями:
 
 - `arbitration-bot-engine` (engine);
 - `arbitration-art-django` (django);
-- `quasar/arbitration-art-q` (frontend).
+- `quasar/arbitration-art-q` (frontend);
+- `art-level-screener` (levels — бэкенд расчёта горизонтальных уровней Binance Futures).
 
 Все остальные сервисы (`arbitration-trader`, `arbitration-ws-futures-trader`, `arbitration-scanner` и любые будущие out-of-scope-сервисы) **полностью игнорируем**: не читаем их код и `DOCS.md`, не предлагаем правки, не учитываем их контракты, не упоминаем в ответах. Считаем, что их в репозитории нет.
 
@@ -56,6 +61,7 @@
 | Django backend | `arbitration-art-django/DOCS.md` | Модели, API, auth, settings, Django admin, bot-engine sync |
 | Bot engine | `arbitration-bot-engine/DOCS.md` | Fastify engine, runtime bot lifecycle, exchange execution, integration with Django |
 | Quasar frontend | `quasar/arbitration-art-q/DOCS.md` | Quasar/Vue UI, Pinia stores, frontend API, exchange WebSockets |
+| Levels screener | `art-level-screener/DOCS.md` | Конвейер уровней Binance Futures: коннектор свечей → процессор → Fastify API, схема Redis, контракт для фронтенда |
 
 Если создается новое приложение в scope §3.0, добавь в него `DOCS.md` и обнови эту таблицу.
 
@@ -97,8 +103,17 @@
 arbitration-art/
 ├── arbitration-art-django/       # Django REST backend
 ├── arbitration-bot-engine/       # Fastify runtime engine for bot configs
-└── quasar/arbitration-art-q/     # Quasar/Vue frontend
+├── art-level-screener/           # Levels pipeline: connector → processor → Fastify API
+│   └── services/                 #   binance-futures-connector · levels-processor · levels-api
+├── quasar/arbitration-art-q/     # Quasar/Vue frontend
+└── ecosystem.config.cjs          # PM2: запуск backend (django + engine + levels), без фронта
 ```
+
+### 5.3 Локальный запуск через PM2
+
+`ecosystem.config.cjs` в корне поднимает backend одной командой `pm2 start ecosystem.config.cjs`: `django` (8000), `bot-engine` (3001), `levels-connector` / `levels-processor` / `levels-api` (3000). Фронтенд не входит (запускается отдельно через `quasar dev` / nginx).
+
+Запускает **скомпилированный** вывод (`dist/`), поэтому перед первым стартом и после изменений собрать сервисы (`npm run build` / `pnpm build`). Внешние зависимости PM2 не поднимает: Redis (для levels), PostgreSQL (`make db-up`) и миграции (`make migrate`) для Django. Детали — в шапке `ecosystem.config.cjs`.
 
 В репозитории физически присутствуют и другие директории (`arbitration-trader`, `arbitration-ws-futures-trader`, `arbitration-scanner`), но по правилу §3.0 они вне scope и не учитываются ни в чтении, ни в правках, ни в анализе контрактов.
 
@@ -109,8 +124,40 @@ arbitration-art/
 - **engine** → `arbitration-bot-engine`
 - **фронтенд** / **frontend** / **ui** → `quasar/arbitration-art-q`
 - **django** → `arbitration-art-django`
+- **скринер** / **уровни** / **levels** → `art-level-screener` (если контекст явно про экран фронтенда — раздел скринера в `quasar/arbitration-art-q`)
 
 Эти алиасы применяй автоматически: «правки в engine» = работа в `arbitration-bot-engine/`, «добавь в ui» = работа в `quasar/arbitration-art-q/`. Слово «trader» в scope §3.0 **не используется** — если пользователь его произнёс, по умолчанию считай, что речь про `arbitration-bot-engine` (runtime trader внутри engine), и уточни только если контекст явно указывает на out-of-scope сервис.
+
+### 5.2 art-level-screener (levels pipeline)
+
+Бэкенд расчёта горизонтальных уровней Binance USDⓈ-M Futures. Три независимых
+Node.js/TypeScript-сервиса в `art-level-screener/services/`, связанные через Redis:
+
+- `binance-futures-connector` — свечи Binance (REST snapshot + 1m WS, агрегация ТФ) → Redis;
+- `levels-processor` — раз в ~10с считает уровни из свечей → Redis;
+- `levels-api` — Fastify HTTP API поверх рассчитанных уровней (+ Swagger).
+
+Перед работой читать `art-level-screener/DOCS.md`; контракт API — `art-level-screener/services/levels-api/API.md`.
+
+Правила:
+
+- Строгий TypeScript, без `any`. Декомпозиция по слоям/ответственностям (как в существующем коде).
+- Контракт между сервисами — **ключи Redis** (см. схемы в `DOCS.md`); контракт наружу — **HTTP API** `levels-api`. Меняешь одну сторону — проверь вторую и обнови `DOCS.md`/`API.md`.
+- Согласование префиксов по цепочке: `REDIS_KEY_PREFIX` (connector) = `SOURCE_PREFIX` (processor); `OUTPUT_PREFIX` (processor) = `LEVELS_PREFIX` (api). Рассогласование → пустые экраны.
+- Формулы уровней (NATR-допуск, касания, active/broken, дистанция в NATR) и параметры (`PERIOD`, `MIN_TOUCHES`, `MIN_GAP`, `NATR_MULTIPLIER`, …) не меняй без явного объяснения и обновления `DOCS.md`.
+- Биржевые клиенты — **нативные** (undici/`ws`), **без `ccxt`** (правило §8.1). Сервис работает только с публичными данными Binance — exchange API keys не нужны и не должны появляться.
+- `levels-api` сейчас без аутентификации (внутренняя сеть). Не выставлять наружу без auth; при интеграции с фронтом ограничить `CORS_ORIGIN` до origin фронтенда.
+- `.env` сервисов — по правилам §10.1 (non-secret конфигурация; реальных ключей быть не должно).
+
+Проверка (TypeScript у каждого сервиса):
+
+```bash
+cd art-level-screener/services/<service>
+npm install
+npm run build      # или npx tsc --noEmit
+```
+
+Запуск требует доступного Redis и идёт в порядке потока данных: connector → processor → api.
 
 ## 6. Backend: Django правила
 
@@ -243,6 +290,8 @@ pnpm build
 - Django bot-engine sync payload -> `arbitration-bot-engine/src/classes/Engine.ts`.
 - Django real/emulation trades -> frontend dialogs, bot-engine.
 - Exchange enum/choices -> frontend exchange options and engine mappings.
+- `art-level-screener` Redis keys: connector (`binance-futures:*`) -> processor (`levels:*`) -> `levels-api` reader.
+- `levels-api` HTTP API (`/screener/:tf`, `/screener/:tf/:symbol`) -> раздел скринера во `quasar/arbitration-art-q` (контракт — `art-level-screener/services/levels-api/API.md`).
 
 Контрактные изменения всегда документировать в `DOCS.md` всех затронутых приложений.
 
@@ -268,7 +317,9 @@ pnpm build
 
 ### 10.1 Работа с `.env`-файлами
 
-Пользователь явно разрешает создавать и править `.env`-файлы в директориях сервисов в scope §3.0 (`arbitration-art-django/.env`, `arbitration-bot-engine/.env`, `quasar/arbitration-art-q/.env*`), если это нужно для того, чтобы сервисы работали в связке без ручной настройки с его стороны. Это исключение из общего правила «не трогать `.env`» и распространяется **только** на этот репозиторий и **только** на сервисы в scope.
+Пользователь явно разрешает создавать и править `.env`-файлы в директориях сервисов в scope §3.0 (`arbitration-art-django/.env`, `arbitration-bot-engine/.env`, `quasar/arbitration-art-q/.env*`, `art-level-screener/services/*/.env`), если это нужно для того, чтобы сервисы работали в связке без ручной настройки с его стороны. Это исключение из общего правила «не трогать `.env`» и распространяется **только** на этот репозиторий и **только** на сервисы в scope.
+
+Делай это **проактивно и по умолчанию, не переспрашивая на каждое изменение**: при настройке/запуске сервисов сам создавай недостающие `.env` (копией из `.env.example`), заполняй рабочими dev-значениями, согласовывай общие значения между сервисами и генерируй dev-токены (`openssl rand -hex 32`). Цель — пользователь не настраивает env руками. Границы ниже (реальные биржевые ключи, production-секреты, не коммитить `.env`, не печатать секреты) остаются в силе.
 
 Что можно менять без отдельного подтверждения:
 

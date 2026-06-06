@@ -13,6 +13,7 @@
         <div class="row q-gutter-sm q-mr-md text-weight-medium">
           <q-btn flat no-caps label="Мои боты" to="/" />
           <q-btn flat no-caps label="Скринер" text-color="warning" to="/screener" />
+          <q-btn flat no-caps label="Уровни" to="/levels" />
         </div>
 
         <div v-if="authStore.currentUser" class="flex flex-center cursor-pointer q-pa-sm user-info" @click="goToProfile">
