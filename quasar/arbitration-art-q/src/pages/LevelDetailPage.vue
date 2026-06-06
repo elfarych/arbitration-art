@@ -30,7 +30,6 @@
       :loading="analysis.listLoading"
       :selected-id="analysis.selected?.id ?? null"
       @select="onSelect"
-      @remove="onRemove"
     />
 
     <div class="col column no-wrap">
@@ -108,10 +107,6 @@ function persistSettings() {
 
 function onSelect(id: number) {
   void analysis.select(id);
-}
-
-function onRemove(id: number) {
-  void analysis.remove(id);
 }
 
 function onRun(next: AnalysisSettings) {

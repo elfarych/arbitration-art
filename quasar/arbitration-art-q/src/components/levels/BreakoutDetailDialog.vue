@@ -1,6 +1,10 @@
 <template>
-  <q-dialog :model-value="modelValue" @update:model-value="emit('update:modelValue', $event)">
-    <q-card class="bg-dark text-white breakout-dialog" flat bordered>
+  <q-dialog
+    :model-value="modelValue"
+    maximized
+    @update:model-value="emit('update:modelValue', $event)"
+  >
+    <q-card class="bg-dark text-white breakout-dialog column no-wrap" flat bordered>
       <q-card-section class="row items-center no-wrap q-py-sm">
         <div class="column">
           <span class="text-subtitle1 text-weight-bold">
@@ -15,9 +19,9 @@
 
       <q-separator color="blue-dark" />
 
-      <q-card-section class="charts">
+      <q-card-section class="charts col">
         <MiniBreakoutChart
-          class="chart-block"
+          class="chart-top"
           :title="`Пробой · ${timeframe}`"
           :candles="tfCandles"
           :level-price="level"
@@ -25,17 +29,29 @@
           :loading="tfLoading"
           :error="tfError"
         />
-        <MiniBreakoutChart
-          class="chart-block"
-          title="Посекундно (по трейдам)"
-          :candles="secCandles"
-          :level-price="level"
-          :markers="secMarkers"
-          :seconds-visible="true"
-          :loading="secLoading"
-          :error="secError"
-          :empty-text="secEmptyText"
-        />
+        <div class="charts-bottom">
+          <MiniBreakoutChart
+            class="chart-block"
+            title="Посекундно (по трейдам)"
+            :candles="secCandles"
+            :level-price="level"
+            :markers="secMarkers"
+            :seconds-visible="true"
+            :loading="tradesLoading"
+            :error="tradesError"
+            :empty-text="secEmptyText"
+          />
+          <MiniTickChart
+            class="chart-block"
+            title="Тиковый (по трейдам)"
+            :points="tickPoints"
+            :level-price="level"
+            :markers="tickMarkers"
+            :loading="tradesLoading"
+            :error="tradesError"
+            :empty-text="secEmptyText"
+          />
+        </div>
       </q-card-section>
     </q-card>
   </q-dialog>
@@ -43,11 +59,12 @@
 
 <script setup lang="ts">
 import { ref, computed, watch } from 'vue';
-import type { CandlestickData, SeriesMarker, UTCTimestamp } from 'lightweight-charts';
+import type { CandlestickData, LineData, SeriesMarker, UTCTimestamp } from 'lightweight-charts';
 import type { AnalysisBreakout } from 'src/stores/levels/api/levelsApi';
 import { fetchKlines } from 'src/stores/levels/api/binanceKlines';
-import { fetchAggTradeCandles } from 'src/stores/levels/api/binanceAggTrades';
+import { fetchAggTradeSeries } from 'src/stores/levels/api/binanceAggTrades';
 import MiniBreakoutChart from './MiniBreakoutChart.vue';
+import MiniTickChart from './MiniTickChart.vue';
 
 const props = defineProps<{
   modelValue: boolean;
@@ -68,9 +85,12 @@ const SEC_PAD_MS = 20_000;
 const tfCandles = ref<CandlestickData[]>([]);
 const tfLoading = ref(false);
 const tfError = ref('');
+// Per-second candles and the raw tick line share one trades fetch (loadTrades),
+// so they share loading/error state.
 const secCandles = ref<CandlestickData[]>([]);
-const secLoading = ref(false);
-const secError = ref('');
+const tickPoints = ref<LineData[]>([]);
+const tradesLoading = ref(false);
+const tradesError = ref('');
 
 const level = computed(() => props.breakout?.price ?? 0);
 const isUp = computed(() => props.breakout?.direction === 'up');
@@ -137,6 +157,51 @@ const secEmptyText = computed(() =>
     : 'Нет трейдов в окне пробоя',
 );
 
+// Time of the tick nearest to a target (ms). Tick times are seconds with a ms
+// fraction and never line up with crossTime/reachTime exactly, so markers snap
+// to the closest existing point (line-series markers must sit on a data point).
+// Points are ascending — stop once the gap starts growing past the target.
+function nearestTickTime(points: LineData[], targetMs: number): UTCTimestamp | null {
+  const targetSec = targetMs / 1000;
+  let best: number | null = null;
+  let bestDiff = Infinity;
+  for (const p of points) {
+    const t = p.time as number;
+    const diff = Math.abs(t - targetSec);
+    if (diff < bestDiff) {
+      bestDiff = diff;
+      best = t;
+    } else if (t > targetSec) {
+      break;
+    }
+  }
+  return best as UTCTimestamp | null;
+}
+
+// Same breakout/target markers as the per-second chart, but placed on the
+// nearest tick so the cross/reach points are visible on the tick line too.
+const tickMarkers = computed<SeriesMarker<UTCTimestamp>[]>(() => {
+  const b = props.breakout;
+  const points = tickPoints.value;
+  if (!b || b.crossTime === null || points.length === 0) return [];
+  const side = isUp.value ? 'belowBar' : 'aboveBar';
+  const shape = isUp.value ? 'arrowUp' : 'arrowDown';
+  const crossT = nearestTickTime(points, b.crossTime);
+  const reachT = b.reachTime !== null ? nearestTickTime(points, b.reachTime) : null;
+  if (crossT === null) return [];
+  // Cross and reach snapped to the same tick → one combined marker.
+  if (reachT !== null && reachT === crossT) {
+    return [{ time: crossT, position: side, color: '#83c764', shape, text: 'пробой → цель', size: 1 }];
+  }
+  const markers: SeriesMarker<UTCTimestamp>[] = [
+    { time: crossT, position: side, color: '#f5c542', shape: 'circle', text: 'пробой', size: 1 },
+  ];
+  if (reachT !== null) {
+    markers.push({ time: reachT, position: side, color: '#83c764', shape, text: 'цель', size: 1 });
+  }
+  return markers;
+});
+
 async function loadTf(): Promise<void> {
   const b = props.breakout;
   if (!b) return;
@@ -153,38 +218,43 @@ async function loadTf(): Promise<void> {
   }
 }
 
-async function loadSeconds(): Promise<void> {
+async function loadTrades(): Promise<void> {
   const b = props.breakout;
   if (!b) return;
   // Without a cross there is no breakout instant to zoom into — skip the fetch
-  // and let the chart show secEmptyText instead of a confusing sparse plot.
+  // and let the charts show secEmptyText instead of a confusing sparse plot.
   if (b.crossTime === null) {
     secCandles.value = [];
-    secError.value = '';
-    secLoading.value = false;
+    tickPoints.value = [];
+    tradesError.value = '';
+    tradesLoading.value = false;
     return;
   }
-  secLoading.value = true;
-  secError.value = '';
+  tradesLoading.value = true;
+  tradesError.value = '';
   try {
     const start = b.crossTime - SEC_PAD_MS;
     const end = b.crossTime + props.maxBreakoutSeconds * 1000 + SEC_PAD_MS;
-    secCandles.value = await fetchAggTradeCandles(props.symbol, start, end, 1000);
+    // One trades fetch feeds both the per-second candles and the tick line.
+    const { candles, ticks } = await fetchAggTradeSeries(props.symbol, start, end);
+    secCandles.value = candles;
+    tickPoints.value = ticks;
   } catch {
-    secError.value = 'Не удалось загрузить трейды';
+    tradesError.value = 'Не удалось загрузить трейды';
     secCandles.value = [];
+    tickPoints.value = [];
   } finally {
-    secLoading.value = false;
+    tradesLoading.value = false;
   }
 }
 
-// Load both charts when the dialog opens (or the selected breakout changes).
+// Load all charts when the dialog opens (or the selected breakout changes).
 watch(
   () => [props.modelValue, props.breakout] as const,
   ([open, breakout]) => {
     if (open && breakout) {
       void loadTf();
-      void loadSeconds();
+      void loadTrades();
     }
   },
   { immediate: true },
@@ -192,16 +262,38 @@ watch(
 </script>
 
 <style lang="sass" scoped>
+// Full-screen dialog: the card fills the viewport, the charts section grows to
+// take all remaining height under the header.
 .breakout-dialog
-  width: 820px
-  max-width: 94vw
+  width: 100%
+  height: 100%
   border-color: $blue-dark
 
 .charts
+  min-height: 0
   display: flex
   flex-direction: column
   gap: 12px
 
-.chart-block
-  height: 280px
+// Top chart full width (analysis timeframe), bottom row split into per-second
+// and tick charts. Heights come from the flex layout so all three fill the screen.
+.chart-top
+  flex: 1.1 1 0
+  min-height: 0
+
+.charts-bottom
+  flex: 1 1 0
+  min-height: 0
+  display: flex
+  gap: 12px
+
+  .chart-block
+    flex: 1 1 0
+    min-width: 0
+    min-height: 0
+
+// Narrow viewports: stack the bottom charts instead of squeezing them.
+@media (max-width: 700px)
+  .charts-bottom
+    flex-direction: column
 </style>

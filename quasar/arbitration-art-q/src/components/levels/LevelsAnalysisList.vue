@@ -16,7 +16,6 @@
         <div class="cell cell-num">Найдено</div>
         <div class="cell cell-num">Совпало</div>
         <div class="cell cell-num">Match</div>
-        <div class="cell cell-act"></div>
       </div>
 
       <div class="analyses-rows col scroll">
@@ -42,19 +41,6 @@
           <div class="cell cell-num text-primary">
             {{ (a.summary.matchRate * 100).toFixed(1) }}%
           </div>
-          <div class="cell cell-act">
-            <q-btn
-              flat
-              dense
-              round
-              size="sm"
-              icon="delete_outline"
-              color="grey-6"
-              @click.stop="emit('remove', a.id)"
-            >
-              <q-tooltip>Удалить анализ</q-tooltip>
-            </q-btn>
-          </div>
         </div>
       </div>
     </template>
@@ -71,7 +57,7 @@ defineProps<{
   selectedId: number | null;
 }>();
 
-const emit = defineEmits<{ select: [id: number]; remove: [id: number] }>();
+const emit = defineEmits<{ select: [id: number] }>();
 
 function fmtTime(iso: string): string {
   return new Date(iso).toLocaleString('ru-RU', {
@@ -145,9 +131,5 @@ function paramsLabel(a: SavedAnalysis): string {
 
 .cell-num
   flex: 1 1 0
-  text-align: right
-
-.cell-act
-  flex: 0 0 40px
   text-align: right
 </style>

@@ -30,6 +30,7 @@
       <div v-else-if="loading" class="chart-overlay">
         <q-spinner color="primary" size="md" />
       </div>
+      <ChartRulerOverlay :measure="measure" />
     </div>
   </q-card>
 </template>
@@ -52,6 +53,8 @@ import {
 import type { ScreenerEntry, LevelView, LevelSide } from 'src/stores/levels/api/levelsApi';
 import { fetchKlines } from 'src/stores/levels/api/binanceKlines';
 import { subscribeKline, type LiveCandle } from 'src/stores/levels/api/klineStream';
+import { useChartRuler } from './useChartRuler';
+import ChartRulerOverlay from './ChartRulerOverlay.vue';
 
 const props = defineProps<{ entry: ScreenerEntry; timeframe: string }>();
 
@@ -92,6 +95,16 @@ let noMoreHistory = false;
 // include far-away levels (no separate anchor series needed).
 let levelSeries: ISeriesApi<'Line'>[] = [];
 let candles: CandlestickData[] = [];
+
+// Shift ruler overlay (see useChartRuler). One bar spans the screener timeframe;
+// price decimals follow the coin's magnitude.
+const { measure, attach: attachRuler, detach: detachRuler } = useChartRuler({
+  container: chartContainer,
+  chart: () => chart,
+  series: () => candleSeries,
+  barSeconds: () => tfSeconds(props.timeframe),
+  pricePrecision: () => priceFormat().precision,
+});
 
 function sideColor(side: LevelSide): string {
   return side === 'support' ? 'positive' : 'negative';
@@ -364,6 +377,8 @@ async function loadMoreHistory(): Promise<void> {
 }
 
 onMounted(() => {
+  // Enable the Shift ruler once the container exists (chart is built lazily).
+  attachRuler();
   // Wait for the container to have a size before lightweight-charts measures it.
   void nextTick(() => loadCandles());
 });
@@ -384,6 +399,8 @@ onBeforeUnmount(() => {
   // Stop live updates first so no tick lands on a removed chart.
   unsubscribeKline?.();
   unsubscribeKline = null;
+  // Tear down the ruler (drops any window listeners it may still hold).
+  detachRuler();
   // chart.remove() drops all series; just reset our references.
   levelSeries = [];
   if (chart) {

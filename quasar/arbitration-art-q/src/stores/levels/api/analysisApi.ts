@@ -56,9 +56,4 @@ export const analysisApi = {
     const { data } = await api.get<SavedAnalysisDetail>(`/levels/analyses/${id}/`);
     return data;
   },
-
-  // Delete a saved analysis (DELETE /levels/analyses/:id/).
-  async remove(id: number): Promise<void> {
-    await api.delete(`/levels/analyses/${id}/`);
-  },
 };

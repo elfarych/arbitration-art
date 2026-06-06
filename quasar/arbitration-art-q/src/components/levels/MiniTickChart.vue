@@ -7,7 +7,7 @@
         <q-spinner color="primary" size="md" />
       </div>
       <div v-else-if="error" class="overlay text-negative text-caption">{{ error }}</div>
-      <div v-else-if="!candles.length" class="overlay text-grey-5 text-caption text-center q-px-md">
+      <div v-else-if="!points.length" class="overlay text-grey-5 text-caption text-center q-px-md">
         {{ emptyText ?? 'Нет данных' }}
       </div>
       <ChartRulerOverlay :measure="measure" />
@@ -19,7 +19,7 @@
 import { ref, watch, onMounted, onBeforeUnmount, nextTick } from 'vue';
 import {
   createChart,
-  CandlestickSeries,
+  LineSeries,
   createSeriesMarkers,
   ColorType,
   LineStyle,
@@ -27,7 +27,7 @@ import {
   type IChartApi,
   type ISeriesApi,
   type IPriceLine,
-  type CandlestickData,
+  type LineData,
   type SeriesMarker,
   type UTCTimestamp,
 } from 'lightweight-charts';
@@ -36,10 +36,9 @@ import ChartRulerOverlay from './ChartRulerOverlay.vue';
 
 const props = defineProps<{
   title: string;
-  candles: CandlestickData[];
+  points: LineData[];
   levelPrice: number;
   markers?: SeriesMarker<UTCTimestamp>[];
-  secondsVisible?: boolean;
   loading?: boolean;
   error?: string;
   emptyText?: string;
@@ -47,7 +46,7 @@ const props = defineProps<{
 
 const container = ref<HTMLElement | null>(null);
 let chart: IChartApi | null = null;
-let series: ISeriesApi<'Candlestick'> | null = null;
+let series: ISeriesApi<'Line'> | null = null;
 let priceLine: IPriceLine | null = null;
 let markersApi: ReturnType<typeof createSeriesMarkers> | null = null;
 
@@ -58,25 +57,22 @@ function priceFormat() {
   return { type: 'price' as const, precision, minMove: Math.pow(10, -precision) };
 }
 
-// Seconds per bar for the ruler's elapsed-time label. There is no single
-// timeframe prop (the chart shows either analysis-TF or per-second candles), so
-// derive it from the candle spacing — the median is robust to gaps in the
-// per-second (aggTrade) candles.
+// Seconds per point for the ruler's elapsed-time label. Ticks are irregular, so
+// take the median spacing (sub-second values are expected).
 function barSeconds(): number {
-  const c = props.candles;
-  const fallback = props.secondsVisible ? 1 : 60;
-  if (c.length < 2) return fallback;
+  const p = props.points;
+  if (p.length < 2) return 1;
   const diffs: number[] = [];
-  for (let i = 1; i < c.length; i++) {
-    const d = (c[i].time as number) - (c[i - 1].time as number);
+  for (let i = 1; i < p.length; i++) {
+    const d = (p[i].time as number) - (p[i - 1].time as number);
     if (d > 0) diffs.push(d);
   }
-  if (diffs.length === 0) return fallback;
+  if (diffs.length === 0) return 1;
   diffs.sort((a, b) => a - b);
-  return diffs[Math.floor(diffs.length / 2)] ?? fallback;
+  return diffs[Math.floor(diffs.length / 2)] ?? 1;
 }
 
-// Shift ruler overlay (see useChartRuler), shared with the screener chart card.
+// Shift ruler overlay (see useChartRuler), shared with the candle charts.
 const { measure, attach: attachRuler, detach: detachRuler } = useChartRuler({
   container,
   chart: () => chart,
@@ -102,16 +98,14 @@ function build(): void {
     timeScale: {
       borderColor: 'rgba(255, 255, 255, 0.08)',
       timeVisible: true,
-      secondsVisible: !!props.secondsVisible,
+      // Ticks live at sub-second resolution — show seconds on the axis.
+      secondsVisible: true,
     },
     autoSize: true,
   });
-  series = chart.addSeries(CandlestickSeries, {
-    upColor: '#83c764',
-    downColor: '#ff5d6b',
-    wickUpColor: '#83c764',
-    wickDownColor: '#ff5d6b',
-    borderVisible: false,
+  series = chart.addSeries(LineSeries, {
+    color: '#4c5cf9',
+    lineWidth: 1,
     priceFormat: priceFormat(),
   });
   render();
@@ -119,7 +113,7 @@ function build(): void {
 
 function render(): void {
   if (!chart || !series) return;
-  series.setData([...props.candles]);
+  series.setData([...props.points]);
 
   if (priceLine) {
     series.removePriceLine(priceLine);
@@ -143,7 +137,7 @@ function render(): void {
     markersApi.setMarkers(markers);
   }
 
-  if (props.candles.length) {
+  if (props.points.length) {
     chart.timeScale().fitContent();
   }
 }
@@ -156,7 +150,7 @@ onMounted(() => {
 
 // Rebuild data when inputs change (dialog reused for a different breakout).
 watch(
-  () => props.candles,
+  () => props.points,
   () => {
     if (!chart) build();
     else render();

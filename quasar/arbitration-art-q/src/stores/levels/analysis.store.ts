@@ -118,18 +118,6 @@ export const useAnalysisStore = defineStore('levelsAnalysis', {
       }
     },
 
-    async remove(id: number) {
-      try {
-        await analysisApi.remove(id);
-        this.items = this.items.filter((item) => item.id !== id);
-        if (this.selected?.id === id) {
-          this.selected = null;
-        }
-      } catch (e) {
-        this.error = extractApiErrorMessage(e, 'Не удалось удалить анализ');
-      }
-    },
-
     reset() {
       this.symbol = '';
       this.items = [];

@@ -1,5 +1,5 @@
 import axios from 'axios';
-import type { CandlestickData, UTCTimestamp } from 'lightweight-charts';
+import type { CandlestickData, LineData, UTCTimestamp } from 'lightweight-charts';
 
 // Per-second OHLC for the breakout detail chart. Binance USDⓈ-M Futures klines
 // have no `1s` interval, so seconds are reconstructed from aggregated trades
@@ -17,19 +17,20 @@ interface RawAggTrade {
 }
 
 /**
- * Fetch aggregated trades in `[startMs, endMs]` and bucket them into OHLC candles
- * of `bucketMs` (default 1s). Window is capped to Binance's <1h limit; trades are
- * paginated forward by time. Returned times are UTC seconds for lightweight-charts.
+ * Fetch aggregated trades in `[startMs, endMs]` once and derive both views of the
+ * breakout window: per-`bucketMs` OHLC candles (default 1s) and a raw tick line
+ * (one point per trade). A single fetch feeds both charts. Window is capped to
+ * Binance's <1h limit; trades are paginated forward by time.
  */
-export async function fetchAggTradeCandles(
+export async function fetchAggTradeSeries(
   symbol: string,
   startMs: number,
   endMs: number,
   bucketMs = 1000,
-): Promise<CandlestickData[]> {
+): Promise<{ candles: CandlestickData[]; ticks: LineData[] }> {
   const cappedEnd = Math.min(endMs, startMs + MAX_WINDOW_MS);
   const trades = await fetchAggTrades(symbol, startMs, cappedEnd);
-  return bucketCandles(trades, bucketMs);
+  return { candles: bucketCandles(trades, bucketMs), ticks: toTicks(trades) };
 }
 
 async function fetchAggTrades(
@@ -77,4 +78,21 @@ function bucketCandles(trades: readonly RawAggTrade[], bucketMs: number): Candle
       low: bar.low,
       close: bar.close,
     }));
+}
+
+// One line point per trade: price over time. Trade time (ms) maps to UTC seconds
+// keeping the millisecond fraction, so dense bursts of trades stay spread out on
+// the time axis. lightweight-charts requires strictly ascending times, so trades
+// sharing a millisecond are nudged forward by 1ms (aggTrades are already sorted
+// by time from the API).
+function toTicks(trades: readonly RawAggTrade[]): LineData[] {
+  const out: LineData[] = [];
+  let lastTime = -Infinity;
+  for (const trade of trades) {
+    let time = trade.T / 1000;
+    if (time <= lastTime) time = lastTime + 0.001;
+    lastTime = time;
+    out.push({ time: time as UTCTimestamp, value: parseFloat(trade.p) });
+  }
+  return out;
 }
