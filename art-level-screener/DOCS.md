@@ -481,6 +481,75 @@ Telegram запрещает `getUpdates` при активном webhook (`409 C
   ограничить до origin фронтенда и сделать сервис доступным по HTTPS (иначе
   mixed content на HTTPS-фронте).
 
+## Production-сборка (Docker / Dokploy)
+
+Каждый из четырёх сервисов собирается в **свой** образ из собственного каталога
+(`services/<service>/`). У каждого — отдельный `Dockerfile` и `.dockerignore`. В
+Dokploy это четыре независимых приложения; деплоить и масштабировать их можно по
+отдельности (так же, как сервисы развязаны через Redis в рантайме).
+
+`Dockerfile` — multi-stage (одинаковый шаблон у всех, аналог
+`arbitration-bot-engine/Dockerfile`):
+
+- Stage 1 (`builder`) на `node:22-slim`: ставит **все** зависимости
+  (`npm ci` по `package-lock.json`), компилирует TypeScript (`npm run build` →
+  `tsc` → `./dist`).
+- Stage 2 (`runtime`) на `node:22-slim`: ставит **только** прод-зависимости
+  (`npm ci --omit=dev` — без `tsc`/`tsx`/`@types/*`), копирует `dist/` из builder.
+  PID 1 — `tini` для корректного SIGTERM от Dokploy/Docker. Запуск от non-root
+  `node` user. Старт — `node dist/index.js`.
+
+Пакетный менеджер образа — **npm** (`package-lock.json` есть у всех четырёх
+сервисов). `pnpm-lock.yaml`, если лежит рядом, в сборке не участвует и срезан
+`.dockerignore`. `.dockerignore` также режет `node_modules/`, `dist/`, `.env*`
+(кроме `.env.example`), `.git/`, доки — чтобы локальный `.env` (у `level-notifier`
+там сервис-токен и Telegram-токен) не попал в образ.
+
+Build context для Dokploy (на каждый сервис):
+
+- **Build Context** / **Dockerfile Path** = `art-level-screener/services/<service>/`.
+- HTTP-порт открывает **только** `levels-api` (`EXPOSE 3000`, биндит `HOST=0.0.0.0`)
+  — его пробрасывать через Traefik/прокси Dokploy. `binance-futures-connector`,
+  `levels-processor`, `level-notifier` — воркеры без порта (наружу не публикуются).
+
+Зависимости рантайма и порядок: всем четырём нужен доступный **Redis**
+(`REDIS_URL`); смысловой порядок — `binance-futures-connector` → `levels-processor`
+→ `levels-api`, `level-notifier` — независимый воркер. Согласование префиксов
+Redis (см. раздел «Согласование префиксов Redis») должно соблюдаться и в проде.
+
+Обязательные env vars в Dokploy (полный список — в `.env.example` каждого сервиса):
+
+- **все**: `REDIS_URL`; согласованные префиксы (`REDIS_KEY_PREFIX` коннектора =
+  `SOURCE_PREFIX` процессора/api/notifier; `OUTPUT_PREFIX` процессора =
+  `LEVELS_PREFIX` api); общий `TIMEFRAMES`.
+- **levels-api**: `HOST=0.0.0.0`, `PORT` (дефолт `3000`), `CORS_ORIGIN`
+  (на проде ограничить до origin фронтенда).
+- **level-notifier**: `DJANGO_API_URL` (с `/api`), `SERVICE_SHARED_TOKEN`
+  (**посимвольно** = токен в `arbitration-art-django`), `TELEGRAM_BOT_TOKEN`,
+  `SITE_BASE_URL` (origin фронта для ссылки в алерте). См. AGENTS §9.
+
+Риски при деплое:
+
+- **`.env` в образ не кладём.** Все env vars приходят через Dokploy env injection;
+  `.dockerignore` страхует от попадания локального `.env` с токенами в образ.
+- **Single-instance у воркеров.** `binance-futures-connector` и `levels-processor`
+  не имеют distributed lock — держать **по одному** контейнеру на общий Redis,
+  иначе двойная запись/двойной расчёт. `level-notifier` хранит дедуп-состояние в
+  Redis (`level-notifier:state:*`), но cooldown не атомарен между инстансами —
+  тоже один контейнер. `levels-api` — stateless reader, его реплики безопасны.
+- **Graceful shutdown.** `tini` доставляет SIGTERM в Node; `levels-api` успевает
+  закрыть HTTP-сервер, воркеры — завершить текущий тик.
+- **Исходящий доступ.** Коннектору и `levels-api` (`/analysis`) нужен исходящий
+  доступ к `fapi.binance.com`/`fstream.binance.com`; `level-notifier` — к Django
+  и `api.telegram.org`. В изолированной сети открыть egress.
+
+Локальный smoke build (опционально, из каталога сервиса):
+
+```bash
+cd art-level-screener/services/levels-api
+docker build -t levels-api:local .
+```
+
 ## Риски и ограничения
 
 - **Свежие экстремумы у правого края** не детектируются (`EXTREMA_WINDOW` —
