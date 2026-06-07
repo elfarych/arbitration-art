@@ -189,6 +189,10 @@ function buildChart(): void {
       // whitespace as empty space past the most recent real candle and refuses
       // to show it, which collapses the right gap.
       rightOffset: 0,
+      // Realtime-edge following is handled manually in onLiveCandle (the new
+      // candle is never at the edge — the whitespace bars sit beyond it — so the
+      // built-in shift wouldn't fire anyway). Off for deterministic behavior.
+      shiftVisibleRangeOnNewBar: false,
     },
     autoSize: true,
   });
@@ -362,10 +366,23 @@ function onLiveCandle(c: LiveCandle): void {
     candles[candles.length - 1] = bar;
     candleSeries.update(bar);
   } else {
+    // Capture the view position BEFORE appending so we can tell whether the user
+    // is anchored at the realtime edge (vs scrolled back into history).
+    const timeScale = chart?.timeScale();
+    const rangeBefore = timeScale?.getVisibleLogicalRange() ?? null;
+    const rightEdgeBefore = candles.length - 1 + RIGHT_OFFSET;
     candles.push(bar);
     candleSeries.update(bar);
     applyWhitespace();
     applyLevels();
+    // The right edge (last whitespace bar) just moved one bar further right. If
+    // the user was viewing that edge, follow it by shifting the visible range one
+    // bar — otherwise the series marches under the price scale as candles
+    // accumulate (the window stays put while the data grows). A scrolled-back
+    // history view (right edge off-screen) is left untouched.
+    if (timeScale && rangeBefore && rangeBefore.to >= rightEdgeBefore - 1) {
+      timeScale.setVisibleLogicalRange({ from: rangeBefore.from + 1, to: rangeBefore.to + 1 });
+    }
   }
 }
 
