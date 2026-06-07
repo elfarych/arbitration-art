@@ -4,7 +4,14 @@ import axios from 'axios';
 // backend from Django (different host/port, no auth — CORS open), so it uses its
 // own axios instance without the auth/refresh interceptors from boot/axios.
 // Contract: art-level-screener/services/levels-api/API.md.
-const DEFAULT_LEVELS_API_URL = 'http://127.0.0.1:3000';
+//
+// process.env.LEVELS_API_URL is inlined at BUILD time, and only when present in
+// a .env file the Quasar dotenv pipeline reads (build.env is not wired). In the
+// Docker/Dokploy build there is no .env, so it resolves to undefined and the
+// default below is what ships. Keep the default pointing at the production
+// levels-api host (mirrors DEFAULT_API_URL in boot/axios.ts); local dev overrides
+// it via the .env LEVELS_API_URL=http://127.0.0.1:3000.
+const DEFAULT_LEVELS_API_URL = 'https://art-levels.jscode.kz';
 const levelsHttp = axios.create({
   baseURL: process.env.LEVELS_API_URL ?? DEFAULT_LEVELS_API_URL,
 });

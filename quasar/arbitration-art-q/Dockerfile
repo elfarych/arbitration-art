@@ -3,27 +3,26 @@
 # =========================
 # Stage 1 — builder
 # =========================
-# Builds the Quasar SPA. process.env.API_URL is read at BUILD time by Vite,
-# so the API base URL must be passed as a build argument (Dokploy supports
-# build args in the service config) — not as a runtime env var.
+# Builds the Quasar SPA. IMPORTANT: @quasar/app-vite injects into the client
+# bundle ONLY keys found in on-disk .env* files (or quasar.config build.env).
+# It does NOT pass OS/Docker env through. build.env is not wired and .env is
+# gitignored (absent here), so these ENV vars do NOT reach the bundle — the
+# effective base URLs are the DEFAULT_* constants in code (boot/axios.ts,
+# stores/levels/api/levelsApi.ts), which point at the production hosts.
+# The ARGs below are kept for parity and become live overrides only once
+# build.env maps them (see DOCS §28.1). Until then they are inert.
 FROM node:22-slim AS builder
 
 ENV CI=1
 ENV NODE_ENV=development
 
-# API_URL is baked into the bundle. Override per-deployment via Dokploy
-# "Build Arguments". The default points at the production Django host so a
-# build without explicit arguments still produces a working bundle.
 ARG API_URL=https://art-api.jscode.kz/api
 ENV API_URL=${API_URL}
 
 # LEVELS_API_URL — base URL of the art-level-screener `levels-api` (levels
-# screener section). Like API_URL it is build-time and must be reachable from
-# the browser with CORS allowing the frontend origin (and HTTPS if the frontend
-# is HTTPS). The default points at the production levels-api host so a build
-# without explicit arguments still produces a working bundle; override it as a
-# build arg for other deployments (use http://127.0.0.1:3000 for local builds).
-# Endpoints live at the root (/timeframes, /screener/:tf, /config) — no /api suffix.
+# screener section). Endpoints live at the root (/timeframes, /screener/:tf,
+# /config) — no /api suffix. Must be reachable from the browser with CORS
+# allowing the frontend origin (HTTPS if the frontend is HTTPS).
 ARG LEVELS_API_URL=https://art-levels.jscode.kz
 ENV LEVELS_API_URL=${LEVELS_API_URL}
 

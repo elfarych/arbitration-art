@@ -1906,9 +1906,9 @@ TELEGRAM_BOT_URL=https://t.me/your_bot
 
 `TELEGRAM_BOT_URL` — ссылка на бота уведомлений (`https://t.me/<bot>`), показывается кнопкой в диалоге уведомлений (§25B.8). **Build-time**, как и остальные (см. §28.1). Пустая/не задана → кнопка скрыта, остаётся текстовый хинт про `/start`. Должна вести на **того же** бота, чьим токеном пользуется сервис `level-notifier` (иначе `/start` отдаст chat_id, но уведомления не дойдут — их шлёт другой бот).
 
-`LEVELS_API_URL` — база сервиса `levels-api` (без `/api`-префикса: эндпоинты `/timeframes`, `/screener/:tf`, `/config` лежат в корне). Сервис должен быть доступен из браузера с CORS, разрешающим origin фронта, и по HTTPS, если фронт под HTTPS (иначе mixed content). Как и `API_URL`, переменная **build-time** (см. §28.1): инлайнится в бандл на сборке. Дефолт в `Dockerfile` — production-хост `https://art-levels.jscode.kz` (билд без build-арга сразу рабочий); для локальной сборки передать `--build-arg LEVELS_API_URL=http://127.0.0.1:3000`. Альтернатива на будущее — проксировать `levels-api` через nginx тем же приёмом, что и биржевые прокси (§28.1), и ходить same-origin.
+`LEVELS_API_URL` — база сервиса `levels-api` (без `/api`-префикса: эндпоинты `/timeframes`, `/screener/:tf`, `/config` лежат в корне). Сервис должен быть доступен из браузера с CORS, разрешающим origin фронта, и по HTTPS, если фронт под HTTPS (иначе mixed content). Переменная **build-time** (см. §28.1): инлайнится в бандл на сборке из `.env`-файла. В прод-сборке `.env` отсутствует, поэтому фактически работает код-дефолт `DEFAULT_LEVELS_API_URL` в `src/stores/levels/api/levelsApi.ts` — он указывает на production-хост `https://art-levels.jscode.kz` (зеркало `DEFAULT_API_URL` в `boot/axios.ts`). Локальный dev переопределяет его через `.env` (`LEVELS_API_URL=http://127.0.0.1:3000`). Альтернатива на будущее — проксировать `levels-api` через nginx тем же приёмом, что и биржевые прокси (§28.1), и ходить same-origin.
 
-Quasar для browser-side env инжектит через `quasar.config.ts build.env`. Сейчас build.env не настроен явно, переменная попадает через стандартный dotenv pipeline Quasar (`.env` + `process.env.*`).
+**Механизм инъекции env (важно).** `@quasar/app-vite` подставляет в client-бандл `process.env.*` **только** из ключей, найденных в `.env*`-файлах на диске (или из `quasar.config.ts build.env`) — см. `lib/utils/env.js` (`fileEnv` читается `readFileSync` из списка `.env*`). OS-окружение процесса сборки (включая `ENV`/`ARG` из Dockerfile и Dokploy Build Arguments) в бандл **не попадает**. `build.env` сейчас не настроен, а `.env` в Docker-сборке отсутствует (`.dockerignore` + gitignore) → ни одного ключа не определено → `process.env.API_URL`/`process.env.LEVELS_API_URL` в бандле = `undefined`, и работает `?? DEFAULT_*`-фоллбэк из кода. Поэтому реальный источник прод-URL — код-дефолты, а `ARG`-и в `Dockerfile` сейчас **инертны** (известный нюанс — см. §28.1).
 
 ### 28.1. Production-сборка (Docker / Dokploy)
 
@@ -1919,25 +1919,28 @@ Production-образ строится из каталога `quasar/arbitration
   - Stage 2 (`runtime`) на `nginx:1.27-alpine`. Копирует `dist/spa` в `/usr/share/nginx/html`, подменяет дефолтный server-блок: SPA fallback `try_files $uri $uri/ /index.html`, длинный `Cache-Control` для `/assets/`, `no-store` для `index.html`, gzip для text/JS/CSS/SVG, **plus** prod-mirror dev-proxy: `location /binance-api/ | /binance-spot-api/ | /mexc-api/ | /bybit-api/` с `proxy_pass` на `fapi.binance.com` / `api.binance.com` / `contract.mexc.com` / `api.bybit.com`. Trailing slash на `proxy_pass` срезает matched-префикс — эквивалент dev-proxy `rewrite`. `proxy_ssl_server_name on` нужен для SNI (биржевые CDN), `Host` ставится явно, `Origin` стрипается (CORS — server-side, биржам Origin не нужен).
 - `.dockerignore` — режет `node_modules/`, `dist/`, `.quasar/`, `.env*` (кроме `.env.example`), cordova/capacitor артефакты, `.git/`, `DOCS.md`.
 
-**Важно: `API_URL` — build-time, не runtime.**
+**Важно: API base URLs — build-time, не runtime, и зашиты кодом, а не build-арг'ом.**
 
-Quasar/Vite инжектят `process.env.API_URL` в JS-бандл на этапе `pnpm run build`. Менять адрес API на уже собранном образе нельзя — нужен пересбор. Поэтому `API_URL` передаётся как **build ARG**, а не env переменная контейнера. В `Dockerfile` объявлен:
+`process.env.API_URL` / `process.env.LEVELS_API_URL` инлайнятся в JS-бандл на этапе `pnpm run build`. Менять адрес на уже собранном образе нельзя — нужен пересбор. Но (см. «Механизм инъекции env» в §28) в этом проекте OS/Docker env **не доходит** до бандла: `build.env` не настроен, `.env` в Docker-сборке нет → определяется только код-дефолт. Поэтому фактический прод-адрес задаётся константами в коде:
 
-```dockerfile
-ARG API_URL=https://art-api.jscode.kz/api
-ENV API_URL=${API_URL}
+- `boot/axios.ts`: `const DEFAULT_API_URL = 'https://art-api.jscode.kz/api'` → `process.env.API_URL ?? DEFAULT_API_URL`.
+- `stores/levels/api/levelsApi.ts`: `const DEFAULT_LEVELS_API_URL = 'https://art-levels.jscode.kz'` → `process.env.LEVELS_API_URL ?? DEFAULT_LEVELS_API_URL`.
+
+`ARG`/`ENV` в `Dockerfile` (`API_URL`, `LEVELS_API_URL`) сейчас **инертны** для бандла и оставлены для паритета/будущего: они начнут работать как per-deployment override только если связать их через `quasar.config.ts build.env`. Чтобы это включить безопасно (не сломав локальный dev, где значения приходят из `.env`), маппить условно — только определённые в OS-окружении ключи:
+
+```ts
+// quasar.config.ts → build
+env: {
+  ...(process.env.API_URL ? { API_URL: process.env.API_URL } : {}),
+  ...(process.env.LEVELS_API_URL ? { LEVELS_API_URL: process.env.LEVELS_API_URL } : {}),
+},
 ```
 
-Дефолт указывает на production-домен Django, чтобы билд без явных аргументов сразу был рабочим. В Dokploy можно установить **Build Arguments → `API_URL`** для staging/других сред — на каждую новую среду собирается отдельный образ с своим `API_URL`. Если дефолт устраивает (prod-сборка на prod-Django), build args в Dokploy не задавать.
+(`build.env` перекрывает `fileEnv`, поэтому безусловный маппинг затёр бы локальный `.env` значением `undefined` — отсюда guard.)
 
-Так же устроен `LEVELS_API_URL` (раздел уровней, §25B) — отдельный build ARG для `levels-api`:
+`levels-api` браузер дёргает **напрямую**, поэтому сервис должен быть опубликован по HTTPS (Traefik) и иметь `CORS_ORIGIN` = origin фронта.
 
-```dockerfile
-ARG LEVELS_API_URL=https://art-levels.jscode.kz
-ENV LEVELS_API_URL=${LEVELS_API_URL}
-```
-
-Дефолт указывает на production-хост `levels-api`. Этот сервис браузер дёргает **напрямую**, поэтому `levels-api` должен быть опубликован по HTTPS (Traefik) и иметь `CORS_ORIGIN` = origin фронта. Для локальной/staging-сборки переопределить `--build-arg LEVELS_API_URL=...`. Частая ошибка: если в проде в DevTools видно обращение на `http://127.0.0.1:3000/timeframes` — значит фронт собрали со старым localhost-дефолтом; лечится пересборкой с правильным `LEVELS_API_URL` (runtime-подмена невозможна — значение уже в статике).
+**Частая ошибка:** в проде в DevTools видно обращение на `http://127.0.0.1:3000/timeframes` — значит в бандле сработал localhost-дефолт. Причина не в Dokploy build-арг'е (он инертен), а в `DEFAULT_LEVELS_API_URL` в коде. Лечится прод-значением этой константы (сделано) и пересборкой; runtime-подмена невозможна — значение уже в статике.
 
 Build context для Dokploy:
 
@@ -1958,13 +1961,16 @@ Runtime env vars в Dokploy для контейнера не требуются 
 
 ```bash
 cd /Users/eldar/dev/Projects/arbitration-art/quasar/arbitration-art-q
-# Без --build-arg уйдут prod-дефолты (https://art-api.jscode.kz/api, https://art-levels.jscode.kz).
-# Для полностью локальной сборки передать оба адреса:
-docker build \
-  --build-arg API_URL=http://127.0.0.1:8000/api \
-  --build-arg LEVELS_API_URL=http://127.0.0.1:3000 \
-  -t arbitration-art-q:local .
+# Образ всегда собирается с prod-дефолтами из кода
+# (https://art-api.jscode.kz/api, https://art-levels.jscode.kz):
+# --build-arg сейчас инертен (build.env не связан), .env срезан .dockerignore.
+docker build -t arbitration-art-q:local .
 ```
+
+Для прогона фронта против локальных бэкендов используй `quasar dev` с локальным `.env`
+(`API_URL=http://127.0.0.1:8000/api`, `LEVELS_API_URL=http://127.0.0.1:3000`) — dev-сервер
+читает `.env`, в отличие от Docker-сборки. Если нужны именно локально-нацеленные
+build-арги через `docker build`, сперва связать `build.env` (см. выше).
 
 ## 29. Known issues and risks
 
