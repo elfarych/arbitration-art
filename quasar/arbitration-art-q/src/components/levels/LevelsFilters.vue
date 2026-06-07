@@ -5,7 +5,7 @@
       <input
         v-model.number="volM"
         type="number"
-        min="0"
+        :min="FLOOR_M"
         step="1"
         inputmode="decimal"
         class="filter-input"
@@ -13,7 +13,7 @@
         @blur="apply"
       />
       <span class="filter-unit text-grey-6">M$</span>
-      <q-tooltip>Минимальный оборот в USDT (млн): сумма volume·close по 24 свечам 1h. Пусто/0 — выключено</q-tooltip>
+      <q-tooltip>Минимальный оборот в USDT (млн): сумма volume·close по 24 свечам 1h. Минимум {{ FLOOR_M }} M$</q-tooltip>
     </label>
 
     <label class="filter-field row no-wrap items-center">
@@ -73,13 +73,14 @@
 
 <script setup lang="ts">
 import { ref, watch } from 'vue';
+import { LEVELS_MIN_VOLUME } from 'src/stores/levels/levels.store';
 
 // Screener calculation params edited in the page header. The contract value for
 // volume is raw USDT; the field edits millions for a compact input. Other params
 // pass through as-is. Changes are committed on Enter/blur (one recompute, not per
 // keystroke — the screener is computed on demand server-side).
 const props = defineProps<{
-  // Minimum USDT turnover (raw USDT); 0 = filter off.
+  // Minimum USDT turnover (raw USDT); floored at LEVELS_MIN_VOLUME (50M).
   minVolume: number;
   natrMultiplier: number;
   minGap: number;
@@ -95,6 +96,8 @@ const emit = defineEmits<{
 }>();
 
 const MILLION = 1_000_000;
+// Smallest selectable volume, in millions (input unit). Mirrors the raw-USDT floor.
+const FLOOR_M = LEVELS_MIN_VOLUME / MILLION;
 
 const volM = ref<number>(props.minVolume / MILLION);
 const natr = ref<number>(props.natrMultiplier);
@@ -106,9 +109,10 @@ watch(() => props.natrMultiplier, (v) => (natr.value = v));
 watch(() => props.minGap, (v) => (gap.value = v));
 
 function apply(): void {
-  // Empty/invalid numeric inputs arrive as '' / NaN. Volume → 0 (off); tolerance
-  // and gap fall back to the current values rather than producing a broken request.
-  const minVolume = Math.max(0, Math.round((Number(volM.value) || 0) * MILLION));
+  // Empty/invalid numeric inputs arrive as '' / NaN. Volume snaps up to the floor
+  // (50M); tolerance and gap fall back to the current values rather than producing
+  // a broken request.
+  const minVolume = Math.max(LEVELS_MIN_VOLUME, Math.round((Number(volM.value) || 0) * MILLION));
   const natrMultiplier = Number(natr.value) > 0 ? Number(natr.value) : props.natrMultiplier;
   const minGap = Number(gap.value) >= 1 ? Math.round(Number(gap.value)) : props.minGap;
   // Reflect the normalized values back into the inputs (clears empty states).

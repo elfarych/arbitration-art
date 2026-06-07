@@ -127,7 +127,7 @@
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue';
 import { useRouter } from 'vue-router';
-import { useLevelsStore } from 'src/stores/levels/levels.store';
+import { useLevelsStore, LEVELS_MIN_VOLUME } from 'src/stores/levels/levels.store';
 import { useFavoritesStore } from 'src/stores/levels/favorites.store';
 import { useNotificationsStore } from 'src/stores/levels/notifications.store';
 import LevelChartCard from 'src/components/levels/LevelChartCard.vue';
@@ -220,7 +220,9 @@ onMounted(async () => {
   // only on manual action (refresh button, timeframe/grid/page/param change) —
   // no background polling.
   store.pageSize = columns.value * rows.value;
-  store.minVolume = loadNumber(PARAM_MIN_VOLUME_KEY, store.minVolume);
+  // Clamp the persisted value up to the floor so users with an old localStorage
+  // entry (0 = off, or a sub-50M value) still respect the 50M minimum.
+  store.minVolume = Math.max(LEVELS_MIN_VOLUME, loadNumber(PARAM_MIN_VOLUME_KEY, store.minVolume));
   store.natrMultiplier = loadNumber(PARAM_NATR_MULT_KEY, store.natrMultiplier);
   store.minGap = loadNumber(PARAM_MIN_GAP_KEY, store.minGap);
   store.pinFavorites = localStorage.getItem(PIN_FAVORITES_KEY) === '1';

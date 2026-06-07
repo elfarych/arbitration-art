@@ -4,6 +4,7 @@ import {
   type NotificationConfig,
   type NotificationConfigInput,
 } from './api/notificationsApi';
+import { LEVELS_MIN_VOLUME } from './levels.store';
 import { extractApiErrorMessage } from 'src/utils/apiError';
 
 // Per-user level-notification config for the screener, backed by Django
@@ -16,7 +17,7 @@ const DEFAULT_CONFIG: NotificationConfig = {
   timeframe: '1m',
   natrMultiplier: 0.3,
   minGap: 12,
-  minVolume: 0,
+  minVolume: LEVELS_MIN_VOLUME,
   distanceMode: 'pct',
   distanceValue: 1,
   chatId: '',

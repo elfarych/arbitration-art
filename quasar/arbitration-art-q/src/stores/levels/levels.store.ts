@@ -10,9 +10,15 @@ import { extractApiErrorMessage } from 'src/utils/apiError';
 // Page size is dynamic: the grid picker on the page sets it to columns × rows.
 export const LEVELS_DEFAULT_PAGE_SIZE = 6;
 
-// Default calculation params — match the levels-api env defaults so the initial
-// screen matches the server's out-of-the-box calculation.
-export const LEVELS_DEFAULT_MIN_VOLUME = 0; // 0 = volume filter off
+// Volume filter floor: the screener and the notification config enforce a minimum
+// 50M USDT turnover (sum of volume·close over 24×1h). This is both the default and
+// the smallest selectable value — the filter cannot be lowered below it or turned
+// off. Single source of truth for the floor across the page, filter and dialog.
+export const LEVELS_MIN_VOLUME = 50_000_000;
+
+// Default calculation params — NATR/gap match the levels-api env defaults so the
+// initial screen matches the server's calculation; volume defaults to the floor.
+export const LEVELS_DEFAULT_MIN_VOLUME = LEVELS_MIN_VOLUME;
 export const LEVELS_DEFAULT_NATR_MULTIPLIER = 0.3;
 export const LEVELS_DEFAULT_MIN_GAP = 12;
 
@@ -40,7 +46,8 @@ interface LevelsState {
   // keeping the proximity sort among them; the rest follow (also by proximity).
   pinFavorites: boolean;
   // Calculation params sent to /screener (server recomputes on demand).
-  // minVolume: minimum USDT turnover (sum of volume·close over 24×1h); 0 = off.
+  // minVolume: minimum USDT turnover (sum of volume·close over 24×1h); floored at
+  // LEVELS_MIN_VOLUME (50M) — always sent, never off.
   minVolume: number;
   // natrMultiplier: touch-zone tolerance in NATR units.
   natrMultiplier: number;

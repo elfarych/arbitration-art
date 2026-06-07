@@ -38,13 +38,13 @@
               type="number"
               label="Объём ≥"
               suffix="M$"
-              min="0"
+              :min="FLOOR_M"
               step="1"
               dense
               outlined
               dark
               class="col-6"
-              hint="0 — выключено"
+              :hint="`минимум ${FLOOR_M} M$`"
             />
           </div>
         </div>
@@ -166,7 +166,7 @@
 import { reactive, computed, watch } from 'vue';
 import { storeToRefs } from 'pinia';
 import { useNotificationsStore } from 'src/stores/levels/notifications.store';
-import { useLevelsStore } from 'src/stores/levels/levels.store';
+import { useLevelsStore, LEVELS_MIN_VOLUME } from 'src/stores/levels/levels.store';
 import type { DistanceMode, NotificationConfig } from 'src/stores/levels/api/notificationsApi';
 
 const props = defineProps<{ modelValue: boolean }>();
@@ -176,15 +176,20 @@ const store = useNotificationsStore();
 const levelsStore = useLevelsStore();
 const { timeframes } = storeToRefs(levelsStore);
 
-// Telegram bot link from .env (must be the same bot the level-notifier service
-// uses). When unset, the link button is hidden and only the text hint shows.
-const botUrl = process.env.TELEGRAM_BOT_URL ?? '';
+// Telegram bot link — hardcoded to the notifications bot. Must stay the SAME bot
+// whose token the level-notifier service uses (TELEGRAM_BOT_TOKEN), otherwise
+// /start returns a chat_id that gets no alerts. Not read from env: process.env.*
+// is not injected into the production bundle (see DOCS §28), so the env path left
+// the button hidden in prod. botLabel (@username) is derived from the URL.
+const botUrl = 'https://t.me/Brakeoutautobot';
 const botMatch = botUrl.match(/t\.me\/([A-Za-z0-9_]+)/);
 const botLabel = botMatch ? `@${botMatch[1]}` : 'Открыть бота';
 
 // Volume is stored as raw USDT but edited in millions for a compact input (same
 // convention as LevelsFilters).
 const MILLION = 1_000_000;
+// Smallest selectable volume, in millions (input unit). Mirrors the raw-USDT floor.
+const FLOOR_M = LEVELS_MIN_VOLUME / MILLION;
 
 const DISTANCE_OPTIONS: { label: string; value: DistanceMode }[] = [
   { label: '%', value: 'pct' },
@@ -222,7 +227,7 @@ const isValid = computed(
     Number.isFinite(form.minGap) &&
     form.minGap >= 1 &&
     Number.isFinite(form.minVolumeM) &&
-    form.minVolumeM >= 0 &&
+    form.minVolumeM >= FLOOR_M &&
     Number.isFinite(form.distanceValue) &&
     form.distanceValue > 0,
 );
@@ -234,7 +239,7 @@ function toForm(config: NotificationConfig): FormState {
     timeframe: config.timeframe,
     natrMultiplier: config.natrMultiplier,
     minGap: config.minGap,
-    minVolumeM: config.minVolume / MILLION,
+    minVolumeM: Math.max(FLOOR_M, config.minVolume / MILLION),
     distanceMode: config.distanceMode,
     distanceValue: config.distanceValue,
     chatId: config.chatId,
@@ -250,7 +255,7 @@ async function onSave() {
       timeframe: form.timeframe,
       natrMultiplier: form.natrMultiplier,
       minGap: Math.round(form.minGap),
-      minVolume: Math.max(0, Math.round(form.minVolumeM * MILLION)),
+      minVolume: Math.max(LEVELS_MIN_VOLUME, Math.round(form.minVolumeM * MILLION)),
       distanceMode: form.distanceMode,
       distanceValue: form.distanceValue,
       chatId: form.chatId,
