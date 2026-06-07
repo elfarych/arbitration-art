@@ -1906,7 +1906,7 @@ TELEGRAM_BOT_URL=https://t.me/your_bot
 
 `TELEGRAM_BOT_URL` — ссылка на бота уведомлений (`https://t.me/<bot>`), показывается кнопкой в диалоге уведомлений (§25B.8). **Build-time**, как и остальные (см. §28.1). Пустая/не задана → кнопка скрыта, остаётся текстовый хинт про `/start`. Должна вести на **того же** бота, чьим токеном пользуется сервис `level-notifier` (иначе `/start` отдаст chat_id, но уведомления не дойдут — их шлёт другой бот).
 
-`LEVELS_API_URL` — база сервиса `levels-api` (host/port из его `.env`, без `/api`-префикса). Дефолт в коде — `http://127.0.0.1:3000`. Сервис должен быть доступен из браузера с CORS, разрешающим origin фронта, и по HTTPS, если фронт под HTTPS (иначе mixed content). Как и `API_URL`, переменная **build-time** (см. §28.1): на проде задаётся build-arg-ом, иначе в бандл попадёт localhost-дефолт. Альтернатива на будущее — проксировать `levels-api` через nginx тем же приёмом, что и биржевые прокси (§28.1), и ходить same-origin.
+`LEVELS_API_URL` — база сервиса `levels-api` (без `/api`-префикса: эндпоинты `/timeframes`, `/screener/:tf`, `/config` лежат в корне). Сервис должен быть доступен из браузера с CORS, разрешающим origin фронта, и по HTTPS, если фронт под HTTPS (иначе mixed content). Как и `API_URL`, переменная **build-time** (см. §28.1): инлайнится в бандл на сборке. Дефолт в `Dockerfile` — production-хост `https://art-levels.jscode.kz` (билд без build-арга сразу рабочий); для локальной сборки передать `--build-arg LEVELS_API_URL=http://127.0.0.1:3000`. Альтернатива на будущее — проксировать `levels-api` через nginx тем же приёмом, что и биржевые прокси (§28.1), и ходить same-origin.
 
 Quasar для browser-side env инжектит через `quasar.config.ts build.env`. Сейчас build.env не настроен явно, переменная попадает через стандартный dotenv pipeline Quasar (`.env` + `process.env.*`).
 
@@ -1930,6 +1930,15 @@ ENV API_URL=${API_URL}
 
 Дефолт указывает на production-домен Django, чтобы билд без явных аргументов сразу был рабочим. В Dokploy можно установить **Build Arguments → `API_URL`** для staging/других сред — на каждую новую среду собирается отдельный образ с своим `API_URL`. Если дефолт устраивает (prod-сборка на prod-Django), build args в Dokploy не задавать.
 
+Так же устроен `LEVELS_API_URL` (раздел уровней, §25B) — отдельный build ARG для `levels-api`:
+
+```dockerfile
+ARG LEVELS_API_URL=https://art-levels.jscode.kz
+ENV LEVELS_API_URL=${LEVELS_API_URL}
+```
+
+Дефолт указывает на production-хост `levels-api`. Этот сервис браузер дёргает **напрямую**, поэтому `levels-api` должен быть опубликован по HTTPS (Traefik) и иметь `CORS_ORIGIN` = origin фронта. Для локальной/staging-сборки переопределить `--build-arg LEVELS_API_URL=...`. Частая ошибка: если в проде в DevTools видно обращение на `http://127.0.0.1:3000/timeframes` — значит фронт собрали со старым localhost-дефолтом; лечится пересборкой с правильным `LEVELS_API_URL` (runtime-подмена невозможна — значение уже в статике).
+
 Build context для Dokploy:
 
 - **Build Path** = корень репозитория, **Dockerfile Path** = `quasar/arbitration-art-q/Dockerfile`, **Build Context** = `quasar/arbitration-art-q/`. Альтернатива — подключать в Dokploy только подкаталог как отдельный source.
@@ -1949,9 +1958,12 @@ Runtime env vars в Dokploy для контейнера не требуются 
 
 ```bash
 cd /Users/eldar/dev/Projects/arbitration-art/quasar/arbitration-art-q
-# Без --build-arg уйдёт prod-дефолт https://art-api.jscode.kz/api.
-# Для локального Django передать свой API_URL:
-docker build --build-arg API_URL=http://127.0.0.1:8000/api -t arbitration-art-q:local .
+# Без --build-arg уйдут prod-дефолты (https://art-api.jscode.kz/api, https://art-levels.jscode.kz).
+# Для полностью локальной сборки передать оба адреса:
+docker build \
+  --build-arg API_URL=http://127.0.0.1:8000/api \
+  --build-arg LEVELS_API_URL=http://127.0.0.1:3000 \
+  -t arbitration-art-q:local .
 ```
 
 ## 29. Known issues and risks

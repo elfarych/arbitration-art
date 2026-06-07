@@ -20,9 +20,11 @@ ENV API_URL=${API_URL}
 # LEVELS_API_URL — base URL of the art-level-screener `levels-api` (levels
 # screener section). Like API_URL it is build-time and must be reachable from
 # the browser with CORS allowing the frontend origin (and HTTPS if the frontend
-# is HTTPS). The localhost default only works for local builds — override it as
-# a build arg for any non-local deploy.
-ARG LEVELS_API_URL=http://127.0.0.1:3000
+# is HTTPS). The default points at the production levels-api host so a build
+# without explicit arguments still produces a working bundle; override it as a
+# build arg for other deployments (use http://127.0.0.1:3000 for local builds).
+# Endpoints live at the root (/timeframes, /screener/:tf, /config) — no /api suffix.
+ARG LEVELS_API_URL=https://art-levels.jscode.kz
 ENV LEVELS_API_URL=${LEVELS_API_URL}
 
 # Enable pnpm via corepack (project pins pnpm >= 9).
