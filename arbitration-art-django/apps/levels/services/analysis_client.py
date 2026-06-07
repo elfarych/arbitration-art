@@ -11,9 +11,13 @@ class LevelsAnalysisError(RuntimeError):
 def run_analysis(symbol: str, timeframe: str, query: dict[str, Any]) -> dict[str, Any]:
     """Call levels-api `GET /analysis/:tf/:symbol` and return the parsed result.
 
+    Server-side compute FALLBACK — not currently wired into the viewset: the
+    frontend computes the analysis in the browser (direct Binance) and posts the
+    result for persistence. Kept for debugging / possible server-side batch use.
+
     Single request, no retries: the analysis is expensive (fetches candles +
     trades from Binance) and a long timeout retried 3× would block a worker for
-    minutes. The caller (viewset) maps `LevelsAnalysisError` to a 502.
+    minutes.
     """
     base = settings.LEVELS_API_URL.rstrip("/")
     url = f"{base}/analysis/{timeframe}/{symbol.upper()}"

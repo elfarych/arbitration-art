@@ -258,7 +258,7 @@ Root URL config: `arbitration_art_django/urls.py`.
 | `/admin/` | Django admin |
 | `/api/auth/` | Auth/profile endpoints из `apps.users.api.urls` |
 | `/api/bots/` | Bot/trade endpoints из `apps.bots.api.urls`, включая агрегированный PnL `GET /api/bots/pnl/` (см. §9.6) |
-| `/api/levels/` | Сохранённые анализы пробоев уровней из `apps.levels.api.urls` (см. §10A) |
+| `/api/levels/` | Сохранённые анализы пробоев уровней + избранные монеты из `apps.levels.api.urls` (см. §10A) |
 
 ## 7. Пользователи и auth
 
@@ -1167,14 +1167,17 @@ Lifecycle sync **inline** в `BotConfigViewSet.perform_create` / `perform_update
 
 Engine отвечает `{ success: true }` или `{ success: false, error: "..." }` со статусом 200/500. `_perform_post` бросает `LifecycleSyncError` на любой non-2xx ответ и на network errors; retry-policy: `SERVICE_REQUEST_RETRIES` попыток с паузой `SERVICE_REQUEST_RETRY_DELAY_SECONDS`.
 
-## 10A. Levels domain (сохранённые анализы пробоев)
+## 10A. Levels domain (сохранённые анализы пробоев + избранные монеты)
 
-Приложение `apps.levels` хранит результаты анализа пробоев горизонтальных уровней (фича страницы монеты во фронтенде, `art-level-screener`). Django **проксирует** расчёт в `levels-api` и **сохраняет** результат в БД под пользователем — история анализов переживает перезагрузку.
+Приложение `apps.levels` хранит результаты анализа пробоев горизонтальных уровней (фича страницы монеты во фронтенде, `art-level-screener`). **Расчёт идёт на фронте** (браузер сам тянет свечи/трейды напрямую с Binance и считает анализ — это разгружает CPU сервера и распределяет weight-лимит Binance по IP пользователей). Django принимает **готовый** результат, валидирует и **сохраняет** под пользователем — история переживает перезагрузку.
+
+**Trust-tradeoff (осознанный).** Результат приходит от клиента, значит пробои — user-supplied данные (без Binance их не перепроверить). Django **не доверяет** клиентскому `summary` и пересчитывает его сам из присланных пробоев (`_build_summary`), так агрегаты нельзя подделать и они всегда консистентны. Структура и домены полей валидируются (`AnalysisSaveSerializer`), число пробоев ограничено (`MAX_BREAKOUTS=2000`).
 
 ### Модели (`apps/levels/models.py`)
 
 - **`LevelAnalysis`** — один запуск анализа. Поля: `owner` (FK на `users.User`, `related_name="level_analyses"`), `symbol`, `timeframe`; параметры запуска (`natr_multiplier`, `min_gap`, `direction` `up`/`down`/`both`, `max_breakout_seconds`, `min_move_pct`, `candles`); `candles_analyzed`, `range_from`/`range_to` (мс); тоталы (`breakouts_found`, `evaluated`, `matched`, `unmatched`, `match_rate`, `up_found`/`up_matched`/`down_found`/`down_matched`); `created_at`. `ordering = ["-created_at"]`, индекс `(owner, symbol, -created_at)`. Запуски **иммутабельны** (только create/read/delete).
 - **`LevelAnalysisBreakout`** — один пробой внутри анализа (`analysis` FK, `related_name="breakouts"`). Поля повторяют контракт пробоя: `price`, `level_time`, `kind`, `direction`, `touches`, `breakout_candle_time`, `cross_time`/`reach_time`/`elapsed_ms`/`move_pct` (nullable), `matched`, `reason`. Времена — `BigIntegerField` (мс Unix), цены/проценты — `FloatField` (research-данные, не деньги).
+- **`FavoriteCoin`** — избранная монета пользователя для скринера уровней (per-user watchlist). Поля: `owner` (FK на `users.User`, `related_name="favorite_coins"`), `symbol` (хранится в верхнем регистре, как в скринере), `created_at`. `ordering = ["-created_at"]`, `UniqueConstraint(owner, symbol)` (`unique_favorite_per_owner`), индекс `(owner, symbol)`.
 
 ### API (`/api/levels/`, `apps/levels/api/`)
 
@@ -1183,25 +1186,33 @@ Engine отвечает `{ success: true }` или `{ success: false, error: "..
 | Метод | Путь | Назначение |
 |-------|------|------------|
 | GET | `/api/levels/analyses/?symbol=BTCUSDT` | История анализов пользователя по монете (summary без пробоев), newest-first |
-| POST | `/api/levels/analyses/` | Запустить + сохранить анализ (тело — параметры) |
+| POST | `/api/levels/analyses/` | Сохранить **готовый** (посчитанный на фронте) анализ — тело это `AnalysisResult` |
 | GET | `/api/levels/analyses/{id}/` | Анализ с полным списком пробоев (`breakouts`) |
-| DELETE | `/api/levels/analyses/{id}/` | Удалить анализ |
+| DELETE | `/api/levels/analyses/{id}/` | Удалить анализ (фронт UI кнопки удаления не показывает) |
 
-**Контракт ответа — camelCase, вложенный** (`params`, `range`, `summary.byDirection`, `breakouts[]`), один-в-один с `AnalysisResult` из `levels-api/API.md` плюс `id` и `createdAt` — чтобы фронт рендерил сохранённые и «живые» анализы одними компонентами. Сериализаторы: `AnalysisRunSerializer` (вход), `AnalysisSummarySerializer` (список), `AnalysisDetailSerializer` (+`breakouts`).
+**Контракт ответа — camelCase, вложенный** (`params`, `range`, `summary.byDirection`, `breakouts[]`), один-в-один с `AnalysisResult` (`levels-api/API.md`) плюс `id` и `createdAt` — чтобы фронт рендерил сохранённые и «живые» анализы одними компонентами. Сериализаторы: `AnalysisSaveSerializer` (вход — полный результат, camelCase; вложенные `_ParamsInputSerializer`/`_BreakoutInputSerializer`, `range` как `DictField` т.к. `from`/`to` не идентификаторы Python), `AnalysisSummarySerializer` (список), `AnalysisDetailSerializer` (+`breakouts`).
 
-**`POST` flow** (`views.create`): валидирует параметры → строит query (необязательные `natrMultiplier`/`minGap`/`candles` шлёт только если заданы, иначе дефолты `levels-api`) → `run_analysis` зовёт `levels-api` → `_persist_analysis` создаёт `LevelAnalysis` + `bulk_create` пробоев → отдаёт detail (201). Ошибки `levels-api` (404/502/таймаут) маппятся в `AnalysisServiceError` (502).
+**`POST` flow** (`views.create`): `AnalysisSaveSerializer` валидирует структуру/домены присланного `AnalysisResult` → `_persist_analysis` создаёт `LevelAnalysis` + `bulk_create` пробоев, при этом `summary` **пересчитывается на сервере** из пробоев (`_build_summary`, клиентский summary игнорируется) → отдаёт detail (201).
 
-### Проксирование в levels-api (`apps/levels/services/analysis_client.py`)
+**Избранные монеты** — `FavoriteCoinViewSet` (`IsAuthenticated`, `pagination_class = None`, queryset по `owner=request.user`). Адресуется **по символу** (`lookup_field = "symbol"`, `lookup_value_regex = "[A-Za-z0-9]+"`), чтобы фронт переключал звезду без хранения id строк. `FavoriteCoinSerializer` нормализует `symbol` в верхний регистр (`validate_symbol`).
 
-`run_analysis(symbol, timeframe, query)` — `requests.get` на `GET {LEVELS_API_URL}/analysis/{tf}/{symbol}?...`, **один запрос без ретраев** (анализ дорогой: свечи+трейды Binance; ретраить долгий таймаут нельзя), таймаут `LEVELS_API_REQUEST_TIMEOUT_SECONDS` (120с). Бросает `LevelsAnalysisError` на любой сбой. Синхронно (dev runserver многопоточный; на проде учесть worker timeout). `levels-api` без auth — Django ходит во внутреннюю сеть.
+| Метод | Путь | Назначение |
+|-------|------|------------|
+| GET | `/api/levels/favorites/` | Все избранные монеты пользователя (без пагинации), `[{id, symbol, createdAt}]` |
+| POST | `/api/levels/favorites/` | Добавить в избранное, тело `{symbol}`. **Идемпотентно**: повтор существующего → существующая запись (200, не 400), новая → 201 (`get_or_create`) |
+| DELETE | `/api/levels/favorites/{symbol}/` | Убрать из избранного по символу (регистронезависимо, `get_object` приводит к upper) |
+
+### Серверный fallback расчёта (`apps/levels/services/analysis_client.py`)
+
+`run_analysis(symbol, timeframe, query)` — `requests.get` на `GET {LEVELS_API_URL}/analysis/{tf}/{symbol}?...`. **Не подключён в текущий `views.create`** (анализ считается на фронте); оставлен как серверный fallback для отладки/возможного батча. Один запрос без ретраев, таймаут `LEVELS_API_REQUEST_TIMEOUT_SECONDS` (120с), бросает `LevelsAnalysisError`. `levels-api` без auth — внутренняя сеть.
 
 ### Settings / env
 
 `settings/base.py`: `LEVELS_API_URL` (env, дефолт `http://127.0.0.1:3000`), `LEVELS_API_REQUEST_TIMEOUT_SECONDS` (env, дефолт 120). Внесены в `.env`/`.env.example`. Приложение — в `INSTALLED_APPS` (`apps.levels`), маршрут — в root `urls.py`.
 
-### Контракт Django ↔ levels-api
+### Контракт `AnalysisResult` (фронт → Django)
 
-`POST /api/levels/analyses/` → `GET {LEVELS_API_URL}/analysis/:tf/:symbol`. Меняешь форму ответа `levels-api` (`AnalysisResult`) — синхронизируй `_persist_analysis`, сериализаторы и `art-level-screener/services/levels-api/API.md`. Фронт **больше не зовёт `/analysis` напрямую** — только через Django (секундные графики деталей по-прежнему тянут Binance напрямую).
+Тело `POST /api/levels/analyses/` — это `AnalysisResult`, который фронт считает в браузере копией алгоритма `levels-api` (`quasar/.../src/stores/levels/compute/`, зеркало — см. AGENTS §5.2). Форма едина у трёх сторон: фронтовый `compute/analysis-compute.ts` ↔ levels-api `lib/analysis-compute.ts` ↔ Django `AnalysisSaveSerializer`/`_persist_analysis`. Меняешь форму — синхронизируй все три + `art-level-screener/services/levels-api/API.md`. `LEVELS_API_URL` в Django остаётся для **fallback** `analysis_client` (не на активном пути).
 
 ## 11. Django admin
 

@@ -4,13 +4,15 @@ import {
   type SavedAnalysis,
   type SavedAnalysisDetail,
 } from './api/analysisApi';
-import type { BreakoutDirection } from './api/levelsApi';
+import { levelsApi, type BreakoutDirection, type LevelsConfig } from './api/levelsApi';
+import { runClientAnalysis } from './compute/analysisClient';
 import { extractApiErrorMessage } from 'src/utils/apiError';
 
-// Breakout-analysis settings (the analysis dialog form). The analysis runs and
-// is persisted server-side in Django (which proxies levels-api); this store
-// holds the per-coin history (`items`), the selected analysis with its breakouts
-// (`selected`), and the run/list/detail loading state.
+// Breakout-analysis settings (the analysis dialog form). The analysis is computed
+// in the browser (see ./compute — direct Binance fetch) and only the result is
+// persisted in Django. This store holds the per-coin history (`items`), the
+// selected analysis with its breakouts (`selected`), the cached calc params
+// (`config` from levels-api) and the run/list/detail loading state.
 
 export interface AnalysisSettings {
   timeframe: string;
@@ -36,6 +38,9 @@ interface AnalysisState {
   symbol: string;
   items: SavedAnalysis[];
   selected: SavedAnalysisDetail | null;
+  // Calc params from levels-api /config, fetched once and cached (so the client
+  // computes levels with the exact same params as the screener).
+  config: LevelsConfig | null;
   listLoading: boolean;
   detailLoading: boolean;
   running: boolean;
@@ -52,6 +57,7 @@ export const useAnalysisStore = defineStore('levelsAnalysis', {
     symbol: '',
     items: [],
     selected: null,
+    config: null,
     listLoading: false,
     detailLoading: false,
     running: false,
@@ -78,25 +84,27 @@ export const useAnalysisStore = defineStore('levelsAnalysis', {
       }
     },
 
-    // Run + persist a new analysis, prepend it to the list and select it.
+    // Compute a new analysis in the browser (direct Binance fetch), persist the
+    // result in Django, prepend it to the list and select it.
     async run(symbol: string, settings: AnalysisSettings) {
       this.running = true;
       this.error = null;
       try {
-        const detail = await analysisApi.create({
-          symbol,
-          timeframe: settings.timeframe,
-          natrMultiplier: settings.natrMultiplier,
-          minGap: settings.minGap,
-          direction: settings.direction,
-          maxBreakoutSeconds: settings.maxBreakoutSeconds,
-          minMovePct: settings.minMovePct,
-          candles: settings.candles,
-        });
+        // Calc params (must match the screener) are fetched once and cached.
+        if (!this.config) {
+          this.config = await levelsApi.config();
+        }
+        const result = await runClientAnalysis(symbol, settings, this.config);
+        const detail = await analysisApi.create(result);
         this.items.unshift(toSummary(detail));
         this.selected = detail;
       } catch (e) {
-        this.error = extractApiErrorMessage(e, 'Не удалось выполнить анализ');
+        // Binance/compute failures are plain Errors → surface their message;
+        // Django save failures are axios → extractApiErrorMessage pulls the detail.
+        this.error = extractApiErrorMessage(
+          e,
+          e instanceof Error ? e.message : 'Не удалось выполнить анализ',
+        );
         throw e;
       } finally {
         this.running = false;

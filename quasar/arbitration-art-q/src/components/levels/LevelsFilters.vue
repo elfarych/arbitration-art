@@ -46,6 +46,28 @@
       />
       <q-tooltip>Минимум свечей между касаниями уровня (ближе — считается одним касанием)</q-tooltip>
     </label>
+
+    <q-btn
+      no-caps
+      dense
+      unelevated
+      icon="push_pin"
+      class="filter-pin"
+      :color="pinFavorites ? 'primary' : 'dark'"
+      :text-color="pinFavorites ? 'white' : 'grey-5'"
+      :disable="favoritesCount === 0 && !pinFavorites"
+      @click="emit('toggle-pin')"
+    >
+      <q-tooltip>
+        {{
+          favoritesCount === 0 && !pinFavorites
+            ? 'Нет избранных монет'
+            : pinFavorites
+              ? 'Открепить избранные'
+              : 'Закрепить избранные сверху'
+        }}
+      </q-tooltip>
+    </q-btn>
   </div>
 </template>
 
@@ -61,10 +83,15 @@ const props = defineProps<{
   minVolume: number;
   natrMultiplier: number;
   minGap: number;
+  // Whether favorites are pinned to the top of the screener.
+  pinFavorites: boolean;
+  // Number of favorite coins — gates the pin button (can't pin with none).
+  favoritesCount: number;
 }>();
 
 const emit = defineEmits<{
   (e: 'apply', value: { minVolume: number; natrMultiplier: number; minGap: number }): void;
+  (e: 'toggle-pin'): void;
 }>();
 
 const MILLION = 1_000_000;
@@ -130,4 +157,11 @@ function apply(): void {
   font-size: 11px
   white-space: nowrap
   user-select: none
+
+// Pin button aligned to the filter pills: same height and radius so the row
+// stays one cohesive control group.
+.filter-pin
+  height: 32px
+  min-width: 40px
+  border-radius: 6px
 </style>

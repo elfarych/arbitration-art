@@ -58,6 +58,36 @@ class LevelAnalysis(models.Model):
         return f"{self.symbol} {self.timeframe} ({self.created_at:%Y-%m-%d %H:%M})"
 
 
+class FavoriteCoin(models.Model):
+    """A coin a user pinned as a favorite on the levels screener.
+
+    Per-user watchlist of symbols. The screener fronts this with a star toggle on
+    each chart card and a "pin favorites to the top" filter. `symbol` is stored
+    uppercased (matching the screener) and is unique per owner, so the API can be
+    addressed by symbol (`/favorites/BTCUSDT/`) without tracking row ids.
+    """
+
+    owner = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="favorite_coins",
+    )
+    symbol = models.CharField(max_length=40)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["owner", "symbol"], name="unique_favorite_per_owner"
+            )
+        ]
+        indexes = [models.Index(fields=["owner", "symbol"])]
+
+    def __str__(self) -> str:
+        return f"{self.symbol} ({self.owner})"
+
+
 class LevelAnalysisBreakout(models.Model):
     """One detected breakout inside a `LevelAnalysis` (mirrors the API breakout)."""
 

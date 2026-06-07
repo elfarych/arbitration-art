@@ -1,10 +1,11 @@
 import { api } from 'boot/axios';
-import type { AnalysisResult, AnalysisBreakout, BreakoutDirection } from './levelsApi';
+import type { AnalysisResult, AnalysisBreakout } from './levelsApi';
 
-// Saved breakout analyses live in Django (it proxies levels-api, persists, and
-// serves history per user). Uses the authed `api` instance (JWT), unlike the
-// screener which talks to levels-api directly. Django returns the same camelCase
-// shape as levels-api's AnalysisResult, plus `id` and `createdAt`.
+// Saved breakout analyses live in Django, but the analysis itself is computed in
+// the browser (see ../compute) — Django only persists the result and serves the
+// per-user history. Uses the authed `api` instance (JWT), unlike the screener
+// which talks to levels-api directly. Django returns the same camelCase shape as
+// the computed AnalysisResult, plus `id` and `createdAt`.
 
 // List row: an analysis without its breakouts.
 export type SavedAnalysis = Omit<AnalysisResult, 'breakouts'> & {
@@ -16,18 +17,6 @@ export type SavedAnalysis = Omit<AnalysisResult, 'breakouts'> & {
 export type SavedAnalysisDetail = SavedAnalysis & {
   breakouts: AnalysisBreakout[];
 };
-
-export interface AnalysisRunPayload {
-  symbol: string;
-  timeframe: string;
-  // Omitted calc params fall back to levels-api env defaults server-side.
-  natrMultiplier?: number;
-  minGap?: number;
-  direction: BreakoutDirection;
-  maxBreakoutSeconds: number;
-  minMovePct: number;
-  candles?: number;
-}
 
 // DRF list may be a bare array or a paginated { results } envelope.
 function unwrapList<T>(data: T[] | { results?: T[] }): T[] {
@@ -44,10 +33,11 @@ export const analysisApi = {
     return unwrapList(data);
   },
 
-  // Run + persist a new analysis (POST /levels/analyses/). Django calls levels-api,
-  // saves the result, and returns the full saved analysis with breakouts.
-  async create(payload: AnalysisRunPayload): Promise<SavedAnalysisDetail> {
-    const { data } = await api.post<SavedAnalysisDetail>('/levels/analyses/', payload);
+  // Persist a browser-computed analysis (POST /levels/analyses/). Django validates
+  // the structure, recomputes the summary server-side, saves it under the user,
+  // and returns the full saved analysis with breakouts.
+  async create(result: AnalysisResult): Promise<SavedAnalysisDetail> {
+    const { data } = await api.post<SavedAnalysisDetail>('/levels/analyses/', result);
     return data;
   },
 

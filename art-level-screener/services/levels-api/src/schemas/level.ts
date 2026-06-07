@@ -190,6 +190,44 @@ export const AnalysisQuery = Type.Object({
   ),
 });
 
+export const ConfigResponse = Type.Object(
+  {
+    levels: Type.Object(
+      {
+        period: Type.Integer(),
+        extremaWindow: Type.Integer(),
+        maxBrokenAge: Type.Integer(),
+        minTouches: Type.Integer(),
+        minGap: Type.Integer(),
+        natrMultiplier: Type.Number(),
+        atrPeriod: Type.Integer(),
+      },
+      { description: 'Env-дефолты детекции уровней (как в скринере)' },
+    ),
+    analysis: Type.Object(
+      {
+        defaultCandles: Type.Integer(),
+        maxCandles: Type.Integer(),
+        aggTradesLimit: Type.Integer(),
+        maxTradePages: Type.Integer(),
+      },
+      { description: 'Дефолты и кэпы анализа пробоев' },
+    ),
+    binance: Type.Object(
+      {
+        restUrl: Type.String(),
+        weightLimitPerMin: Type.Integer(),
+      },
+      { description: 'Binance Futures REST: база и weight-лимит (для клиентского лимитера)' },
+    ),
+  },
+  {
+    $id: 'ConfigResponse',
+    description:
+      'Параметры расчёта для клиентского анализа: фронт считает анализ сам и должен использовать те же параметры, что и скринер',
+  },
+);
+
 export const HealthResponse = Type.Object(
   {
     status: Type.Literal('ok'),
@@ -267,6 +305,7 @@ export type ScreenerQueryType = Static<typeof ScreenerQuery>;
 export type AnalysisBreakoutType = Static<typeof AnalysisBreakout>;
 export type AnalysisResponseType = Static<typeof AnalysisResponse>;
 export type AnalysisQueryType = Static<typeof AnalysisQuery>;
+export type ConfigResponseType = Static<typeof ConfigResponse>;
 
 /** Общие модели для регистрации в Fastify (по $id ссылаются схемы маршрутов). */
 export const SHARED_MODELS = [
@@ -279,4 +318,5 @@ export const SHARED_MODELS = [
   ErrorResponse,
   AnalysisBreakout,
   AnalysisResponse,
+  ConfigResponse,
 ];

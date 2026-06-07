@@ -145,6 +145,7 @@ Node.js/TypeScript-сервиса в `art-level-screener/services/`, связа�
 - Контракт между сервисами — **ключи Redis** (см. схемы в `DOCS.md`); контракт наружу — **HTTP API** `levels-api`. Меняешь одну сторону — проверь вторую и обнови `DOCS.md`/`API.md`.
 - Согласование префиксов по цепочке: `REDIS_KEY_PREFIX` (connector) = `SOURCE_PREFIX` (processor); `OUTPUT_PREFIX` (processor) = `LEVELS_PREFIX` (api). Рассогласование → пустые экраны.
 - Формулы уровней (NATR-допуск, касания, active/broken, дистанция в NATR) и параметры (`PERIOD`, `MIN_TOUCHES`, `MIN_GAP`, `NATR_MULTIPLIER`, …) не меняй без явного объяснения и обновления `DOCS.md`.
+- **Дублированный алгоритм анализа (фронт ↔ levels-api).** Расчёт анализа пробоев продублирован в браузере: `quasar/arbitration-art-q/src/stores/levels/compute/` — зеркало `levels-api/src/{levels,lib/analysis-compute,binance}`. Источник правды — `levels-api`. Любая правка детекции уровней / скана пробоев / проверки по трейдам / NATR / касаний / экстремумов / дедупа делается **синхронно в обоих местах**, иначе анализ найдёт другие уровни, чем скринер. Параметры (`PERIOD`/`EXTREMA_WINDOW`/`MIN_TOUCHES`/`ATR_PERIOD`/`MAX_BROKEN_AGE` + analysis-кэпы) фронт тянет с `levels-api` `GET /config` — не хардкодить. Детали и таблица соответствия файлов — в `compute/README.md`.
 - Биржевые клиенты — **нативные** (undici/`ws`), **без `ccxt`** (правило §8.1). Сервис работает только с публичными данными Binance — exchange API keys не нужны и не должны появляться.
 - `levels-api` сейчас без аутентификации (внутренняя сеть). Не выставлять наружу без auth; при интеграции с фронтом ограничить `CORS_ORIGIN` до origin фронтенда.
 - `.env` сервисов — по правилам §10.1 (non-secret конфигурация; реальных ключей быть не должно).
@@ -292,7 +293,10 @@ pnpm build
 - Exchange enum/choices -> frontend exchange options and engine mappings.
 - `art-level-screener` Redis keys: connector (`binance-futures:*`) -> processor (`levels:*`) -> `levels-api` reader.
 - `levels-api` HTTP API (`/screener/:tf`, `/screener/:tf/:symbol`) -> раздел скринера во `quasar/arbitration-art-q` (контракт — `art-level-screener/services/levels-api/API.md`).
-- `levels-api` `/analysis/:tf/:symbol` -> Django (`apps.levels`, проксирует и сохраняет) -> Quasar `analysisApi`. Фронт зовёт анализ только через Django (`/api/levels/analyses/`), не напрямую `levels-api`. Меняешь форму `AnalysisResult` — синхронизируй Django `_persist_analysis`/сериализаторы и `API.md`.
+- `levels-api` `/config` -> Quasar `levelsApi.config()` + модуль `compute/`. Отдаёт env-дефолты детекции уровней и кэпы анализа, чтобы клиентский расчёт совпадал со скринером. Меняешь форму — синхронизируй `API.md` и фронтовый `LevelsConfig`.
+- **Анализ пробоев считается на фронте.** Браузер тянет свечи/трейды **напрямую с Binance** (`fapi.binance.com`, без прокси — weight-лимит распределяется по IP пользователей) и сам считает анализ (`quasar/.../compute/`, зеркало levels-api). Готовый `AnalysisResult` уходит в Django `POST /api/levels/analyses/`, где сохраняется. **Trust-tradeoff:** Django доверяет присланным пробоям (без Binance их не перепроверить), но `summary` пересчитывает сам из пробоев. Меняешь форму `AnalysisResult` — синхронизируй: фронтовый `compute/analysis-compute.ts` ↔ levels-api `lib/analysis-compute.ts`, Django `AnalysisSaveSerializer`/`_persist_analysis`, и `API.md`.
+- `levels-api` `/analysis/:tf/:symbol` + Django `services/analysis_client.run_analysis` — **серверный fallback**, в текущий фронт-путь не подключён (оставлен для отладки/возможного серверного батча).
+- **Избранные монеты скринера** — Django `apps.levels` `FavoriteCoin` (`/api/levels/favorites/`, адресуется по символу) ↔ фронт `favoritesApi` + `useFavoritesStore` (звезда на карточке, пин-режим скринера). Per-user watchlist; меняешь форму — синхронизируй обе стороны и `DOCS.md` обоих приложений.
 
 Контрактные изменения всегда документировать в `DOCS.md` всех затронутых приложений.
 

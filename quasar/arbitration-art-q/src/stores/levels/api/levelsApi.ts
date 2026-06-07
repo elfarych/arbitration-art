@@ -158,10 +158,42 @@ export interface AnalysisResult {
   breakouts: AnalysisBreakout[];
 }
 
+// Calculation params for the client-side analysis (GET /config). The frontend
+// computes analyses itself and must use the SAME level params as the screener,
+// so it reads the authoritative env defaults from levels-api instead of
+// hardcoding them. `levels` is structurally a LevelParams (compute module).
+export interface LevelsConfig {
+  levels: {
+    period: number;
+    extremaWindow: number;
+    maxBrokenAge: number;
+    minTouches: number;
+    minGap: number;
+    natrMultiplier: number;
+    atrPeriod: number;
+  };
+  analysis: {
+    defaultCandles: number;
+    maxCandles: number;
+    aggTradesLimit: number;
+    maxTradePages: number;
+  };
+  binance: {
+    restUrl: string;
+    weightLimitPerMin: number;
+  };
+}
+
 export const levelsApi = {
   // Timeframes that currently have data (GET /timeframes).
   async timeframes(): Promise<string[]> {
     const { data } = await levelsHttp.get<string[]>('/timeframes');
+    return data;
+  },
+
+  // Calculation params for the client-side analysis (GET /config).
+  async config(): Promise<LevelsConfig> {
+    const { data } = await levelsHttp.get<LevelsConfig>('/config');
     return data;
   },
 

@@ -1,13 +1,29 @@
 <template>
   <q-card class="bg-dark level-card column" flat>
     <q-card-section class="q-py-sm q-px-md row items-center justify-between no-wrap level-header">
-      <div
-        class="row items-center no-wrap ellipsis cursor-pointer symbol-link"
-        @click="emit('open', entry.symbol)"
-      >
-        <span class="text-title-color text-weight-bold">{{ entry.symbol }}</span>
-        <span class="q-ml-sm text-grey-5 text-caption">NATR {{ entry.natr.toFixed(2) }}%</span>
-        <q-tooltip :delay="400">Открыть страницу монеты</q-tooltip>
+      <div class="row items-center no-wrap ellipsis">
+        <q-btn
+          flat
+          dense
+          round
+          no-caps
+          size="sm"
+          class="q-mr-xs"
+          :icon="isFavorite ? 'star' : 'star_border'"
+          :color="isFavorite ? 'amber' : 'grey-6'"
+          :loading="isFavoritePending"
+          @click="toggleFavorite"
+        >
+          <q-tooltip>{{ isFavorite ? 'Убрать из избранного' : 'В избранное' }}</q-tooltip>
+        </q-btn>
+        <div
+          class="row items-center no-wrap ellipsis cursor-pointer symbol-link"
+          @click="emit('open', entry.symbol)"
+        >
+          <span class="text-title-color text-weight-bold">{{ entry.symbol }}</span>
+          <span class="q-ml-sm text-grey-5 text-caption">NATR {{ entry.natr.toFixed(2) }}%</span>
+          <q-tooltip :delay="400">Открыть страницу монеты</q-tooltip>
+        </div>
       </div>
       <div class="row items-center no-wrap q-gutter-x-sm text-caption">
         <q-chip
@@ -53,6 +69,7 @@ import {
 import type { ScreenerEntry, LevelView, LevelSide } from 'src/stores/levels/api/levelsApi';
 import { fetchKlines } from 'src/stores/levels/api/binanceKlines';
 import { subscribeKline, type LiveCandle } from 'src/stores/levels/api/klineStream';
+import { useFavoritesStore } from 'src/stores/levels/favorites.store';
 import { useChartRuler } from './useChartRuler';
 import ChartRulerOverlay from './ChartRulerOverlay.vue';
 
@@ -62,11 +79,22 @@ const props = defineProps<{ entry: ScreenerEntry; timeframe: string }>();
 // detail page. Left unhandled on the detail page itself (no re-navigation).
 const emit = defineEmits<{ open: [symbol: string] }>();
 
+// Favorite star next to the symbol. Toggling is optimistic (instant fill) and
+// persisted in Django via the store.
+const favoritesStore = useFavoritesStore();
+const isFavorite = computed(() => favoritesStore.isFavorite(props.entry.symbol));
+const isFavoritePending = computed(() => favoritesStore.isPending(props.entry.symbol));
+function toggleFavorite(): void {
+  void favoritesStore.toggle(props.entry.symbol);
+}
+
 // Candles shown by default; older bars lazy-load on scroll (HISTORY_BATCH).
 const CANDLE_LIMIT = 400;
 const HISTORY_BATCH = 500;
-// Small empty gap kept to the right of the last candle (in bars).
-const RIGHT_OFFSET = 8;
+// Empty gap kept to the right of the last candle (in bars). Sized so the gap
+// stays clearly visible against the full CANDLE_LIMIT view (~6% of width) on the
+// small screener cards, not just a couple of pixels.
+const RIGHT_OFFSET = 24;
 const SUPPORT_COLOR = '#83c764';
 const RESISTANCE_COLOR = '#ff5d6b';
 // Semi-transparent variants for the level rays (candles keep the solid colors).

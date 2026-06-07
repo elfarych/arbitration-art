@@ -1,6 +1,24 @@
 from rest_framework import serializers
 
-from apps.levels.models import LevelAnalysis, LevelAnalysisBreakout
+from apps.levels.models import FavoriteCoin, LevelAnalysis, LevelAnalysisBreakout
+
+
+class FavoriteCoinSerializer(serializers.ModelSerializer):
+    """One favorite coin. Input is just `symbol`; it is normalized to uppercase so
+    it matches the screener symbols and the per-owner uniqueness constraint."""
+
+    createdAt = serializers.DateTimeField(source="created_at", read_only=True)
+
+    class Meta:
+        model = FavoriteCoin
+        fields = ["id", "symbol", "createdAt"]
+        read_only_fields = ["id", "createdAt"]
+
+    def validate_symbol(self, value: str) -> str:
+        symbol = value.strip().upper()
+        if not symbol:
+            raise serializers.ValidationError("Symbol must not be empty.")
+        return symbol
 
 # Output is camelCase and nested (params/range/summary/byDirection) to match the
 # levels-api AnalysisResult contract the frontend already consumes — so the same
@@ -99,3 +117,65 @@ class AnalysisDetailSerializer(AnalysisSummarySerializer):
 
     class Meta(AnalysisSummarySerializer.Meta):
         fields = AnalysisSummarySerializer.Meta.fields + ["breakouts"]
+
+
+class _BreakoutInputSerializer(serializers.Serializer):
+    """Validates one browser-computed breakout before persistence (camelCase wire)."""
+
+    price = serializers.FloatField()
+    levelTime = serializers.IntegerField()
+    kind = serializers.ChoiceField(choices=["top", "bottom"])
+    direction = serializers.ChoiceField(choices=["up", "down"])
+    touches = serializers.IntegerField(min_value=0)
+    breakoutCandleTime = serializers.IntegerField()
+    crossTime = serializers.IntegerField(allow_null=True)
+    reachTime = serializers.IntegerField(allow_null=True)
+    elapsedMs = serializers.IntegerField(allow_null=True)
+    movePct = serializers.FloatField(allow_null=True)
+    matched = serializers.BooleanField()
+    reason = serializers.ChoiceField(
+        choices=["ok", "no_trades", "no_cross", "min_move_not_reached", "too_slow"]
+    )
+
+
+class _ParamsInputSerializer(serializers.Serializer):
+    natrMultiplier = serializers.FloatField(min_value=0)
+    minGap = serializers.IntegerField(min_value=1)
+    direction = serializers.ChoiceField(choices=["up", "down", "both"])
+    maxBreakoutSeconds = serializers.IntegerField(min_value=1)
+    minMovePct = serializers.FloatField(min_value=0)
+    candles = serializers.IntegerField(min_value=1)
+
+
+class AnalysisSaveSerializer(serializers.Serializer):
+    """Input for POST /levels/analyses/ — a browser-computed AnalysisResult.
+
+    The analysis is computed client-side (frontend src/stores/levels/compute),
+    so this is user-supplied data (accepted trust tradeoff). Structure and field
+    domains are validated here; the client `summary` is NOT trusted — the viewset
+    recomputes it from `breakouts`. Unknown extra keys (e.g. a client summary) are
+    ignored by DRF.
+    """
+
+    MAX_BREAKOUTS = 2000
+
+    symbol = serializers.CharField(max_length=40)
+    timeframe = serializers.CharField(max_length=8)
+    candlesAnalyzed = serializers.IntegerField(min_value=1)
+    params = _ParamsInputSerializer()
+    # 'from'/'to' are not valid Python identifiers, so range is a dict, not a
+    # nested serializer.
+    range = serializers.DictField(child=serializers.IntegerField())
+    breakouts = _BreakoutInputSerializer(many=True)
+
+    def validate_range(self, value):
+        if "from" not in value or "to" not in value:
+            raise serializers.ValidationError("range must contain 'from' and 'to'.")
+        return value
+
+    def validate_breakouts(self, value):
+        if len(value) > self.MAX_BREAKOUTS:
+            raise serializers.ValidationError(
+                f"Too many breakouts (> {self.MAX_BREAKOUTS})."
+            )
+        return value

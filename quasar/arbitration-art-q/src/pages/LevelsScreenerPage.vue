@@ -1,7 +1,7 @@
 <template>
   <q-page class="q-pa-md text-white column no-wrap">
     <div class="row items-center q-gutter-x-sm q-mb-sm header-row">
-      <h4 class="q-my-none text-h6 text-weight-bold">Скринер уровней</h4>
+      <h4 class="q-my-none text-h6 text-weight-bold">Уровни</h4>
       <span v-if="updatedAt" class="text-caption text-grey-5">обновлено {{ updatedAt }}</span>
 
       <q-space />
@@ -62,7 +62,10 @@
         :min-volume="store.minVolume"
         :natr-multiplier="store.natrMultiplier"
         :min-gap="store.minGap"
+        :pin-favorites="store.pinFavorites"
+        :favorites-count="favoritesStore.count"
         @apply="onParams"
+        @toggle-pin="onTogglePin"
       />
 
       <LevelsGridPicker :columns="columns" :rows="rows" :max="5" @select="onSelectGrid" />
@@ -110,11 +113,13 @@
 import { ref, computed, onMounted } from 'vue';
 import { useRouter } from 'vue-router';
 import { useLevelsStore } from 'src/stores/levels/levels.store';
+import { useFavoritesStore } from 'src/stores/levels/favorites.store';
 import LevelChartCard from 'src/components/levels/LevelChartCard.vue';
 import LevelsGridPicker from 'src/components/levels/LevelsGridPicker.vue';
 import LevelsFilters from 'src/components/levels/LevelsFilters.vue';
 
 const store = useLevelsStore();
+const favoritesStore = useFavoritesStore();
 const router = useRouter();
 
 // Open the coin detail page; carry the current screener timeframe so the detail
@@ -149,6 +154,7 @@ async function onSelectGrid({ columns: c, rows: r }: { columns: number; rows: nu
 const PARAM_MIN_VOLUME_KEY = 'levels.minVolume';
 const PARAM_NATR_MULT_KEY = 'levels.natrMultiplier';
 const PARAM_MIN_GAP_KEY = 'levels.minGap';
+const PIN_FAVORITES_KEY = 'levels.pinFavorites';
 
 function loadNumber(key: string, fallback: number): number {
   const raw = localStorage.getItem(key);
@@ -162,6 +168,14 @@ async function onParams(p: { minVolume: number; natrMultiplier: number; minGap: 
   localStorage.setItem(PARAM_NATR_MULT_KEY, String(p.natrMultiplier));
   localStorage.setItem(PARAM_MIN_GAP_KEY, String(p.minGap));
   await store.setParams(p);
+}
+
+// Toggle "pin favorites to the top"; persist the choice so it sticks across
+// reloads. The store reshapes the fetch (full universe vs one page) accordingly.
+async function onTogglePin() {
+  const next = !store.pinFavorites;
+  localStorage.setItem(PIN_FAVORITES_KEY, next ? '1' : '0');
+  await store.setPinFavorites(next);
 }
 
 // Wall-clock time of the last manual refresh (no live ticking — updates only
@@ -188,7 +202,10 @@ onMounted(async () => {
   store.minVolume = loadNumber(PARAM_MIN_VOLUME_KEY, store.minVolume);
   store.natrMultiplier = loadNumber(PARAM_NATR_MULT_KEY, store.natrMultiplier);
   store.minGap = loadNumber(PARAM_MIN_GAP_KEY, store.minGap);
-  await store.fetchTimeframes();
+  store.pinFavorites = localStorage.getItem(PIN_FAVORITES_KEY) === '1';
+  // Favorites must be loaded before the first screener fetch so pinned ordering
+  // and filled stars are correct on first paint. Loaded alongside timeframes.
+  await Promise.all([favoritesStore.load(), store.fetchTimeframes()]);
   await store.fetchScreener();
 });
 </script>

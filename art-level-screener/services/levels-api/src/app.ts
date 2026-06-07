@@ -8,6 +8,7 @@ import { SHARED_MODELS } from './schemas/level';
 import { healthRoutes } from './routes/health';
 import { screenerRoutes } from './routes/screener';
 import { timeframesRoutes } from './routes/timeframes';
+import { configRoutes } from './routes/config';
 import { analysisRoutes } from './routes/analysis';
 import redisPlugin from './plugins/redis';
 import binancePlugin from './plugins/binance';
@@ -32,6 +33,7 @@ export async function buildApp(config: Config): Promise<FastifyInstance> {
 
   await app.register(healthRoutes);
   await app.register(timeframesRoutes);
+  await app.register(configRoutes);
   await app.register(screenerRoutes);
   await app.register(analysisRoutes);
 

@@ -1,6 +1,6 @@
 from django.contrib import admin
 
-from apps.levels.models import LevelAnalysis, LevelAnalysisBreakout
+from apps.levels.models import FavoriteCoin, LevelAnalysis, LevelAnalysisBreakout
 
 
 class LevelAnalysisBreakoutInline(admin.TabularInline):
@@ -25,3 +25,10 @@ class LevelAnalysisAdmin(admin.ModelAdmin):
     list_filter = ("symbol", "timeframe", "direction", "created_at")
     search_fields = ("symbol", "owner__email")
     inlines = [LevelAnalysisBreakoutInline]
+
+
+@admin.register(FavoriteCoin)
+class FavoriteCoinAdmin(admin.ModelAdmin):
+    list_display = ("id", "owner", "symbol", "created_at")
+    list_filter = ("created_at",)
+    search_fields = ("symbol", "owner__email")
