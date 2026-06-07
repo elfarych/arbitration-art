@@ -82,5 +82,11 @@ module.exports = {
     nodeDev('levels-connector', path.join(servicesDir, 'binance-futures-connector'), 'src/index.ts'),
     // nodeDev('levels-processor', path.join(servicesDir, 'levels-processor'), 'src/index.ts'),
     nodeDev('levels-api', path.join(servicesDir, 'levels-api'), 'src/index.ts'),
+
+    // --- Level notifications (Telegram) ----------------------------------
+    // Reads active per-user configs from Django every 10s, computes levels from
+    // the connector's candles (does NOT need levels-processor), sends alerts.
+    // Requires DJANGO_API_URL + SERVICE_SHARED_TOKEN + TELEGRAM_BOT_TOKEN in its .env.
+    nodeDev('level-notifier', path.join(servicesDir, 'level-notifier'), 'src/index.ts'),
   ],
 };

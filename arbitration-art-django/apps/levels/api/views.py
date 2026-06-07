@@ -1,17 +1,25 @@
 from typing import Any
 
 from django.shortcuts import get_object_or_404
-from rest_framework import mixins, status, viewsets
+from rest_framework import generics, mixins, status, viewsets
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
+from apps.bots.permissions import ServiceTokenOnly
 from apps.levels.api.serializers import (
     AnalysisDetailSerializer,
     AnalysisSaveSerializer,
     AnalysisSummarySerializer,
     FavoriteCoinSerializer,
+    LevelNotificationConfigSerializer,
+    ServiceNotificationConfigSerializer,
 )
-from apps.levels.models import FavoriteCoin, LevelAnalysis, LevelAnalysisBreakout
+from apps.levels.models import (
+    FavoriteCoin,
+    LevelAnalysis,
+    LevelAnalysisBreakout,
+    LevelNotificationConfig,
+)
 
 
 class FavoriteCoinViewSet(
@@ -182,3 +190,45 @@ def _persist_analysis(user, symbol: str, timeframe: str, result: dict[str, Any])
         ]
     )
     return analysis
+
+
+class LevelNotificationConfigView(generics.RetrieveUpdateAPIView):
+    """Return / update the current user's level-notification config (singleton).
+
+    One config per user: `get_object` creates it lazily on first access (same
+    pattern as `ExchangeKeysView`), so the screener dialog always has a row to read
+    and PUT/PATCH.
+    """
+
+    serializer_class = LevelNotificationConfigSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_object(self) -> LevelNotificationConfig:
+        config, _ = LevelNotificationConfig.objects.get_or_create(user=self.request.user)
+        return config
+
+
+class ServiceNotificationConfigsView(generics.ListAPIView):
+    """All active notification configs for the `level-notifier` service.
+
+    Service-token only (no JWT). Returns enabled configs that have a chat_id, each
+    with the owner's favorite symbols (prefetched). Wrapped in `{"configs": [...]}`
+    to match the engine-bootstrap envelope style.
+    """
+
+    serializer_class = ServiceNotificationConfigSerializer
+    permission_classes = [ServiceTokenOnly]
+    pagination_class = None
+
+    def get_queryset(self):
+        return (
+            LevelNotificationConfig.objects.filter(enabled=True)
+            .exclude(chat_id="")
+            .select_related("user")
+            .prefetch_related("user__favorite_coins")
+            .order_by("user_id")
+        )
+
+    def list(self, request, *args, **kwargs) -> Response:
+        serializer = self.get_serializer(self.get_queryset(), many=True)
+        return Response({"configs": serializer.data})

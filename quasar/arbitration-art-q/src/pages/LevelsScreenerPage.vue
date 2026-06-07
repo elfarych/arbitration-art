@@ -83,6 +83,19 @@
       >
         <q-tooltip>Обновить</q-tooltip>
       </q-btn>
+
+      <q-btn
+        unelevated
+        dense
+        no-caps
+        icon="notifications"
+        class="ctrl-btn"
+        :color="notificationsStore.config.enabled ? 'primary' : 'dark'"
+        :text-color="notificationsStore.config.enabled ? 'white' : 'grey-5'"
+        @click="showNotifications = true"
+      >
+        <q-tooltip>Настройки уведомлений</q-tooltip>
+      </q-btn>
     </div>
 
     <q-banner v-if="store.error" dense class="bg-negative text-white q-mb-md rounded-borders">
@@ -106,6 +119,8 @@
         @open="onOpenCoin"
       />
     </div>
+
+    <LevelsNotificationsDialog v-model="showNotifications" />
   </q-page>
 </template>
 
@@ -114,13 +129,19 @@ import { ref, computed, onMounted } from 'vue';
 import { useRouter } from 'vue-router';
 import { useLevelsStore } from 'src/stores/levels/levels.store';
 import { useFavoritesStore } from 'src/stores/levels/favorites.store';
+import { useNotificationsStore } from 'src/stores/levels/notifications.store';
 import LevelChartCard from 'src/components/levels/LevelChartCard.vue';
 import LevelsGridPicker from 'src/components/levels/LevelsGridPicker.vue';
 import LevelsFilters from 'src/components/levels/LevelsFilters.vue';
+import LevelsNotificationsDialog from 'src/components/levels/LevelsNotificationsDialog.vue';
 
 const store = useLevelsStore();
 const favoritesStore = useFavoritesStore();
+const notificationsStore = useNotificationsStore();
 const router = useRouter();
+
+// Notification settings dialog (per-user level alerts).
+const showNotifications = ref(false);
 
 // Open the coin detail page; carry the current screener timeframe so the detail
 // chart opens on the same TF the user was viewing.
@@ -205,6 +226,9 @@ onMounted(async () => {
   store.pinFavorites = localStorage.getItem(PIN_FAVORITES_KEY) === '1';
   // Favorites must be loaded before the first screener fetch so pinned ordering
   // and filled stars are correct on first paint. Loaded alongside timeframes.
+  // Notification config is loaded in parallel — it only feeds the bell button's
+  // active state and the dialog, so it does not gate the first paint.
+  void notificationsStore.load();
   await Promise.all([favoritesStore.load(), store.fetchTimeframes()]);
   await store.fetchScreener();
 });

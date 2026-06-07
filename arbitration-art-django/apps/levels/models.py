@@ -88,6 +88,54 @@ class FavoriteCoin(models.Model):
         return f"{self.symbol} ({self.owner})"
 
 
+class LevelNotificationConfig(models.Model):
+    """Per-user Telegram notification settings for the levels screener.
+
+    Exactly one config per user (OneToOne). The `level-notifier` service reads all
+    enabled configs that have a chat_id over the service-token channel and, every
+    ~10s, alerts the user when a coin's price comes within `distance_value` of an
+    active horizontal level. The level-detection parameters mirror the screener
+    filters (`natr_multiplier` / `min_gap` / `min_volume`) so alerts match what the
+    user sees on the screen. Notification de-duplication state lives in Redis,
+    owned by the notifier — it is intentionally NOT stored here, so the service
+    never writes back to Django.
+    """
+
+    class DistanceMode(models.TextChoices):
+        PCT = "pct", "pct"
+        NATR = "natr", "natr"
+
+    user = models.OneToOneField(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="level_notification_config",
+    )
+    enabled = models.BooleanField(default=False)
+    only_favorites = models.BooleanField(default=False)
+    timeframe = models.CharField(max_length=8, default="1m")
+    # Level-detection params — same meaning as the screener filters, so the alert
+    # fires on the same levels the screener would show for these settings.
+    natr_multiplier = models.FloatField(default=0.3)  # touch-zone tolerance in NATR units
+    min_gap = models.PositiveIntegerField(default=12)  # min candles between touches
+    min_volume = models.FloatField(default=0)  # min USDT turnover; 0 = off
+    # Proximity trigger: alert when the nearest active level is within
+    # `distance_value`, measured in percent or in NATR units per `distance_mode`.
+    distance_mode = models.CharField(
+        max_length=4, choices=DistanceMode.choices, default=DistanceMode.PCT
+    )
+    distance_value = models.FloatField(default=1.0)
+    chat_id = models.CharField(max_length=64, blank=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "level notification config"
+        verbose_name_plural = "level notification configs"
+
+    def __str__(self) -> str:
+        state = "on" if self.enabled else "off"
+        return f"{self.user.email} level notifications ({state})"
+
+
 class LevelAnalysisBreakout(models.Model):
     """One detected breakout inside a `LevelAnalysis` (mirrors the API breakout)."""
 

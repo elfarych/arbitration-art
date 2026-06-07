@@ -1,6 +1,11 @@
 from django.contrib import admin
 
-from apps.levels.models import FavoriteCoin, LevelAnalysis, LevelAnalysisBreakout
+from apps.levels.models import (
+    FavoriteCoin,
+    LevelAnalysis,
+    LevelAnalysisBreakout,
+    LevelNotificationConfig,
+)
 
 
 class LevelAnalysisBreakoutInline(admin.TabularInline):
@@ -32,3 +37,19 @@ class FavoriteCoinAdmin(admin.ModelAdmin):
     list_display = ("id", "owner", "symbol", "created_at")
     list_filter = ("created_at",)
     search_fields = ("symbol", "owner__email")
+
+
+@admin.register(LevelNotificationConfig)
+class LevelNotificationConfigAdmin(admin.ModelAdmin):
+    list_display = (
+        "id",
+        "user",
+        "enabled",
+        "only_favorites",
+        "timeframe",
+        "distance_mode",
+        "distance_value",
+        "updated_at",
+    )
+    list_filter = ("enabled", "only_favorites", "timeframe", "distance_mode")
+    search_fields = ("user__email", "chat_id")

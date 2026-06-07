@@ -1,6 +1,11 @@
 from rest_framework import serializers
 
-from apps.levels.models import FavoriteCoin, LevelAnalysis, LevelAnalysisBreakout
+from apps.levels.models import (
+    FavoriteCoin,
+    LevelAnalysis,
+    LevelAnalysisBreakout,
+    LevelNotificationConfig,
+)
 
 
 class FavoriteCoinSerializer(serializers.ModelSerializer):
@@ -179,3 +184,98 @@ class AnalysisSaveSerializer(serializers.Serializer):
                 f"Too many breakouts (> {self.MAX_BREAKOUTS})."
             )
         return value
+
+
+class LevelNotificationConfigSerializer(serializers.ModelSerializer):
+    """The current user's level-notification config (camelCase wire shape).
+
+    Used by the screener's notification dialog. `chatId` is allowed blank so other
+    settings can be saved before pasting it, but the service ignores configs
+    without a chat_id. Numeric domains mirror the level math: natrMultiplier > 0,
+    minGap >= 1, minVolume >= 0, distanceValue > 0.
+    """
+
+    onlyFavorites = serializers.BooleanField(source="only_favorites", required=False)
+    natrMultiplier = serializers.FloatField(source="natr_multiplier", required=False)
+    minGap = serializers.IntegerField(source="min_gap", required=False, min_value=1)
+    minVolume = serializers.FloatField(source="min_volume", required=False, min_value=0)
+    distanceMode = serializers.ChoiceField(
+        source="distance_mode",
+        choices=LevelNotificationConfig.DistanceMode.values,
+        required=False,
+    )
+    distanceValue = serializers.FloatField(source="distance_value", required=False)
+    chatId = serializers.CharField(
+        source="chat_id", required=False, allow_blank=True, max_length=64
+    )
+    updatedAt = serializers.DateTimeField(source="updated_at", read_only=True)
+
+    class Meta:
+        model = LevelNotificationConfig
+        fields = [
+            "enabled",
+            "onlyFavorites",
+            "timeframe",
+            "natrMultiplier",
+            "minGap",
+            "minVolume",
+            "distanceMode",
+            "distanceValue",
+            "chatId",
+            "updatedAt",
+        ]
+
+    def validate_natrMultiplier(self, value: float) -> float:
+        if value <= 0:
+            raise serializers.ValidationError("natrMultiplier must be > 0.")
+        return value
+
+    def validate_distanceValue(self, value: float) -> float:
+        if value <= 0:
+            raise serializers.ValidationError("distanceValue must be > 0.")
+        return value
+
+    def validate_timeframe(self, value: str) -> str:
+        timeframe = value.strip()
+        if not timeframe:
+            raise serializers.ValidationError("timeframe must not be empty.")
+        return timeframe
+
+
+class ServiceNotificationConfigSerializer(serializers.ModelSerializer):
+    """Read-only projection of an active config for the `level-notifier` service.
+
+    Adds `ownerId` and the owner's favorite symbols (prefetched by the view) so the
+    service can scope to favorites without a second request. Service-token only;
+    exposes `chatId` over the internal channel.
+    """
+
+    ownerId = serializers.IntegerField(source="user_id", read_only=True)
+    onlyFavorites = serializers.BooleanField(source="only_favorites")
+    natrMultiplier = serializers.FloatField(source="natr_multiplier")
+    minGap = serializers.IntegerField(source="min_gap")
+    minVolume = serializers.FloatField(source="min_volume")
+    distanceMode = serializers.CharField(source="distance_mode")
+    distanceValue = serializers.FloatField(source="distance_value")
+    chatId = serializers.CharField(source="chat_id")
+    favorites = serializers.SerializerMethodField()
+
+    class Meta:
+        model = LevelNotificationConfig
+        fields = [
+            "ownerId",
+            "enabled",
+            "onlyFavorites",
+            "timeframe",
+            "natrMultiplier",
+            "minGap",
+            "minVolume",
+            "distanceMode",
+            "distanceValue",
+            "chatId",
+            "favorites",
+        ]
+
+    def get_favorites(self, obj: LevelNotificationConfig) -> list[str]:
+        # Prefetched via the view (user__favorite_coins) — no extra query per row.
+        return [favorite.symbol for favorite in obj.user.favorite_coins.all()]

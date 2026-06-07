@@ -1167,7 +1167,7 @@ Lifecycle sync **inline** в `BotConfigViewSet.perform_create` / `perform_update
 
 Engine отвечает `{ success: true }` или `{ success: false, error: "..." }` со статусом 200/500. `_perform_post` бросает `LifecycleSyncError` на любой non-2xx ответ и на network errors; retry-policy: `SERVICE_REQUEST_RETRIES` попыток с паузой `SERVICE_REQUEST_RETRY_DELAY_SECONDS`.
 
-## 10A. Levels domain (сохранённые анализы пробоев + избранные монеты)
+## 10A. Levels domain (анализы пробоев + избранные монеты + конфиг уведомлений)
 
 Приложение `apps.levels` хранит результаты анализа пробоев горизонтальных уровней (фича страницы монеты во фронтенде, `art-level-screener`). **Расчёт идёт на фронте** (браузер сам тянет свечи/трейды напрямую с Binance и считает анализ — это разгружает CPU сервера и распределяет weight-лимит Binance по IP пользователей). Django принимает **готовый** результат, валидирует и **сохраняет** под пользователем — история переживает перезагрузку.
 
@@ -1178,6 +1178,7 @@ Engine отвечает `{ success: true }` или `{ success: false, error: "..
 - **`LevelAnalysis`** — один запуск анализа. Поля: `owner` (FK на `users.User`, `related_name="level_analyses"`), `symbol`, `timeframe`; параметры запуска (`natr_multiplier`, `min_gap`, `direction` `up`/`down`/`both`, `max_breakout_seconds`, `min_move_pct`, `candles`); `candles_analyzed`, `range_from`/`range_to` (мс); тоталы (`breakouts_found`, `evaluated`, `matched`, `unmatched`, `match_rate`, `up_found`/`up_matched`/`down_found`/`down_matched`); `created_at`. `ordering = ["-created_at"]`, индекс `(owner, symbol, -created_at)`. Запуски **иммутабельны** (только create/read/delete).
 - **`LevelAnalysisBreakout`** — один пробой внутри анализа (`analysis` FK, `related_name="breakouts"`). Поля повторяют контракт пробоя: `price`, `level_time`, `kind`, `direction`, `touches`, `breakout_candle_time`, `cross_time`/`reach_time`/`elapsed_ms`/`move_pct` (nullable), `matched`, `reason`. Времена — `BigIntegerField` (мс Unix), цены/проценты — `FloatField` (research-данные, не деньги).
 - **`FavoriteCoin`** — избранная монета пользователя для скринера уровней (per-user watchlist). Поля: `owner` (FK на `users.User`, `related_name="favorite_coins"`), `symbol` (хранится в верхнем регистре, как в скринере), `created_at`. `ordering = ["-created_at"]`, `UniqueConstraint(owner, symbol)` (`unique_favorite_per_owner`), индекс `(owner, symbol)`.
+- **`LevelNotificationConfig`** — настройки Telegram-уведомлений по уровням, **один конфиг на пользователя** (`OneToOneField` на `users.User`, `related_name="level_notification_config"`). Поля: `enabled`, `only_favorites`, `timeframe` (дефолт `1m`); параметры детекции, совпадающие с фильтрами скринера — `natr_multiplier`, `min_gap`, `min_volume`; порог близости — `distance_mode` (`pct`/`natr`) + `distance_value`; `chat_id` (Telegram, blank допустим); `updated_at`. Дедуп-состояние уведомлений в этой модели **не хранится** — оно живёт в Redis у сервиса `level-notifier`, поэтому сервис никогда не пишет в Django.
 
 ### API (`/api/levels/`, `apps/levels/api/`)
 
@@ -1201,6 +1202,15 @@ Engine отвечает `{ success: true }` или `{ success: false, error: "..
 | GET | `/api/levels/favorites/` | Все избранные монеты пользователя (без пагинации), `[{id, symbol, createdAt}]` |
 | POST | `/api/levels/favorites/` | Добавить в избранное, тело `{symbol}`. **Идемпотентно**: повтор существующего → существующая запись (200, не 400), новая → 201 (`get_or_create`) |
 | DELETE | `/api/levels/favorites/{symbol}/` | Убрать из избранного по символу (регистронезависимо, `get_object` приводит к upper) |
+
+**Конфиг уведомлений по уровням** — два эндпоинта (`apps/levels/api/views.py`, регистрируются как `path()`, не через router, т.к. это singleton/сервисный read):
+
+| Метод | Путь | Permission | Назначение |
+|-------|------|-----------|------------|
+| GET / PUT / PATCH | `/api/levels/notification-config/` | `IsAuthenticated` | Конфиг текущего пользователя (`LevelNotificationConfigView`, `RetrieveUpdateAPIView`). `get_object` делает `get_or_create(user=request.user)` — строка всегда есть (как `ExchangeKeysView`). Используется диалогом уведомлений в шапке скринера. |
+| GET | `/api/levels/notification-configs/` | `ServiceTokenOnly` | Все активные конфиги для сервиса `level-notifier` (`ServiceNotificationConfigsView`, `ListAPIView`). Фильтр `enabled=True` и `chat_id != ""`, `select_related("user")` + `prefetch_related("user__favorite_coins")`. Ответ `{"configs": [...]}`. |
+
+`LevelNotificationConfigSerializer` — camelCase (`onlyFavorites`, `natrMultiplier`, `minGap`, `minVolume`, `distanceMode`, `distanceValue`, `chatId`, `updatedAt` ro), валидация `natrMultiplier>0`, `minGap>=1`, `minVolume>=0`, `distanceValue>0`, непустой `timeframe`. `ServiceNotificationConfigSerializer` — read-only проекция для сервиса: те же поля + `ownerId` + `favorites` (символы избранного владельца, отдаются прямо в ответе, чтобы сервис не делал второй запрос). Сервисный канал отдаёт чужие `chat_id` — защищён только `ServiceTokenOnly` (см. §17.2), `chatId` логировать нельзя.
 
 ### Серверный fallback расчёта (`apps/levels/services/analysis_client.py`)
 
@@ -1632,6 +1642,8 @@ Mitigations, которые уже на месте:
 ### 17.2. Service-token write endpoints
 
 `EmulationTradeViewSet`, `TradeViewSet` и `TraderRuntimeConfigErrorViewSet` используют общий `X-Service-Token` для write methods. Если токен утечёт, атакующий с network access сможет писать/читать service-level данные.
+
+Тем же `X-Service-Token` защищён read-эндпоинт `GET /api/levels/notification-configs/` (`ServiceTokenOnly`, для сервиса `level-notifier`). Он отдаёт `chat_id` всех пользователей по внутреннему каналу — при утечке токена это утечка Telegram chat id (не торговые данные, но PII). Mitigations те же; `chat_id` нельзя выводить в логи.
 
 Mitigations, которые уже на месте:
 

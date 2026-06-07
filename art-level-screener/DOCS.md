@@ -41,6 +41,12 @@ binance-futures-connector ──► Redis  binance-futures:candles:<sym>:<tf>
 (детали). Поэтому экран скринера (список ТФ + расчёт) полностью независим от
 процессора — нужны лишь свечи коннектора.
 
+`level-notifier` — четвёртый сервис (worker, без HTTP): раз в ~10с тянет активные
+per-user конфиги уведомлений из Django и шлёт Telegram-алерты, когда цена монеты
+подходит к уровню. Уровни он считает сам из свечей коннектора тем же кодом, что и
+`levels-api` (`lib/screener-compute`), поэтому от `levels-processor` тоже не
+зависит. Подробности — в разделе `services/level-notifier` ниже.
+
 ### Порядок запуска
 
 Нужен доступный Redis (по умолчанию `redis://127.0.0.1:6379`).
@@ -345,6 +351,105 @@ weight-лимит. Нужен потому, что **анализ пробоев
 
 ---
 
+## services/level-notifier — Telegram-уведомления по уровням (Node.js/TS)
+
+Worker без HTTP. Раз в `INTERVAL_MS` (10с) опрашивает Django, считает уровни и
+шлёт пользователям Telegram-уведомления, когда цена подходит к активному уровню по
+их персональным настройкам. Один конфиг на пользователя; один бот на сервис,
+`chat_id` — у каждого пользователя свой.
+
+### Поток
+
+```
+Django  GET /api/levels/notification-configs/  (X-Service-Token)
+   │   активные конфиги (enabled=true, chat_id≠"") + favorites владельца
+   ▼
+level-notifier (каждые 10с):
+   1. группирует конфиги по (timeframe, natrMultiplier, minGap, minVolume)
+   2. на группу — computeScreener(свечи коннектора)  ← Redis binance-futures:*
+   3. на конфиг — фильтр favorites → дистанция nearest-уровня ≤ distanceValue
+   4. дедуп (Redis level-notifier:state:*) → Telegram sendMessage
+   ▼
+Telegram Bot API  + ссылка ${SITE_BASE_URL}/#/levels/SYMBOL?tf=TF
+```
+
+Группировка по параметрам расчёта означает: одинаковые наборы (tf+natr+gap+vol)
+считаются один раз за тик, а не на каждого пользователя.
+
+### Сопоставление настроек с расчётом
+
+- `natr_multiplier`, `min_gap` → `LevelParams` (через `resolveLevelParams`):
+  меняют набор уровней, поэтому подаются **в расчёт**, а не фильтруют результат.
+- `min_volume` → пре-фильтр объёма `computeScreener` (сумма `volume·close` по
+  `VOLUME_LOOKBACK` свечам `VOLUME_TIMEFRAME` — те же `1h × 24`, что у скринера).
+- `distance_mode`+`distance_value` → порог по ближайшему активному уровню
+  (`nearest.distancePct` или `nearest.distanceNatr`).
+- `only_favorites` → ограничение набора символов списком `favorites` владельца.
+
+### Дедуп (анти-спам)
+
+Состояние в Redis, владелец — сам сервис (Django сервис **не пишет**). Ключ
+`level-notifier:state:<ownerId>:<tf>:<symbol>` = `{levelPrice, notifiedAt}`,
+TTL = `NOTIFY_COOLDOWN_MS`. Политика: edge-trigger на вход в зону + кулдаун
+(30 мин) на пару (пользователь, ТФ, монета, уровень). Уведомление шлётся, когда
+по символу нет состояния, в зону вошёл **другой** уровень, или кулдаун истёк
+(ключ сам протух). Микро-сдвиг цены уровня (< 0.15%) считается тем же уровнем.
+
+### Telegram
+
+**Отправка алертов** (`telegram/telegram-client.ts`): `POST .../bot<token>/sendMessage`
+(undici), `parse_mode=HTML`. Ошибка `4xx` (неверный `chat_id` / пользователь не
+нажал `/start`) — лог `warn` без ретраев (ретрай не поможет); сетевые/`5xx` —
+ретрай с backoff. Сбой отправки не валит тик.
+
+**Приём `/start` → ответ `chat_id`** (`telegram/command-listener.ts`): отдельный
+цикл long polling (`getUpdates`, не webhook — работает без публичного HTTPS). На
+`/start` бот отвечает пользователю его `chat_id` (в `<code>`-блоке, чтобы скопировать
+тапом) — чтобы тот вставил его в диалог уведомлений. Подтверждённый `offset` хранится
+в Redis (`level-notifier:telegram:offset`), поэтому после рестарта старые `/start`
+не переотвечаются. Запускается из `Application.start()` рядом с тиком; на shutdown
+останавливается. `getUpdates`-цикл и `sendMessage` используют один токен.
+
+**Бот** создаётся через @BotFather. Важно: у бота **не должно быть webhook** —
+Telegram запрещает `getUpdates` при активном webhook (`409 Conflict`), и допускает
+только **одного** консьюмера `getUpdates` на токен. Поэтому: отдельный бот под
+уведомления (не переиспользовать бота, у которого стоит webhook), один инстанс
+`level-notifier`. При `409`/сетевой ошибке цикл логирует `warn` и делает backoff.
+Пока пользователь не нажал `/start`, `sendMessage` ему вернёт `400 chat not found`.
+
+### Конфигурация (env)
+
+| Переменная | Назначение | Дефолт |
+|---|---|---|
+| `REDIS_URL` | Redis (свечи + state) | `redis://127.0.0.1:6379` |
+| `SOURCE_PREFIX` | префикс свечей — **= `REDIS_KEY_PREFIX` коннектора** | `binance-futures` |
+| `INTERVAL_MS` | период тика | `10000` |
+| `NOTIFY_COOLDOWN_MS` | кулдаун анти-спама | `1800000` (30 мин) |
+| `DJANGO_API_URL` | база Django c `/api` | `http://127.0.0.1:8000/api` |
+| `SERVICE_SHARED_TOKEN` | сервис-токен — **= Django/engine** | (обяз.) |
+| `TELEGRAM_BOT_TOKEN` | токен бота от @BotFather | (обяз., только в `.env`) |
+| `SITE_BASE_URL` | origin фронта для ссылки | `http://localhost:9000` |
+| `VOLUME_TIMEFRAME` / `VOLUME_LOOKBACK` | источник объёмного пре-фильтра | `1h` / `24` |
+| `PERIOD`…`ATR_PERIOD` | дефолты уровней (как у processor/api) | см. `.env.example` |
+| `LOG_LEVEL` | уровень логов | `info` |
+
+`SERVICE_SHARED_TOKEN` и `TELEGRAM_BOT_TOKEN` — секреты: реальные значения только
+в `.env` (gitignored), в `.env.example` — плейсхолдеры.
+
+### Алгоритм уровней — дубликат
+
+`src/levels/*` + `src/lib/screener-compute.ts` + `src/redis/candle-source.ts` —
+копия `levels-api` (источник правды). Любая правка детекции уровней/касаний/NATR
+делается синхронно во всех копиях (AGENTS §5.2, `compute/README.md`).
+
+### Запуск
+
+`cp .env.example .env` (заполнить токены) → `npm install` → `npm run dev`
+(или `build`+`start`). Нужны живые Redis, `binance-futures-connector` и Django.
+Зарегистрирован в корневом `ecosystem.config.cjs` (`pm2 start ecosystem.config.cjs`).
+
+---
+
 ## Интеграция с arbitration-art
 
 - **Бэкенд скринера**: `levels-api` — источник данных для раздела «скринер
@@ -362,6 +467,12 @@ weight-лимит. Нужен потому, что **анализ пробоев
   **Django** (`POST /api/levels/analyses/`) на сохранение под пользователем. Сюда
   (`/analysis`) фронт **не ходит** — это серверный fallback. Дублированный
   алгоритм требует синхронизации (AGENTS §5.2). См. `arbitration-art-django/DOCS.md` §10A.
+- **Уведомления по уровням**: `level-notifier` читает per-user конфиги из Django
+  (`GET /api/levels/notification-configs/`, сервис-токен) и шлёт Telegram-алерты со
+  ссылкой `${SITE_BASE_URL}/#/levels/SYMBOL?tf=TF` на страницу монеты во фронте.
+  Конфиги создаются из диалога «уведомления» в шапке скринера
+  (`quasar/.../LevelsNotificationsDialog.vue`, `PUT /api/levels/notification-config/`).
+  См. `arbitration-art-django/DOCS.md` §10A и фронт `DOCS.md` §25B.
 - **База на фронте**: `process.env.LEVELS_API_URL` (по умолч. `http://127.0.0.1:3000`).
 - **Поллинг**: `/screener/:tf` считается под запрос — каждый ответ свежий
   (`updatedAt` = время расчёта). Для живого экрана фронт поллит список каждые
