@@ -110,13 +110,31 @@
         <!-- Telegram -->
         <div>
           <div class="group-label">Telegram</div>
+          <div class="text-caption text-grey-5 q-mb-sm">
+            Откройте бота, нажмите <span class="text-weight-medium">/start</span> — он пришлёт
+            ваш <span class="text-weight-medium">chat_id</span>, вставьте его ниже.
+          </div>
+          <q-btn
+            v-if="botUrl"
+            :href="botUrl"
+            target="_blank"
+            rel="noopener noreferrer"
+            type="a"
+            icon="open_in_new"
+            :label="botLabel"
+            no-caps
+            dense
+            unelevated
+            color="primary"
+            size="sm"
+            class="q-mb-sm"
+          />
           <q-input
             v-model.trim="form.chatId"
             label="Chat ID"
             dense
             outlined
             dark
-            hint="Нажмите /start боту — он пришлёт ваш chat_id, вставьте его сюда"
           />
         </div>
 
@@ -157,6 +175,12 @@ const emit = defineEmits<{ 'update:modelValue': [value: boolean] }>();
 const store = useNotificationsStore();
 const levelsStore = useLevelsStore();
 const { timeframes } = storeToRefs(levelsStore);
+
+// Telegram bot link from .env (must be the same bot the level-notifier service
+// uses). When unset, the link button is hidden and only the text hint shows.
+const botUrl = process.env.TELEGRAM_BOT_URL ?? '';
+const botMatch = botUrl.match(/t\.me\/([A-Za-z0-9_]+)/);
+const botLabel = botMatch ? `@${botMatch[1]}` : 'Открыть бота';
 
 // Volume is stored as raw USDT but edited in millions for a compact input (same
 // convention as LevelsFilters).

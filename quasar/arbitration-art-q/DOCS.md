@@ -1742,7 +1742,7 @@ Per-user watchlist монет на скринере. Хранится в **Djang
 Per-user конфиг Telegram-уведомлений, **один на пользователя**. Хранится в **Django** (`apps.levels`, модель `LevelNotificationConfig`, см. backend DOCS §10A); клиент — `notificationsApi` (authed `api`), стор — `useNotificationsStore` (`levelsNotifications`). Сами уведомления шлёт бэкенд-сервис `level-notifier` (`art-level-screener`), не фронт — фронт только редактирует конфиг.
 
 - **Кнопка** `notifications` в шапке скринера: активна (primary), когда `notificationsStore.config.enabled`; открывает `LevelsNotificationsDialog`.
-- **Диалог** (`LevelsNotificationsDialog.vue`): локальная копия формы, ресинк из стора на каждое открытие (правки отбрасываются при «Отмена»). Поля 1:1 с моделью — включить, только избранные, таймфрейм (из `levelsStore.timeframes`), объём (M$ → raw USDT ×1e6), погрешность (NATR), свечей между касаниями, режим дистанции `% / NATR` + значение, `chatId` (с хинтом про `/start` у бота). Валидация: `natrMultiplier>0`, `minGap>=1`, `minVolume>=0`, `distanceValue>0`, непустой ТФ. Сохранение → `notificationsStore.save()` (PUT) → закрытие; ошибка показывается баннером, диалог не закрывается.
+- **Диалог** (`LevelsNotificationsDialog.vue`): локальная копия формы, ресинк из стора на каждое открытие (правки отбрасываются при «Отмена»). Поля 1:1 с моделью — включить, только избранные, таймфрейм (из `levelsStore.timeframes`), объём (M$ → raw USDT ×1e6), погрешность (NATR), свечей между касаниями, режим дистанции `% / NATR` + значение, `chatId`. В секции Telegram — инструкция и кнопка-ссылка на бота из `process.env.TELEGRAM_BOT_URL` (`@username` парсится из `t.me/<bot>`; если env пуст — кнопка скрыта, остаётся текстовый хинт). Ссылка должна вести на того же бота, чьим токеном шлёт `level-notifier`. Валидация: `natrMultiplier>0`, `minGap>=1`, `minVolume>=0`, `distanceValue>0`, непустой ТФ. Сохранение → `notificationsStore.save()` (PUT) → закрытие; ошибка показывается баннером, диалог не закрывается.
 - **Загрузка.** `notificationsStore.load()` зовётся в `onMounted` параллельно (через `void`, не блокирует первый рендер скринера) — нужен только для активного состояния кнопки и преднаполнения диалога.
 - **Контракт.** Параметры детекции (`natrMultiplier`/`minGap`/`minVolume`) совпадают с фильтрами скринера (`LevelsFilters`), чтобы уведомления находили те же уровни, что видит пользователь. Сервис `level-notifier` читает активные конфиги по сервис-токену (`GET /api/levels/notification-configs/`) и шлёт алерт со ссылкой `${SITE_BASE_URL}/#/levels/SYMBOL?tf=TF` на эту страницу монеты. Меняешь форму `NotificationConfig` — синхронизируй Django-сериализатор и сервис.
 
@@ -1891,6 +1891,7 @@ Response assumptions:
 ```ts
 process.env.API_URL          // Django REST API
 process.env.LEVELS_API_URL   // art-level-screener levels-api (раздел уровней, §25B)
+process.env.TELEGRAM_BOT_URL // ссылка на бота уведомлений в диалоге §25B.8 (опц.)
 ```
 
 Локальный `.env` (dev):
@@ -1898,9 +1899,12 @@ process.env.LEVELS_API_URL   // art-level-screener levels-api (раздел ур
 ```env
 API_URL=http://127.0.0.1:8000/api
 LEVELS_API_URL=http://127.0.0.1:3000
+TELEGRAM_BOT_URL=https://t.me/your_bot
 ```
 
 `API_URL` должен совпадать с `arbitration-art-django/.env` host/port и `/api` prefix из `arbitration_art_django/urls.py`. Если `API_URL` не задан, Axios baseURL = `undefined` и запросы становятся относительными от origin фронта — в production это сломает все API вызовы.
+
+`TELEGRAM_BOT_URL` — ссылка на бота уведомлений (`https://t.me/<bot>`), показывается кнопкой в диалоге уведомлений (§25B.8). **Build-time**, как и остальные (см. §28.1). Пустая/не задана → кнопка скрыта, остаётся текстовый хинт про `/start`. Должна вести на **того же** бота, чьим токеном пользуется сервис `level-notifier` (иначе `/start` отдаст chat_id, но уведомления не дойдут — их шлёт другой бот).
 
 `LEVELS_API_URL` — база сервиса `levels-api` (host/port из его `.env`, без `/api`-префикса). Дефолт в коде — `http://127.0.0.1:3000`. Сервис должен быть доступен из браузера с CORS, разрешающим origin фронта, и по HTTPS, если фронт под HTTPS (иначе mixed content). Как и `API_URL`, переменная **build-time** (см. §28.1): на проде задаётся build-arg-ом, иначе в бандл попадёт localhost-дефолт. Альтернатива на будущее — проксировать `levels-api` через nginx тем же приёмом, что и биржевые прокси (§28.1), и ходить same-origin.
 
