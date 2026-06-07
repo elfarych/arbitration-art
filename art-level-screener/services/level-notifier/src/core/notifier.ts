@@ -131,7 +131,15 @@ export class Notifier {
     level: LevelView,
     metric: number,
   ): string {
-    const link = `${this.config.siteBaseUrl}/#/levels/${entry.symbol}?tf=${cfg.timeframe}`;
+    // Carry the level-detection params so the coin page renders a chart with the
+    // same levels this alert was computed from. minVolume is a universe pre-filter
+    // (irrelevant to a single coin), so it is not part of the link.
+    const query = new URLSearchParams({
+      tf: cfg.timeframe,
+      natrMultiplier: String(cfg.natrMultiplier),
+      minGap: String(cfg.minGap),
+    });
+    const link = `${this.config.siteBaseUrl}/#/levels/${entry.symbol}?${query.toString()}`;
     const sideRu = level.side === 'resistance' ? 'сопротивления' : 'поддержки';
     const unit = cfg.distanceMode === 'natr' ? ' NATR' : '%';
     return [

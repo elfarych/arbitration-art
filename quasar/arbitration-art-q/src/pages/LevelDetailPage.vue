@@ -19,6 +19,18 @@
       />
     </div>
 
+    <!-- Small levels chart computed with the params carried in the URL (from the
+         alert link or the screener filters). Falls back to defaults if absent. -->
+    <div class="levels-chart-box q-mb-md">
+      <LevelChartCard v-if="chartEntry" :entry="chartEntry" :timeframe="chartTf" />
+      <div v-else-if="chartLoading" class="full-height flex flex-center">
+        <q-spinner color="primary" size="md" />
+      </div>
+      <div v-else class="full-height flex flex-center text-grey-6 text-caption">
+        {{ chartError || 'Нет данных по уровням' }}
+      </div>
+    </div>
+
     <q-banner v-if="analysis.error" dense class="bg-negative text-white q-mb-md rounded-borders">
       {{ analysis.error }}
     </q-banner>
@@ -60,12 +72,18 @@
 <script setup lang="ts">
 import { ref, reactive, computed, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
-import { useLevelsStore } from 'src/stores/levels/levels.store';
+import {
+  useLevelsStore,
+  LEVELS_DEFAULT_NATR_MULTIPLIER,
+  LEVELS_DEFAULT_MIN_GAP,
+} from 'src/stores/levels/levels.store';
 import {
   useAnalysisStore,
   ANALYSIS_DEFAULTS,
   type AnalysisSettings,
 } from 'src/stores/levels/analysis.store';
+import { levelsApi, type ScreenerEntry } from 'src/stores/levels/api/levelsApi';
+import LevelChartCard from 'src/components/levels/LevelChartCard.vue';
 import LevelsAnalysisDialog from 'src/components/levels/LevelsAnalysisDialog.vue';
 import LevelsAnalysisResults from 'src/components/levels/LevelsAnalysisResults.vue';
 import LevelsAnalysisList from 'src/components/levels/LevelsAnalysisList.vue';
@@ -78,6 +96,47 @@ const analysis = useAnalysisStore();
 const symbol = computed(() => String(route.params.symbol ?? '').toUpperCase());
 
 const dialogOpen = ref(false);
+
+// Top levels chart: the single coin computed with the params carried in the URL
+// (natrMultiplier/minGap from the alert link or the screener filters), so it shows
+// the same levels the alert/screener used. minVolume is a universe pre-filter, so
+// it is forced to 0 here — never filter out the very coin being viewed.
+const chartEntry = ref<ScreenerEntry | null>(null);
+const chartTf = ref('1h');
+const chartLoading = ref(false);
+const chartError = ref('');
+
+// Positive numeric query param or fallback (query values are string | string[]).
+function numQuery(key: string, fallback: number): number {
+  const raw = route.query[key];
+  const value = typeof raw === 'string' ? Number(raw) : NaN;
+  return Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
+async function loadChart(timeframe: string): Promise<void> {
+  chartLoading.value = true;
+  chartError.value = '';
+  chartEntry.value = null;
+  const natrMultiplier = numQuery('natrMultiplier', store.natrMultiplier || LEVELS_DEFAULT_NATR_MULTIPLIER);
+  const minGap = numQuery('minGap', store.minGap || LEVELS_DEFAULT_MIN_GAP);
+  try {
+    const page = await levelsApi.screener(timeframe, {
+      search: symbol.value,
+      natrMultiplier,
+      minGap,
+      minVolume: 0,
+      limit: 20,
+    });
+    const found = page.items.find((item) => item.symbol === symbol.value) ?? null;
+    chartEntry.value = found;
+    chartTf.value = timeframe;
+    if (!found) chartError.value = 'Нет данных по уровням';
+  } catch {
+    chartError.value = 'Не удалось загрузить график';
+  } finally {
+    chartLoading.value = false;
+  }
+}
 
 // Analysis settings (the dialog form), persisted across reloads except the
 // timeframe, which defaults to the screener's current timeframe.
@@ -136,6 +195,8 @@ async function init() {
     store.timeframe ||
     store.timeframes[0] ||
     '1h';
+  // Load the top chart in parallel — it must not block the analysis list.
+  void loadChart(settings.timeframe);
   await analysis.fetchList(symbol.value);
 }
 
@@ -147,4 +208,13 @@ watch(symbol, init, { immediate: true });
 .ctrl-btn
   min-width: 40px
   border-radius: 6px
+
+// Fixed-height box for the top levels chart (LevelChartCard is height:100%).
+.levels-chart-box
+  height: 300px
+  flex: none
+
+@media (max-width: 599.98px)
+  .levels-chart-box
+    height: 240px
 </style>

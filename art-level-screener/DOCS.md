@@ -370,7 +370,7 @@ level-notifier (каждые 10с):
    3. на конфиг — фильтр favorites → дистанция nearest-уровня ≤ distanceValue
    4. дедуп (Redis level-notifier:state:*) → Telegram sendMessage
    ▼
-Telegram Bot API  + ссылка ${SITE_BASE_URL}/#/levels/SYMBOL?tf=TF
+Telegram Bot API  + ссылка ${SITE_BASE_URL}/#/levels/SYMBOL?tf=TF&natrMultiplier=…&minGap=…
 ```
 
 Группировка по параметрам расчёта означает: одинаковые наборы (tf+natr+gap+vol)
@@ -398,7 +398,11 @@ TTL = `NOTIFY_COOLDOWN_MS`. Политика: edge-trigger на вход в зо
 ### Telegram
 
 **Отправка алертов** (`telegram/telegram-client.ts`): `POST .../bot<token>/sendMessage`
-(undici), `parse_mode=HTML`. Ошибка `4xx` (неверный `chat_id` / пользователь не
+(undici), `parse_mode=HTML`, `disable_web_page_preview=true` (без превью сайта).
+Текст несёт ссылку `${SITE_BASE_URL}/#/levels/<symbol>?tf=<tf>&natrMultiplier=<…>&minGap=<…>`
+— параметры детекции из конфига, чтобы страница монеты построила график с теми же
+уровнями (`minVolume` не кладётся — это фильтр вселенной, на одну монету не влияет).
+Ошибка `4xx` (неверный `chat_id` / пользователь не
 нажал `/start`) — лог `warn` без ретраев (ретрай не поможет); сетевые/`5xx` —
 ретрай с backoff. Сбой отправки не валит тик.
 
@@ -469,7 +473,7 @@ Telegram запрещает `getUpdates` при активном webhook (`409 C
   алгоритм требует синхронизации (AGENTS §5.2). См. `arbitration-art-django/DOCS.md` §10A.
 - **Уведомления по уровням**: `level-notifier` читает per-user конфиги из Django
   (`GET /api/levels/notification-configs/`, сервис-токен) и шлёт Telegram-алерты со
-  ссылкой `${SITE_BASE_URL}/#/levels/SYMBOL?tf=TF` на страницу монеты во фронте.
+  ссылкой `${SITE_BASE_URL}/#/levels/SYMBOL?tf=TF&natrMultiplier=…&minGap=…` на страницу монеты во фронте (без превью сайта; параметры → график уровней на странице).
   Конфиги создаются из диалога «уведомления» в шапке скринера
   (`quasar/.../LevelsNotificationsDialog.vue`, `PUT /api/levels/notification-config/`).
   См. `arbitration-art-django/DOCS.md` §10A и фронт `DOCS.md` §25B.

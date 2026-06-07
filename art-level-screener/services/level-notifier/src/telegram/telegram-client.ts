@@ -55,7 +55,8 @@ export class TelegramClient {
       chat_id: chatId,
       text,
       parse_mode: 'HTML',
-      disable_web_page_preview: false,
+      // No site link preview in the alert (and the /start reply has no link anyway).
+      disable_web_page_preview: true,
     });
 
     let lastError: unknown;

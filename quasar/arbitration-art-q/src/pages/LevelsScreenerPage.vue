@@ -143,10 +143,19 @@ const router = useRouter();
 // Notification settings dialog (per-user level alerts).
 const showNotifications = ref(false);
 
-// Open the coin detail page; carry the current screener timeframe so the detail
-// chart opens on the same TF the user was viewing.
+// Open the coin detail page; carry the current screener timeframe and the level
+// params from the filters so the detail page renders a chart with the same levels
+// the user is looking at. minVolume is a universe pre-filter (irrelevant to a
+// single coin), so it is not passed.
 function onOpenCoin(symbol: string) {
-  void router.push({ path: `/levels/${symbol}`, query: { tf: store.timeframe } });
+  void router.push({
+    path: `/levels/${symbol}`,
+    query: {
+      tf: store.timeframe,
+      natrMultiplier: String(store.natrMultiplier),
+      minGap: String(store.minGap),
+    },
+  });
 }
 
 // Grid layout: columns × rows, chosen via the dropdown picker (max 5×5) and
