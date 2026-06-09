@@ -147,6 +147,7 @@ import { useRouter } from 'vue-router';
 import { useLevelsStore, LEVELS_MIN_VOLUME } from 'src/stores/levels/levels.store';
 import { useFavoritesStore } from 'src/stores/levels/favorites.store';
 import { useNotificationsStore } from 'src/stores/levels/notifications.store';
+import { usePriceNotificationsStore } from 'src/stores/levels/priceNotifications.store';
 import LevelChartCard from 'src/components/levels/LevelChartCard.vue';
 import LevelsGridPicker from 'src/components/levels/LevelsGridPicker.vue';
 import LevelsFilters from 'src/components/levels/LevelsFilters.vue';
@@ -155,6 +156,7 @@ import LevelsNotificationsDialog from 'src/components/levels/LevelsNotifications
 const store = useLevelsStore();
 const favoritesStore = useFavoritesStore();
 const notificationsStore = useNotificationsStore();
+const priceNotificationsStore = usePriceNotificationsStore();
 const router = useRouter();
 
 // Notification settings dialog (per-user level alerts).
@@ -274,6 +276,8 @@ onMounted(async () => {
   // Notification config is loaded in parallel — it only feeds the bell button's
   // active state and the dialog, so it does not gate the first paint.
   void notificationsStore.load();
+  // Price alerts feed the dashed rays the chart cards overlay; load in parallel.
+  void priceNotificationsStore.load();
   await Promise.all([favoritesStore.load(), store.fetchTimeframes()]);
   await store.fetchScreener();
 });

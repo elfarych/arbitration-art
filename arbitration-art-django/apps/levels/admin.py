@@ -5,6 +5,7 @@ from apps.levels.models import (
     LevelAnalysis,
     LevelAnalysisBreakout,
     LevelNotificationConfig,
+    PriceNotification,
 )
 
 
@@ -53,3 +54,19 @@ class LevelNotificationConfigAdmin(admin.ModelAdmin):
     )
     list_filter = ("enabled", "only_favorites", "timeframe", "distance_mode")
     search_fields = ("user__email", "chat_id")
+
+
+@admin.register(PriceNotification)
+class PriceNotificationAdmin(admin.ModelAdmin):
+    list_display = (
+        "id",
+        "owner",
+        "symbol",
+        "target_price",
+        "direction",
+        "enabled",
+        "triggered_at",
+        "created_at",
+    )
+    list_filter = ("enabled", "direction", "created_at")
+    search_fields = ("symbol", "owner__email")

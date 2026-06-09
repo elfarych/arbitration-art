@@ -1167,7 +1167,7 @@ Lifecycle sync **inline** в `BotConfigViewSet.perform_create` / `perform_update
 
 Engine отвечает `{ success: true }` или `{ success: false, error: "..." }` со статусом 200/500. `_perform_post` бросает `LifecycleSyncError` на любой non-2xx ответ и на network errors; retry-policy: `SERVICE_REQUEST_RETRIES` попыток с паузой `SERVICE_REQUEST_RETRY_DELAY_SECONDS`.
 
-## 10A. Levels domain (анализы пробоев + избранные монеты + конфиг уведомлений)
+## 10A. Levels domain (анализы пробоев + избранные монеты + конфиг уведомлений + ценовые уведомления)
 
 Приложение `apps.levels` хранит результаты анализа пробоев горизонтальных уровней (фича страницы монеты во фронтенде, `art-level-screener`). **Расчёт идёт на фронте** (браузер сам тянет свечи/трейды напрямую с Binance и считает анализ — это разгружает CPU сервера и распределяет weight-лимит Binance по IP пользователей). Django принимает **готовый** результат, валидирует и **сохраняет** под пользователем — история переживает перезагрузку.
 
@@ -1179,6 +1179,7 @@ Engine отвечает `{ success: true }` или `{ success: false, error: "..
 - **`LevelAnalysisBreakout`** — один пробой внутри анализа (`analysis` FK, `related_name="breakouts"`). Поля повторяют контракт пробоя: `price`, `level_time`, `kind`, `direction`, `touches`, `breakout_candle_time`, `cross_time`/`reach_time`/`elapsed_ms`/`move_pct` (nullable), `matched`, `reason`. Времена — `BigIntegerField` (мс Unix), цены/проценты — `FloatField` (research-данные, не деньги).
 - **`FavoriteCoin`** — избранная монета пользователя для скринера уровней (per-user watchlist). Поля: `owner` (FK на `users.User`, `related_name="favorite_coins"`), `symbol` (хранится в верхнем регистре, как в скринере), `created_at`. `ordering = ["-created_at"]`, `UniqueConstraint(owner, symbol)` (`unique_favorite_per_owner`), индекс `(owner, symbol)`.
 - **`LevelNotificationConfig`** — настройки Telegram-уведомлений по уровням, **один конфиг на пользователя** (`OneToOneField` на `users.User`, `related_name="level_notification_config"`). Поля: `enabled`, `only_favorites`, `timeframe` (дефолт `1m`); параметры детекции, совпадающие с фильтрами скринера — `natr_multiplier`, `min_gap`, `min_volume`; порог близости — `distance_mode` (`pct`/`natr`) + `distance_value`; `chat_id` (Telegram, blank допустим); `updated_at`. Дедуп-состояние уведомлений в этой модели **не хранится** — оно живёт в Redis у сервиса `level-notifier`, поэтому сервис никогда не пишет в Django.
+- **`PriceNotification`** — ценовое уведомление, **много на пользователя** (коллекция, в отличие от singleton-конфига выше; паттерн `FavoriteCoin`). `owner` (FK на `users.User`, `related_name="price_notifications"`), `symbol` (верхний регистр), `target_price` (`FloatField` — единообразно с остальным levels-app и чтобы wire-формат был числом; порог алерта не money-critical), `direction` (`above`/`below`), `enabled` (дефолт `True`), `triggered_at` (nullable; ставится при срабатывании), `created_at`, `updated_at`. `ordering = ["-created_at"]`, индексы `(owner, symbol)` и `(owner, enabled)`, без unique-constraint (несколько таргетов на монету разрешены). **Одноразовое** срабатывание: сервис `level-notifier` шлёт алерт и отключает запись (`enabled=False`, `triggered_at`) через сервисный эндпоинт. `chat_id` здесь **не хранится** — переиспользуется из `LevelNotificationConfig` владельца (один Telegram-сетап). `direction` вычисляется фронтом по позиции клика относительно текущей цены, поэтому в момент создания условие срабатывания ложно — сервису достаточно одного сравнения с уровнем. Дедуп-окна — Redis-guard у сервиса.
 
 ### API (`/api/levels/`, `apps/levels/api/`)
 
@@ -1211,6 +1212,17 @@ Engine отвечает `{ success: true }` или `{ success: false, error: "..
 | GET | `/api/levels/notification-configs/` | `ServiceTokenOnly` | Все активные конфиги для сервиса `level-notifier` (`ServiceNotificationConfigsView`, `ListAPIView`). Фильтр `enabled=True` и `chat_id != ""`, `select_related("user")` + `prefetch_related("user__favorite_coins")`. Ответ `{"configs": [...]}`. |
 
 `LevelNotificationConfigSerializer` — camelCase (`onlyFavorites`, `natrMultiplier`, `minGap`, `minVolume`, `distanceMode`, `distanceValue`, `chatId`, `updatedAt` ro), валидация `natrMultiplier>0`, `minGap>=1`, `minVolume>=0`, `distanceValue>0`, непустой `timeframe`. `ServiceNotificationConfigSerializer` — read-only проекция для сервиса: те же поля + `ownerId` + `favorites` (символы избранного владельца, отдаются прямо в ответе, чтобы сервис не делал второй запрос). Сервисный канал отдаёт чужие `chat_id` — защищён только `ServiceTokenOnly` (см. §17.2), `chatId` логировать нельзя.
+
+**Ценовые уведомления** — `PriceNotificationViewSet` (`ModelViewSet`, `IsAuthenticated`, `pagination_class = None`, без PUT — только PATCH; queryset по `owner=request.user`, опц. `?symbol=`). Создаются обычно правым кликом по цене на графике скринера. `perform_create` проставляет `owner`; `perform_update` при `enabled=True` сбрасывает `triggered_at` (повторное вооружение из виджета). Сервисные эндпоинты для `level-notifier` вынесены под префикс `service/` (чтобы не конфликтовать с router-роутом `price-notifications/<pk>/`).
+
+| Метод | Путь | Permission | Назначение |
+|-------|------|-----------|------------|
+| GET / POST | `/api/levels/price-notifications/` | `IsAuthenticated` | Список (без пагинации) / создание ценового уведомления пользователя |
+| PATCH / DELETE | `/api/levels/price-notifications/{id}/` | `IsAuthenticated` | Обновить (вкл/выкл, перенести цель) / удалить по id |
+| GET | `/api/levels/service/price-notifications/` | `ServiceTokenOnly` | Активные алерты для `level-notifier` (`ServicePriceNotificationsView`). Фильтр `enabled=True` **и** непустой `chat_id` владельца (`owner__level_notification_config__chat_id__gt=""`, `select_related`). Ответ `{"notifications": [...]}` |
+| POST | `/api/levels/service/price-notifications/{id}/trigger/` | `ServiceTokenOnly` | Отметить сработавшим (`ServicePriceNotificationTriggerView`): `enabled=False` + `triggered_at=now`. Идемпотентно. Так реализуется one-shot |
+
+`PriceNotificationSerializer` (user) — camelCase (`targetPrice`, `direction`, `enabled`, `triggeredAt`/`createdAt`/`updatedAt` ro), `validate_symbol` → upper, `validate_targetPrice>0`. `ServicePriceNotificationSerializer` (service) — `id`, `ownerId`, `symbol`, `targetPrice`, `direction` + `chatId` (через `SerializerMethodField` из `owner.level_notification_config`, отдаётся по сервисному каналу). Эндпоинт-фид отдаёт только записи, у владельца которых есть `chat_id` (иначе доставить нельзя) — `chatId` логировать нельзя. **Universe-gap:** алерты срабатывают только для монет вселенной коннектора (24h объём ≥ `MIN_24H_VOLUME_USDT`) — для монет вне неё цены в Redis нет, алерт молча не сработает (см. `art-level-screener/DOCS.md`).
 
 ### Серверный fallback расчёта (`apps/levels/services/analysis_client.py`)
 

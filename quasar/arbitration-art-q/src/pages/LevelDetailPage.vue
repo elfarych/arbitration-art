@@ -83,6 +83,7 @@ import {
   type AnalysisSettings,
 } from 'src/stores/levels/analysis.store';
 import { levelsApi, type ScreenerEntry } from 'src/stores/levels/api/levelsApi';
+import { usePriceNotificationsStore } from 'src/stores/levels/priceNotifications.store';
 import LevelChartCard from 'src/components/levels/LevelChartCard.vue';
 import LevelsAnalysisDialog from 'src/components/levels/LevelsAnalysisDialog.vue';
 import LevelsAnalysisResults from 'src/components/levels/LevelsAnalysisResults.vue';
@@ -92,6 +93,11 @@ const route = useRoute();
 const router = useRouter();
 const store = useLevelsStore();
 const analysis = useAnalysisStore();
+
+// Price alerts for the dashed rays the chart overlays. Loaded once on mount;
+// the chart card reads them from the store per symbol.
+const priceNotificationsStore = usePriceNotificationsStore();
+if (!priceNotificationsStore.loaded) void priceNotificationsStore.load();
 
 const symbol = computed(() => String(route.params.symbol ?? '').toUpperCase());
 

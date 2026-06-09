@@ -50,9 +50,46 @@ export class CandleSource {
     return map;
   }
 
+  /**
+   * Latest price + last-live-update time per symbol, read straight from the
+   * connector's `:price:<SYM>` / `:updated:<SYM>` keys (no level computation).
+   * Two `MGET`s; symbols without a parseable price are omitted. `updatedAt` lets
+   * the caller skip stale prices (frozen feed after a WS drop).
+   */
+  async getLatestPrices(
+    symbols: readonly string[],
+  ): Promise<Map<string, { price: number; updatedAt: number }>> {
+    const map = new Map<string, { price: number; updatedAt: number }>();
+    if (symbols.length === 0) {
+      return map;
+    }
+    const priceKeys = symbols.map((symbol) => `${this.prefix}:price:${symbol}`);
+    const updatedKeys = symbols.map((symbol) => `${this.prefix}:updated:${symbol}`);
+    const [prices, updated] = await Promise.all([
+      this.redis.mget(priceKeys),
+      this.redis.mget(updatedKeys),
+    ]);
+    for (let i = 0; i < symbols.length; i++) {
+      const price = parseFiniteNumber(prices[i]);
+      if (price === null) {
+        continue;
+      }
+      map.set(symbols[i], { price, updatedAt: parseFiniteNumber(updated[i]) ?? 0 });
+    }
+    return map;
+  }
+
   private candleKey(symbol: string, timeframe: string): string {
     return `${this.prefix}:candles:${symbol}:${timeframe}`;
   }
+}
+
+function parseFiniteNumber(raw: string | null): number | null {
+  if (raw === null || raw === '') {
+    return null;
+  }
+  const value = Number(raw);
+  return Number.isFinite(value) ? value : null;
 }
 
 function parseCandles(raw: string | null): Candle[] | null {

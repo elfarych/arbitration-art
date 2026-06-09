@@ -47,6 +47,14 @@
         <q-spinner color="primary" size="md" />
       </div>
       <ChartRulerOverlay :measure="measure" />
+      <!-- Price-notification badges (bell + price + delete, draggable). The line
+           itself is a LineSeries; this overlay carries the interactive bits. -->
+      <PriceNotificationsOverlay
+        :markers="notifyMarkers"
+        :dragging-id="draggingId"
+        @delete="onDeleteNotification"
+        @drag-start="onNotifyDragStart"
+      />
     </div>
   </q-card>
 </template>
@@ -66,14 +74,23 @@ import {
   type WhitespaceData,
   type UTCTimestamp,
 } from 'lightweight-charts';
+import { useQuasar } from 'quasar';
 import type { ScreenerEntry, LevelView, LevelSide } from 'src/stores/levels/api/levelsApi';
 import { fetchKlines } from 'src/stores/levels/api/binanceKlines';
 import { subscribeKline, type LiveCandle } from 'src/stores/levels/api/klineStream';
 import { useFavoritesStore } from 'src/stores/levels/favorites.store';
+import { usePriceNotificationsStore } from 'src/stores/levels/priceNotifications.store';
+import type { PriceDirection } from 'src/stores/levels/api/priceNotificationsApi';
 import { useChartRuler } from './useChartRuler';
+import { useChartRightClick } from './useChartRightClick';
 import ChartRulerOverlay from './ChartRulerOverlay.vue';
+import PriceNotificationsOverlay, {
+  type PriceNotificationMarker,
+} from './PriceNotificationsOverlay.vue';
 
 const props = defineProps<{ entry: ScreenerEntry; timeframe: string }>();
+
+const $q = useQuasar();
 
 // Emitted when the header is clicked — the screener page navigates to the coin
 // detail page. Left unhandled on the detail page itself (no re-navigation).
@@ -88,6 +105,9 @@ function toggleFavorite(): void {
   void favoritesStore.toggle(props.entry.symbol);
 }
 
+// Armed price alerts for this symbol are drawn as dashed amber rays (see priceStore).
+const priceStore = usePriceNotificationsStore();
+
 // Candles shown by default; older bars lazy-load on scroll (HISTORY_BATCH).
 const CANDLE_LIMIT = 400;
 const HISTORY_BATCH = 500;
@@ -101,6 +121,8 @@ const RESISTANCE_COLOR = '#ff5d6b';
 const LEVEL_SUPPORT = 'rgba(131, 199, 100, 0.5)';
 const LEVEL_RESISTANCE = 'rgba(255, 93, 107, 0.5)';
 const PRICE_GRAY = '#c4c7cd';
+// User price-notification rays — amber dashed, visually distinct from levels.
+const NOTIFY_COLOR = '#f5c542';
 
 const chartContainer = ref<HTMLElement | null>(null);
 const loading = ref(false);
@@ -122,7 +144,12 @@ let noMoreHistory = false;
 // the right edge. Being visible series, they also pull the price scale to
 // include far-away levels (no separate anchor series needed).
 let levelSeries: ISeriesApi<'Line'>[] = [];
+// Dashed line series per armed price notification, keyed by id so a single line
+// can be updated live while its badge is dragged.
+const priceNotificationSeries = new Map<number, ISeriesApi<'Line'>>();
 let candles: CandlestickData[] = [];
+// Recomputes badge positions on container resize (no price-scale event covers it).
+let resizeObserver: ResizeObserver | null = null;
 
 // Shift ruler overlay (see useChartRuler). One bar spans the screener timeframe;
 // price decimals follow the coin's magnitude.
@@ -133,6 +160,40 @@ const { measure, attach: attachRuler, detach: detachRuler } = useChartRuler({
   barSeconds: () => tfSeconds(props.timeframe),
   pricePrecision: () => priceFormat().precision,
 });
+
+// Right-click on the chart immediately creates a price notification at the
+// cursor price (no confirmation menu).
+const { attach: attachRightClick, detach: detachRightClick } = useChartRightClick({
+  container: chartContainer,
+  series: () => candleSeries,
+  onPick: (price) => void createPriceNotification(price),
+});
+
+// Overlay badges (bell + price + delete), positioned from priceToCoordinate.
+const notifyMarkers = ref<PriceNotificationMarker[]>([]);
+// Notification id being dragged (vertical move → new target price); null when idle.
+const draggingId = ref<number | null>(null);
+// Live price while dragging, so the badge + line follow before persistence.
+let dragPrice: number | null = null;
+
+function fmtPrice(value: number): string {
+  return value.toFixed(priceFormat().precision);
+}
+
+async function createPriceNotification(targetPrice: number): Promise<void> {
+  // Direction inferred from the click position vs the current price, so the
+  // trigger condition starts false (the feature's invariant).
+  const direction: PriceDirection = targetPrice >= props.entry.price ? 'above' : 'below';
+  try {
+    await priceStore.create({ symbol: props.entry.symbol, targetPrice, direction });
+  } catch {
+    $q.notify({
+      type: 'negative',
+      message: priceStore.error ?? 'Не удалось создать уведомление',
+      timeout: 3000,
+    });
+  }
+}
 
 function sideColor(side: LevelSide): string {
   return side === 'support' ? 'positive' : 'negative';
@@ -229,6 +290,13 @@ function buildChart(): void {
     // CANDLE_LIMIT candles doesn't auto-load extra batches on mount.
     if (bars !== null && bars.barsBefore < 0) void loadMoreHistory();
   });
+
+  // Keep price-notification badges aligned with the price scale. There is no
+  // price-scale-change event, so recompute on pan/zoom (logical range) and on any
+  // crosshair move (covers price-axis drag / hover); live-candle autoscale and
+  // resize are handled separately.
+  chart.timeScale().subscribeVisibleLogicalRangeChange(() => recomputeMarkers());
+  chart.subscribeCrosshairMove(() => recomputeMarkers());
 }
 
 function clearLevels(): void {
@@ -261,6 +329,121 @@ function applyLevels(): void {
     ]);
     levelSeries.push(series);
   }
+}
+
+function clearPriceNotifications(): void {
+  if (chart) for (const series of priceNotificationSeries.values()) chart.removeSeries(series);
+  priceNotificationSeries.clear();
+  notifyMarkers.value = [];
+}
+
+// Draw a dashed amber ray (left edge → right edge) for each armed price alert on
+// this symbol and (re)compute its overlay badge. Triggered/disabled alerts are
+// not drawn. Rebuilt whenever the store changes or the candle window shifts.
+function applyPriceNotifications(): void {
+  if (!chart || candles.length < 2) return;
+  clearPriceNotifications();
+  const first = candles[0];
+  if (!first) return;
+  const start = first.time as UTCTimestamp;
+  const end = rightEdgeTime() as UTCTimestamp;
+  for (const notification of priceStore.bySymbol(props.entry.symbol)) {
+    if (!notification.enabled) continue;
+    const series = chart.addSeries(LineSeries, {
+      color: NOTIFY_COLOR,
+      lineWidth: 1,
+      lineStyle: LineStyle.Dashed,
+      priceLineVisible: false,
+      lastValueVisible: false,
+      crosshairMarkerVisible: false,
+      pointMarkersVisible: false,
+      priceFormat: priceFormat(),
+    });
+    series.setData([
+      { time: start, value: notification.targetPrice },
+      { time: end, value: notification.targetPrice },
+    ]);
+    priceNotificationSeries.set(notification.id, series);
+  }
+  recomputeMarkers();
+}
+
+// Recompute overlay badge positions from the current price scale. Cheap (a few
+// priceToCoordinate calls); called on pan/zoom/crosshair/live-candle/resize so
+// badges track the lightweight-charts line, which is synced natively.
+function recomputeMarkers(): void {
+  if (!candleSeries || candles.length < 2) {
+    notifyMarkers.value = [];
+    return;
+  }
+  const markers: PriceNotificationMarker[] = [];
+  for (const notification of priceStore.bySymbol(props.entry.symbol)) {
+    if (!notification.enabled) continue;
+    const price =
+      draggingId.value === notification.id && dragPrice !== null ? dragPrice : notification.targetPrice;
+    const top = candleSeries.priceToCoordinate(price);
+    if (top === null) continue;
+    markers.push({ id: notification.id, top, label: fmtPrice(price) });
+  }
+  notifyMarkers.value = markers;
+}
+
+function onDeleteNotification(id: number): void {
+  // Chart delete is immediate (the widget tab is the place with a confirm).
+  void priceStore.remove(id);
+}
+
+// Drag a badge vertically to move its target price. The line series for that id
+// follows live; persistence happens on mouse up.
+function onNotifyDragStart(id: number): void {
+  if (!candleSeries) return;
+  draggingId.value = id;
+  window.addEventListener('mousemove', onNotifyDragMove);
+  window.addEventListener('mouseup', onNotifyDragEnd);
+}
+
+function onNotifyDragMove(e: MouseEvent): void {
+  if (draggingId.value === null || !candleSeries || !chartContainer.value || candles.length < 2) return;
+  const rect = chartContainer.value.getBoundingClientRect();
+  const y = Math.max(0, Math.min(e.clientY - rect.top, rect.height));
+  const price = candleSeries.coordinateToPrice(y);
+  if (price === null) return;
+  dragPrice = price;
+  const series = priceNotificationSeries.get(draggingId.value);
+  const first = candles[0];
+  if (series && first) {
+    series.setData([
+      { time: first.time, value: price },
+      { time: rightEdgeTime() as UTCTimestamp, value: price },
+    ]);
+  }
+  recomputeMarkers();
+}
+
+async function onNotifyDragEnd(): Promise<void> {
+  window.removeEventListener('mousemove', onNotifyDragMove);
+  window.removeEventListener('mouseup', onNotifyDragEnd);
+  const id = draggingId.value;
+  const price = dragPrice;
+  draggingId.value = null;
+  dragPrice = null;
+  if (id === null || price === null) {
+    applyPriceNotifications();
+    return;
+  }
+  const direction: PriceDirection = price >= props.entry.price ? 'above' : 'below';
+  try {
+    await priceStore.update(id, { targetPrice: price, direction });
+  } catch {
+    $q.notify({
+      type: 'negative',
+      message: priceStore.error ?? 'Не удалось переместить уведомление',
+      timeout: 3000,
+    });
+  }
+  // Re-render from the store (store.update reconciled the item) — also restores
+  // the line if the update failed and rolled back.
+  applyPriceNotifications();
 }
 
 // Timeframe (e.g. "15m", "1h") to seconds — to place trailing whitespace bars
@@ -325,6 +508,7 @@ async function loadCandles(): Promise<void> {
     if (!chart) buildChart();
     setCandleData();
     applyLevels();
+    applyPriceNotifications();
     // Show all loaded candles at once (plus the right gap), instead of the
     // default recent-bars view.
     chart?.timeScale().setVisibleLogicalRange({ from: 0, to: candles.length - 1 + RIGHT_OFFSET });
@@ -375,6 +559,7 @@ function onLiveCandle(c: LiveCandle): void {
     candleSeries.update(bar);
     applyWhitespace();
     applyLevels();
+    applyPriceNotifications();
     // The right edge (last whitespace bar) just moved one bar further right. If
     // the user was viewing that edge, follow it by shifting the visible range one
     // bar — otherwise the series marches under the price scale as candles
@@ -410,6 +595,7 @@ async function loadMoreHistory(): Promise<void> {
     candles = [...fresh, ...candles];
     setCandleData();
     applyLevels();
+    applyPriceNotifications();
     const added = candles.length - before;
     if (timeScale && range) {
       timeScale.setVisibleLogicalRange({ from: range.from + added, to: range.to + added });
@@ -422,8 +608,15 @@ async function loadMoreHistory(): Promise<void> {
 }
 
 onMounted(() => {
-  // Enable the Shift ruler once the container exists (chart is built lazily).
+  // Enable the Shift ruler and the right-click create-alert handler once the
+  // container exists (chart is built lazily).
   attachRuler();
+  attachRightClick();
+  // Resize changes the price scale with no event of its own — realign badges.
+  if (chartContainer.value && typeof ResizeObserver !== 'undefined') {
+    resizeObserver = new ResizeObserver(() => recomputeMarkers());
+    resizeObserver.observe(chartContainer.value);
+  }
   // Wait for the container to have a size before lightweight-charts measures it.
   void nextTick(() => loadCandles());
 });
@@ -436,18 +629,38 @@ watch(() => props.timeframe, () => void loadCandles());
 watch(
   () => props.entry,
   () => {
-    if (candleSeries) applyLevels();
+    if (candleSeries) {
+      applyLevels();
+      applyPriceNotifications();
+    }
   },
+);
+
+// Redraw price-notification rays + badges when the user's alerts change (create /
+// drag / delete) for this symbol. Deep watch — update replaces the item fields.
+watch(
+  () => priceStore.items,
+  () => {
+    if (candleSeries) applyPriceNotifications();
+  },
+  { deep: true },
 );
 
 onBeforeUnmount(() => {
   // Stop live updates first so no tick lands on a removed chart.
   unsubscribeKline?.();
   unsubscribeKline = null;
-  // Tear down the ruler (drops any window listeners it may still hold).
+  // Tear down the ruler and right-click listeners (drop any window listeners).
   detachRuler();
+  detachRightClick();
+  // Drop any in-flight drag listeners and the resize observer.
+  window.removeEventListener('mousemove', onNotifyDragMove);
+  window.removeEventListener('mouseup', onNotifyDragEnd);
+  resizeObserver?.disconnect();
+  resizeObserver = null;
   // chart.remove() drops all series; just reset our references.
   levelSeries = [];
+  priceNotificationSeries.clear();
   if (chart) {
     chart.remove();
     chart = null;

@@ -136,6 +136,55 @@ class LevelNotificationConfig(models.Model):
         return f"{self.user.email} level notifications ({state})"
 
 
+class PriceNotification(models.Model):
+    """A one-shot per-user price alert for the levels screener.
+
+    Unlike `LevelNotificationConfig` (one proximity config per user), price alerts
+    are a collection: a user pins many target prices across coins, usually by
+    right-clicking a price on the chart. The `level-notifier` service reads the
+    enabled ones over the service-token channel and, when a coin's latest price
+    crosses the target in the stored `direction`, sends one Telegram alert and
+    disables the row (`enabled=False`, `triggered_at` set). `direction` is inferred
+    at creation from the click position relative to the current price, so the
+    trigger condition is initially false and a single price comparison suffices
+    (no edge tracking needed). The Telegram chat_id is reused from the owner's
+    `LevelNotificationConfig` (one Telegram setup per user); the service is given
+    only rows whose owner has a chat_id. De-dup of the brief window before the
+    disable propagates is a Redis guard owned by the notifier — not stored here.
+    """
+
+    class Direction(models.TextChoices):
+        ABOVE = "above", "above"  # alert when price rises to the target
+        BELOW = "below", "below"  # alert when price falls to the target
+
+    owner = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="price_notifications",
+    )
+    symbol = models.CharField(max_length=40)  # uppercased, like FavoriteCoin
+    # Float (not Decimal) for parity with the rest of the levels app — prices are
+    # floats end-to-end — and to keep the JSON wire shape a plain number. An alert
+    # threshold is not money-critical.
+    target_price = models.FloatField()
+    direction = models.CharField(max_length=5, choices=Direction.choices)
+    enabled = models.BooleanField(default=True)
+    triggered_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["owner", "symbol"]),
+            models.Index(fields=["owner", "enabled"]),
+        ]
+
+    def __str__(self) -> str:
+        state = "on" if self.enabled else "off"
+        return f"{self.symbol} {self.direction} {self.target_price} ({state})"
+
+
 class LevelAnalysisBreakout(models.Model):
     """One detected breakout inside a `LevelAnalysis` (mirrors the API breakout)."""
 

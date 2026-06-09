@@ -26,6 +26,13 @@ export interface Config {
   siteBaseUrl: string;
   /** Per (user, tf, symbol, level) anti-spam cooldown. */
   cooldownMs: number;
+  /** Price-crossing alerts (independent of the level proximity pass). */
+  price: {
+    /** Master switch for the price-notification pass. */
+    enabled: boolean;
+    /** Skip a price whose `:updated:` is older than this — frozen feed guard. */
+    maxStalenessMs: number;
+  };
   /** USDT-volume pre-filter source — must match the screener (1h × 24). */
   volume: VolumeConfig;
   /** Default level parameters; per-config natrMultiplier/minGap override a subset. */
@@ -49,6 +56,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     },
     siteBaseUrl: stripTrailingSlash(requireString(env.SITE_BASE_URL, 'SITE_BASE_URL')),
     cooldownMs: parseNumber(env.NOTIFY_COOLDOWN_MS, 1_800_000),
+    price: {
+      enabled: parseBoolean(env.PRICE_NOTIFICATIONS_ENABLED, true),
+      maxStalenessMs: parseNumber(env.PRICE_MAX_STALENESS_MS, 60_000),
+    },
     volume: {
       timeframe: env.VOLUME_TIMEFRAME ?? '1h',
       lookback: parseNumber(env.VOLUME_LOOKBACK, 24),
@@ -86,4 +97,11 @@ function parseNumber(raw: string | undefined, fallback: number): number {
     throw new Error(`Expected a number, got: ${raw}`);
   }
   return value;
+}
+
+function parseBoolean(raw: string | undefined, fallback: boolean): boolean {
+  if (raw === undefined || raw.trim() === '') {
+    return fallback;
+  }
+  return ['1', 'true', 'yes', 'on'].includes(raw.trim().toLowerCase());
 }

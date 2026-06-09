@@ -1,3 +1,5 @@
+import math
+
 from rest_framework import serializers
 
 from apps.levels.models import (
@@ -5,6 +7,7 @@ from apps.levels.models import (
     LevelAnalysis,
     LevelAnalysisBreakout,
     LevelNotificationConfig,
+    PriceNotification,
 )
 
 
@@ -279,3 +282,69 @@ class ServiceNotificationConfigSerializer(serializers.ModelSerializer):
     def get_favorites(self, obj: LevelNotificationConfig) -> list[str]:
         # Prefetched via the view (user__favorite_coins) — no extra query per row.
         return [favorite.symbol for favorite in obj.user.favorite_coins.all()]
+
+
+class PriceNotificationSerializer(serializers.ModelSerializer):
+    """One user-owned price alert (camelCase wire shape).
+
+    `direction` is supplied by the client, inferred from the click position vs the
+    current price (above = price must rise to target, below = must fall). `symbol`
+    is normalized to uppercase to match the screener. `enabled` is writable so the
+    widget can re-arm a fired alert; clearing `triggered_at` on re-arm is handled
+    in the viewset.
+    """
+
+    targetPrice = serializers.FloatField(source="target_price")
+    triggeredAt = serializers.DateTimeField(source="triggered_at", read_only=True)
+    createdAt = serializers.DateTimeField(source="created_at", read_only=True)
+    updatedAt = serializers.DateTimeField(source="updated_at", read_only=True)
+
+    class Meta:
+        model = PriceNotification
+        fields = [
+            "id",
+            "symbol",
+            "targetPrice",
+            "direction",
+            "enabled",
+            "triggeredAt",
+            "createdAt",
+            "updatedAt",
+        ]
+        read_only_fields = ["id", "triggeredAt", "createdAt", "updatedAt"]
+
+    def validate_symbol(self, value: str) -> str:
+        symbol = value.strip().upper()
+        if not symbol:
+            raise serializers.ValidationError("Symbol must not be empty.")
+        return symbol
+
+    def validate_targetPrice(self, value: float) -> float:
+        # Reject NaN/Infinity (a string body like "Infinity" coerces via float()
+        # and would otherwise slip past the > 0 check, creating a dead alert).
+        if not math.isfinite(value):
+            raise serializers.ValidationError("targetPrice must be a finite number.")
+        if value <= 0:
+            raise serializers.ValidationError("targetPrice must be > 0.")
+        return value
+
+
+class ServicePriceNotificationSerializer(serializers.ModelSerializer):
+    """Read-only projection of an active price alert for the `level-notifier`
+    service. Adds `ownerId` and the owner's Telegram `chatId` (reused from their
+    LevelNotificationConfig, select_related by the view) so the service can deliver
+    without a second request. Service-token only."""
+
+    ownerId = serializers.IntegerField(source="owner_id", read_only=True)
+    targetPrice = serializers.FloatField(source="target_price")
+    chatId = serializers.SerializerMethodField()
+
+    class Meta:
+        model = PriceNotification
+        fields = ["id", "ownerId", "symbol", "targetPrice", "direction", "chatId"]
+
+    def get_chatId(self, obj: PriceNotification) -> str:
+        # Reverse OneToOne may be absent; the view already filters to owners that
+        # have a non-empty chat_id, this is a defensive fallback.
+        config = getattr(obj.owner, "level_notification_config", None)
+        return config.chat_id if config else ""

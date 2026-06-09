@@ -1,9 +1,11 @@
 from typing import Any
 
 from django.shortcuts import get_object_or_404
+from django.utils import timezone
 from rest_framework import generics, mixins, status, viewsets
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
+from rest_framework.views import APIView
 
 from apps.bots.permissions import ServiceTokenOnly
 from apps.levels.api.serializers import (
@@ -12,13 +14,16 @@ from apps.levels.api.serializers import (
     AnalysisSummarySerializer,
     FavoriteCoinSerializer,
     LevelNotificationConfigSerializer,
+    PriceNotificationSerializer,
     ServiceNotificationConfigSerializer,
+    ServicePriceNotificationSerializer,
 )
 from apps.levels.models import (
     FavoriteCoin,
     LevelAnalysis,
     LevelAnalysisBreakout,
     LevelNotificationConfig,
+    PriceNotification,
 )
 
 
@@ -232,3 +237,77 @@ class ServiceNotificationConfigsView(generics.ListAPIView):
     def list(self, request, *args, **kwargs) -> Response:
         serializer = self.get_serializer(self.get_queryset(), many=True)
         return Response({"configs": serializer.data})
+
+
+class PriceNotificationViewSet(viewsets.ModelViewSet):
+    """CRUD over the current user's price alerts (a collection, addressed by id).
+
+    Created mostly by right-clicking a price on the screener chart. PATCH lets the
+    widget re-arm a fired alert (toggling `enabled` back on) or move a target; re-
+    arming clears `triggered_at`. Unpaginated — a user's alert list is small and
+    the screener needs all of it to overlay lines on the charts.
+    """
+
+    serializer_class = PriceNotificationSerializer
+    permission_classes = [IsAuthenticated]
+    pagination_class = None
+    http_method_names = ["get", "post", "patch", "delete", "head", "options"]
+
+    def get_queryset(self):
+        queryset = PriceNotification.objects.filter(owner=self.request.user)
+        symbol = self.request.query_params.get("symbol")
+        if symbol:
+            queryset = queryset.filter(symbol=symbol.upper())
+        return queryset
+
+    def perform_create(self, serializer) -> None:
+        serializer.save(owner=self.request.user)
+
+    def perform_update(self, serializer) -> None:
+        # Re-arming a fired alert from the widget (enabled flipped back on) clears
+        # the previous trigger timestamp so it shows as active again.
+        if serializer.validated_data.get("enabled") is True:
+            serializer.save(triggered_at=None)
+        else:
+            serializer.save()
+
+
+class ServicePriceNotificationsView(generics.ListAPIView):
+    """All active price alerts for the `level-notifier` service.
+
+    Service-token only. Returns enabled alerts whose owner has a Telegram chat_id
+    (reused from their LevelNotificationConfig) — the service cannot deliver
+    without one. Wrapped in `{"notifications": [...]}` to match the configs
+    envelope.
+    """
+
+    serializer_class = ServicePriceNotificationSerializer
+    permission_classes = [ServiceTokenOnly]
+    pagination_class = None
+
+    def get_queryset(self):
+        return (
+            PriceNotification.objects.filter(enabled=True)
+            .filter(owner__level_notification_config__chat_id__gt="")
+            .select_related("owner__level_notification_config")
+            .order_by("owner_id")
+        )
+
+    def list(self, request, *args, **kwargs) -> Response:
+        serializer = self.get_serializer(self.get_queryset(), many=True)
+        return Response({"notifications": serializer.data})
+
+
+class ServicePriceNotificationTriggerView(APIView):
+    """Mark a price alert as fired (one-shot): the `level-notifier` calls this after
+    sending the Telegram alert. Sets `enabled=False` + `triggered_at`. Service-token
+    only; idempotent."""
+
+    permission_classes = [ServiceTokenOnly]
+
+    def post(self, request, pk: int, *args, **kwargs) -> Response:
+        notification = get_object_or_404(PriceNotification, pk=pk)
+        notification.enabled = False
+        notification.triggered_at = timezone.now()
+        notification.save(update_fields=["enabled", "triggered_at", "updated_at"])
+        return Response(status=status.HTTP_200_OK)

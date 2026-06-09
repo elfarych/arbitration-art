@@ -359,6 +359,12 @@ Worker без HTTP. Раз в `INTERVAL_MS` (10с) опрашивает Django, 
 их персональным настройкам. Один конфиг на пользователя; один бот на сервис,
 `chat_id` — у каждого пользователя свой.
 
+В том же тике идёт **второй, независимый проход — ценовые уведомления**
+(price-crossing): алерт, когда последняя цена монеты пересекает заданную
+пользователем целевую цену. Этому проходу расчёт уровней не нужен — он читает
+готовую цену из Redis коннектора. Подробности — в разделе «Ценовые уведомления»
+ниже.
+
 ### Поток
 
 ```
@@ -422,6 +428,47 @@ Telegram запрещает `getUpdates` при активном webhook (`409 C
 `level-notifier`. При `409`/сетевой ошибке цикл логирует `warn` и делает backoff.
 Пока пользователь не нажал `/start`, `sendMessage` ему вернёт `400 chat not found`.
 
+### Ценовые уведомления (price-crossing)
+
+Второй проход тика (`Notifier.runPriceChecks`, независим от уровневого — его сбой
+не валит уровневый и наоборот). Поток:
+
+```
+Django  GET /api/levels/service/price-notifications/  (X-Service-Token)
+   │   активные алерты (enabled=true) + chatId владельца (из его LevelNotificationConfig)
+   ▼
+level-notifier (каждые 10с, рядом с уровневым проходом):
+   1. собрать символы → CandleSource.getLatestPrices  ← Redis binance-futures:price:<SYM> + :updated:<SYM>
+   2. пропустить, если цены нет или :updated: старше PRICE_MAX_STALENESS_MS (замороженный фид)
+   3. пересечение: above → price ≥ target; below → price ≤ target
+   4. guard от двойного срабатывания (Redis level-notifier:price-state:<id>, SET NX PX)
+   5. Telegram sendMessage → POST .../price-notifications/<id>/trigger/ (Django: enabled=false)
+   ▼
+Telegram Bot API + ссылка ${SITE_BASE_URL}/#/levels/SYMBOL
+```
+
+- **Direction** (`above`/`below`) вычисляется фронтом по позиции клика на графике
+  относительно текущей цены, поэтому в момент создания условие ложно — достаточно
+  одного сравнения с уровнем, edge-трекинг прошлой цены не нужен.
+- **One-shot.** Реальный дедуп — `enabled=false` в Django после отправки (алерт
+  выпадает из фида). `level-notifier:price-state:<id>` (`SET … NX PX guardMs`,
+  `guardMs = max(2·INTERVAL_MS, PRICE_MAX_STALENESS_MS)`) — лишь страховка
+  переходного окна, пока disable не доехал до фида; TTL истекает, чтобы повторно
+  вооружённый алерт снова срабатывал.
+- **chat_id** не дублируется в `PriceNotification` — берётся из
+  `LevelNotificationConfig` владельца (фид отдаёт только записи с непустым
+  `chat_id`). Сбой доставки (4xx) оставляет алерт вооружённым — `trigger` шлётся
+  только после подтверждённой отправки.
+- **Universe-gap.** Цена есть только для монет вселенной коннектора (24h объём ≥
+  `MIN_24H_VOLUME_USDT`). Алерт по монете вне неё молча не сработает (см. «Риски»).
+- **Дубликат алгоритма уровней не задействован** — ценовой путь читает только
+  `:price:` коннектора, расчёт уровней (`compute/`) не трогает.
+
+Состояние (`src/state/price-state.ts`, `PriceNotifyStateStore`), клиент Django
+(`getActivePriceNotifications` + `markPriceNotificationTriggered` в
+`services/django-client.ts`), чтение цен (`CandleSource.getLatestPrices`).
+Контракт с Django — `arbitration-art-django/DOCS.md` §10A.
+
 ### Конфигурация (env)
 
 | Переменная | Назначение | Дефолт |
@@ -429,7 +476,9 @@ Telegram запрещает `getUpdates` при активном webhook (`409 C
 | `REDIS_URL` | Redis (свечи + state) | `redis://127.0.0.1:6379` |
 | `SOURCE_PREFIX` | префикс свечей — **= `REDIS_KEY_PREFIX` коннектора** | `binance-futures` |
 | `INTERVAL_MS` | период тика | `10000` |
-| `NOTIFY_COOLDOWN_MS` | кулдаун анти-спама | `1800000` (30 мин) |
+| `NOTIFY_COOLDOWN_MS` | кулдаун анти-спама (уровневый проход) | `1800000` (30 мин) |
+| `PRICE_NOTIFICATIONS_ENABLED` | мастер-переключатель ценового прохода | `true` |
+| `PRICE_MAX_STALENESS_MS` | пропускать цену, если `:updated:` старше (замороженный фид) | `60000` |
 | `DJANGO_API_URL` | база Django c `/api` | `http://127.0.0.1:8000/api` |
 | `SERVICE_SHARED_TOKEN` | сервис-токен — **= Django/engine** | (обяз.) |
 | `TELEGRAM_BOT_TOKEN` | токен бота от @BotFather | (обяз., только в `.env`) |
@@ -476,8 +525,16 @@ Telegram запрещает `getUpdates` при активном webhook (`409 C
   (`GET /api/levels/notification-configs/`, сервис-токен) и шлёт Telegram-алерты со
   ссылкой `${SITE_BASE_URL}/#/levels/SYMBOL?tf=TF&natrMultiplier=…&minGap=…` на страницу монеты во фронте (без превью сайта; параметры → график уровней на странице).
   Конфиги создаются из диалога «уведомления» в шапке скринера
-  (`quasar/.../LevelsNotificationsDialog.vue`, `PUT /api/levels/notification-config/`).
+  (`quasar/.../LevelsNotificationsDialog.vue`, вкладка «По уровням»,
+  `PUT /api/levels/notification-config/`).
   См. `arbitration-art-django/DOCS.md` §10A и фронт `DOCS.md` §25B.
+- **Ценовые уведомления**: тот же `level-notifier` (второй проход) читает активные
+  ценовые алерты из Django (`GET /api/levels/service/price-notifications/`,
+  сервис-токен) и шлёт Telegram-алерт при пересечении ценой целевого уровня, затем
+  отключает алерт (one-shot, `POST .../price-notifications/<id>/trigger/`). Создаются
+  правым кликом по цене на графике скринера (`LevelChartCard.vue`) и управляются во
+  вкладке «По цене» того же диалога. См. `arbitration-art-django/DOCS.md` §10A и
+  фронт `DOCS.md` §25B.
 - **База на фронте**: `process.env.LEVELS_API_URL` (по умолч. `http://127.0.0.1:3000`).
 - **Поллинг**: `/screener/:tf` считается под запрос — каждый ответ свежий
   (`updatedAt` = время расчёта). Для живого экрана фронт поллит список каждые
@@ -569,6 +626,11 @@ docker build -t levels-api:local .
   высокой конкуррентности/частом поллинге это давит на event loop; при росте
   нагрузки рассмотреть кеш по набору параметров или вынос расчёта в worker.
 - **API без auth** — не выставлять наружу без добавления аутентификации.
+- **Ценовые уведомления — universe-gap**: `level-notifier` читает цену из
+  `binance-futures:price:<SYM>`, который есть только для монет вселенной коннектора
+  (24h объём ≥ `MIN_24H_VOLUME_USDT`). Ценовой алерт по монете вне вселенной молча
+  не сработает (цены в Redis нет). Коннектор под это не расширяется (по решению);
+  на практике алерты создаются с графиков скринера, т.е. по монетам внутри вселенной.
 - **Лимиты Binance**: коннектор держит бюджет веса REST; агрессивное снижение
   `REFRESH_INTERVAL_MS` или рост числа символов повышают нагрузку на лимит.
 - **Стоимость `/analysis`**: тянет свечи + по запросу `aggTrades` на каждый пробой

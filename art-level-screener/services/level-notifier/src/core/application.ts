@@ -7,6 +7,7 @@ import { CandleSource } from '../redis/candle-source';
 import { createRedis } from '../redis/redis-client';
 import { DjangoClient } from '../services/django-client';
 import { NotifyStateStore } from '../state/notify-state';
+import { PriceNotifyStateStore } from '../state/price-state';
 import { Notifier } from './notifier';
 import { TelegramClient } from '../telegram/telegram-client';
 import { TelegramCommandListener } from '../telegram/command-listener';
@@ -30,7 +31,12 @@ export class Application {
     const django = new DjangoClient(config.django.apiUrl, config.django.serviceToken, logger);
     const telegram = new TelegramClient(config.telegram.botToken, logger);
     const state = new NotifyStateStore(this.redis, config.cooldownMs);
-    this.notifier = new Notifier(config, source, django, state, telegram, logger);
+    // Guard window for one-shot price alerts: long enough to cover the gap until a
+    // fired alert's disable propagates to the service feed (a couple of ticks),
+    // and the staleness window, so it is never re-fired before Django disables it.
+    const priceGuardMs = Math.max(2 * config.intervalMs, config.price.maxStalenessMs);
+    const priceState = new PriceNotifyStateStore(this.redis, priceGuardMs);
+    this.notifier = new Notifier(config, source, django, state, priceState, telegram, logger);
     // Inbound half of the bot: answers /start with the user's chat_id (long polling).
     this.commandListener = new TelegramCommandListener(telegram, this.redis, logger);
   }
