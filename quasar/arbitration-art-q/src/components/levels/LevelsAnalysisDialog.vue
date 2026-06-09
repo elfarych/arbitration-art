@@ -30,13 +30,13 @@
               type="number"
               label="Свечей для анализа"
               :min="61"
-              :max="3000"
+              :max="10000"
               step="100"
               dense
               outlined
               dark
               class="col-6"
-              hint="61–3000"
+              hint="61–10000"
             />
           </div>
         </div>
@@ -67,6 +67,7 @@
               outlined
               dark
               class="col-6"
+              :hint="gapHint"
             />
           </div>
         </div>
@@ -137,6 +138,7 @@
 <script setup lang="ts">
 import { reactive, computed, watch } from 'vue';
 import type { AnalysisSettings } from 'src/stores/levels/analysis.store';
+import { gapDuration } from 'src/stores/levels/timeframe';
 
 const props = defineProps<{
   modelValue: boolean;
@@ -157,7 +159,7 @@ const DIRECTION_OPTIONS = [
 ];
 
 const MIN_CANDLES = 61;
-const MAX_CANDLES = 3000;
+const MAX_CANDLES = 10000;
 
 // Local editable copy so closing without "Запустить" discards edits. Re-synced
 // from props each time the dialog opens.
@@ -169,6 +171,14 @@ watch(
     if (open) Object.assign(form, props.settings);
   },
 );
+
+// Wall-clock span of the "candles between touches" gap on the selected analysis
+// timeframe, shown as a hint under the field (e.g. "≈ 1ч35м"). Empty while the
+// timeframe/gap is unset so the hint just hides.
+const gapHint = computed(() => {
+  const duration = gapDuration(form.timeframe, form.minGap);
+  return duration ? `≈ ${duration}` : '';
+});
 
 const isValid = computed(
   () =>

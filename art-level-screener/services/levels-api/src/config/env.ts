@@ -77,7 +77,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     },
     analysis: {
       defaultCandles: parseNumber(env.ANALYSIS_DEFAULT_CANDLES, 1000),
-      maxCandles: parseNumber(env.ANALYSIS_MAX_CANDLES, 3000),
+      maxCandles: parseNumber(env.ANALYSIS_MAX_CANDLES, 10000),
       aggTradesLimit: parseNumber(env.ANALYSIS_AGG_TRADES_LIMIT, 1000),
       maxTradePages: parseNumber(env.ANALYSIS_MAX_TRADE_PAGES, 12),
     },

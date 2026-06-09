@@ -80,11 +80,10 @@ export async function computeAnalysis(
 
   const highs = candles.map((candle) => candle.high);
   const lows = candles.map((candle) => candle.low);
-  const closes = candles.map((candle) => candle.close);
 
   const candidates: BreakoutCandidate[] = [];
-  collectBreakouts(highs, closes, candles, 'top', levelParams, tolerancePct, candidates);
-  collectBreakouts(lows, closes, candles, 'bottom', levelParams, tolerancePct, candidates);
+  collectBreakouts(highs, candles, 'top', levelParams, tolerancePct, candidates);
+  collectBreakouts(lows, candles, 'bottom', levelParams, tolerancePct, candidates);
 
   const selected = candidates
     .filter((c) => params.direction === 'both' || c.direction === params.direction)
@@ -123,15 +122,15 @@ export async function computeAnalysis(
  *
  * A level is a significant extremum (same `findExtrema` as the screener) that,
  * before being breached, was touched at least `minTouches` times within the NATR
- * tolerance band (same `countTouches`). Its breakout is the first candle that
- * **closes** beyond the level (top → close above, bottom → close below). Using
- * the close (not the high/low wick) filters out wick fakeouts — a single tick
- * poking through the level that closes back inside is not a breakout. Levels
- * never breached in the window produce no breakout event.
+ * tolerance band (same `countTouches`). Its breakout is the first candle whose
+ * wick pierces the level (top → high above, bottom → low below). The first pierce
+ * is the breakout — no close confirmation is required: a wick poking through the
+ * level counts even if the candle closes back inside. This matches the screener's
+ * broken-level rule, which is also wick-based. Levels never pierced in the window
+ * produce no breakout event.
  */
 function collectBreakouts(
   series: readonly number[],
-  closes: readonly number[],
   candles: readonly Candle[],
   kind: LevelKind,
   params: LevelParams,
@@ -143,9 +142,9 @@ function collectBreakouts(
 
   for (const index of extrema) {
     const level = series[index];
-    const breakoutIndex = firstBreachIndex(closes, index + 1, level, isTop);
+    const breakoutIndex = firstBreachIndex(series, index + 1, level, isTop);
     if (breakoutIndex === -1) {
-      continue; // never closed beyond the level inside the window
+      continue; // wick never pierced the level inside the window
     }
     // Touches are counted on the wick series (highs/lows) only between formation
     // and the breakout — the level must be established before it breaks.

@@ -29,11 +29,27 @@
         @blur="apply"
       />
       <span class="filter-unit text-grey-6">NATR</span>
-      <q-tooltip>Погрешность зоны касания в долях NATR (ширина полосы = natr · значение)</q-tooltip>
+      <span class="filter-stepper column no-wrap items-center justify-center">
+        <q-icon
+          name="keyboard_arrow_up"
+          size="14px"
+          color="grey-6"
+          class="filter-step"
+          @click.prevent="stepNatr(0.1)"
+        />
+        <q-icon
+          name="keyboard_arrow_down"
+          size="14px"
+          color="grey-6"
+          class="filter-step"
+          @click.prevent="stepNatr(-0.1)"
+        />
+      </span>
+      <q-tooltip>Погрешность зоны касания в долях NATR (ширина полосы = natr · значение). Стрелки — шаг 0.1</q-tooltip>
     </label>
 
     <label class="filter-field row no-wrap items-center">
-      <span class="filter-label text-grey-5">Свечей</span>
+      <span class="filter-label text-grey-5">{{ gapTime || 'Свечей' }}</span>
       <input
         v-model.number="gap"
         type="number"
@@ -44,7 +60,10 @@
         @keyup.enter="apply"
         @blur="apply"
       />
-      <q-tooltip>Минимум свечей между касаниями уровня (ближе — считается одним касанием)</q-tooltip>
+      <q-tooltip>
+        Минимум свечей между касаниями уровня (ближе — считается одним касанием).
+        Слева — это время на текущем ТФ ({{ gap }} × {{ props.timeframe || '—' }})
+      </q-tooltip>
     </label>
 
     <q-btn
@@ -72,8 +91,9 @@
 </template>
 
 <script setup lang="ts">
-import { ref, watch } from 'vue';
+import { ref, watch, computed } from 'vue';
 import { LEVELS_MIN_VOLUME } from 'src/stores/levels/levels.store';
+import { gapDuration } from 'src/stores/levels/timeframe';
 
 // Screener calculation params edited in the page header. The contract value for
 // volume is raw USDT; the field edits millions for a compact input. Other params
@@ -88,6 +108,9 @@ const props = defineProps<{
   pinFavorites: boolean;
   // Number of favorite coins — gates the pin button (can't pin with none).
   favoritesCount: number;
+  // Current screener timeframe (e.g. '1m', '15m', '1h') — used to show the gap
+  // (candles between touches) as an equivalent duration label.
+  timeframe: string;
 }>();
 
 const emit = defineEmits<{
@@ -121,6 +144,25 @@ function apply(): void {
   gap.value = minGap;
   emit('apply', { minVolume, natrMultiplier, minGap });
 }
+
+// Step the NATR tolerance by ±0.1 via the up/down arrows and commit immediately.
+// Rounds to 1 decimal to avoid float drift (0.1+0.2 = 0.30000000000000004) and
+// floors at 0.1 — apply() treats 0 as invalid and would revert, so the smallest
+// committed step is 0.1.
+function stepNatr(delta: number): void {
+  const current = Number(natr.value) || 0;
+  natr.value = Math.max(0.1, Math.round((current + delta) * 10) / 10);
+  apply();
+}
+
+// Time the "candles between touches" gap spans on the current timeframe — shown
+// in place of the "Свечей" label. Tracks the live input value; falls back to the
+// committed minGap when the field is mid-edit/empty. Empty when the timeframe is
+// unknown (label then reverts to "Свечей").
+const gapTime = computed(() => {
+  const candles = Number(gap.value) >= 1 ? Number(gap.value) : props.minGap;
+  return gapDuration(props.timeframe, candles);
+});
 </script>
 
 <style lang="sass" scoped>
@@ -161,6 +203,19 @@ function apply(): void {
   font-size: 11px
   white-space: nowrap
   user-select: none
+
+// Vertical ±0.1 stepper for the NATR field: two compact chevrons stacked inside
+// the pill. Base grey (color="grey-6"); brighten on hover for affordance.
+.filter-stepper
+  margin-left: 4px
+  height: 28px
+  user-select: none
+
+.filter-step
+  cursor: pointer
+  line-height: 1
+  &:hover
+    color: $title-color
 
 // Pin button aligned to the filter pills: same height and radius so the row
 // stays one cohesive control group.

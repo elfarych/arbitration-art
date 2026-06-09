@@ -157,7 +157,7 @@ class LevelAnalysisBreakout(models.Model):
     kind = models.CharField(max_length=6, choices=Kind.choices)
     direction = models.CharField(max_length=4, choices=Direction.choices)
     touches = models.PositiveIntegerField()
-    breakout_candle_time = models.BigIntegerField()  # candle that closed beyond, ms
+    breakout_candle_time = models.BigIntegerField()  # candle whose wick first pierced the level, ms
     cross_time = models.BigIntegerField(null=True, blank=True)  # first trade past level
     reach_time = models.BigIntegerField(null=True, blank=True)  # reached minMovePct
     elapsed_ms = models.BigIntegerField(null=True, blank=True)  # cross → peak move

@@ -59,7 +59,7 @@
               label="Погрешность"
               suffix="NATR"
               min="0"
-              step="0.05"
+              step="0.1"
               dense
               outlined
               dark

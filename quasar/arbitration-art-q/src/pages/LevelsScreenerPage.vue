@@ -1,8 +1,24 @@
 <template>
   <q-page class="q-pa-md text-white column no-wrap">
     <div class="row items-center q-gutter-x-sm q-mb-sm header-row">
-      <h4 class="q-my-none text-h6 text-weight-bold">Уровни</h4>
-      <span v-if="updatedAt" class="text-caption text-grey-5">обновлено {{ updatedAt }}</span>
+      <label class="search-field row no-wrap items-center">
+        <q-icon name="search" size="18px" class="text-grey-5" />
+        <input
+          v-model="searchInput"
+          type="text"
+          placeholder="Поиск монеты"
+          class="search-input-native"
+          @input="onSearchInput"
+          @keyup.enter="commitSearch"
+        />
+        <q-icon
+          v-if="searchInput"
+          name="close"
+          size="16px"
+          class="search-clear text-grey-5 cursor-pointer"
+          @click="clearSearch"
+        />
+      </label>
 
       <q-space />
 
@@ -64,6 +80,7 @@
         :min-gap="store.minGap"
         :pin-favorites="store.pinFavorites"
         :favorites-count="favoritesStore.count"
+        :timeframe="store.timeframe"
         @apply="onParams"
         @toggle-pin="onTogglePin"
       />
@@ -107,7 +124,7 @@
     </div>
 
     <div v-else-if="!store.entries.length" class="text-center text-grey-5 q-pa-xl">
-      Нет данных по выбранному таймфрейму
+      {{ store.search ? `Ничего не найдено по запросу «${store.search}»` : 'Нет данных по выбранному таймфрейму' }}
     </div>
 
     <div v-else class="levels-grid" :style="{ '--cols': columns, '--rows': rows }">
@@ -125,7 +142,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue';
+import { ref, onMounted } from 'vue';
 import { useRouter } from 'vue-router';
 import { useLevelsStore, LEVELS_MIN_VOLUME } from 'src/stores/levels/levels.store';
 import { useFavoritesStore } from 'src/stores/levels/favorites.store';
@@ -208,12 +225,29 @@ async function onTogglePin() {
   await store.setPinFavorites(next);
 }
 
-// Wall-clock time of the last manual refresh (no live ticking — updates only
-// when the data is refetched).
-const updatedAt = computed(() => {
-  if (!store.fetchedAt) return '';
-  return new Date(store.fetchedAt).toLocaleTimeString('ru-RU');
-});
+// Symbol search. Local input mirrors the LevelsFilters pills (native input in a
+// styled label). Debounced by 350ms so a recompute fires once the user pauses,
+// not per keystroke; Enter commits immediately, the clear icon resets it.
+const searchInput = ref(store.search);
+let searchTimer: ReturnType<typeof setTimeout> | null = null;
+
+function commitSearch() {
+  if (searchTimer) {
+    clearTimeout(searchTimer);
+    searchTimer = null;
+  }
+  void store.setSearch(searchInput.value);
+}
+
+function onSearchInput() {
+  if (searchTimer) clearTimeout(searchTimer);
+  searchTimer = setTimeout(commitSearch, 350);
+}
+
+function clearSearch() {
+  searchInput.value = '';
+  commitSearch();
+}
 
 async function onTimeframe(timeframe: string) {
   await store.setTimeframe(timeframe);
@@ -251,6 +285,38 @@ onMounted(async () => {
 .ctrl-btn
   min-width: 40px
   border-radius: 6px
+
+// Symbol search pill — mirrors LevelsFilters `.filter-field` (dark fill, 6px
+// radius, 32px height, primary focus ring) so the header reads as one control
+// group. Native input instead of q-input to guarantee the exact same look.
+.search-field
+  height: 32px
+  width: 180px
+  padding: 0 10px
+  background: $dark
+  border-radius: 6px
+  cursor: text
+  transition: box-shadow 0.1s ease
+  &:focus-within
+    box-shadow: inset 0 0 0 1px $primary
+
+.search-input-native
+  flex: 1 1 auto
+  width: 100%
+  min-width: 0
+  margin: 0 6px
+  border: none
+  outline: none
+  background: transparent
+  color: $title-color
+  font-size: 13px
+  font-weight: 600
+  &::placeholder
+    color: $grey-6
+    font-weight: 400
+
+.search-clear
+  flex: none
 
 // Fill the remaining viewport height so all rows fit without page scroll;
 // min-height:0 lets the grid shrink instead of overflowing the flex column.

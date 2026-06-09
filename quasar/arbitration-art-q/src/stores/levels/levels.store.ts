@@ -53,6 +53,8 @@ interface LevelsState {
   natrMultiplier: number;
   // minGap: minimum candles between counted touches.
   minGap: number;
+  // Case-insensitive symbol substring filter, matched server-side. Empty → off.
+  search: string;
   loading: boolean;
   error: string | null;
   // Wall-clock of the last successful fetch (ms) — for the "updated Xs ago" hint.
@@ -71,6 +73,7 @@ export const useLevelsStore = defineStore('levels', {
     minVolume: LEVELS_DEFAULT_MIN_VOLUME,
     natrMultiplier: LEVELS_DEFAULT_NATR_MULTIPLIER,
     minGap: LEVELS_DEFAULT_MIN_GAP,
+    search: '',
     loading: false,
     error: null,
     fetchedAt: null,
@@ -119,30 +122,48 @@ export const useLevelsStore = defineStore('levels', {
       }
     },
 
+    // Run the screener request for the current timeframe/page/filters and store
+    // the result. Internal — fetchScreener wraps it with loading/error handling
+    // and page clamping.
+    async _fetchPage() {
+      const calc = {
+        // Volume filter is opt-in: send only when set (> 0).
+        ...(this.minVolume > 0 ? { minVolume: this.minVolume } : {}),
+        natrMultiplier: this.natrMultiplier,
+        minGap: this.minGap,
+      };
+      const result = await levelsApi.screener(this.timeframe, {
+        sort: 'distance',
+        order: 'asc',
+        // By-symbol search (case-insensitive substring); omitted when empty.
+        ...(this.search ? { search: this.search } : {}),
+        // Pinned mode needs the whole universe in one request (no by-symbol
+        // filter) to float favorites to the top across pages; paged mode keeps
+        // server-side limit/offset.
+        ...(this.pinFavorites
+          ? { limit: PINNED_FETCH_LIMIT, offset: 0 }
+          : { limit: this.pageSize, offset: (this.page - 1) * this.pageSize }),
+        ...calc,
+      });
+      this.rawItems = result.items;
+      this.serverTotal = result.total;
+      this.fetchedAt = Date.now();
+    },
+
     async fetchScreener() {
       if (!this.timeframe) return;
       this.loading = true;
       try {
-        const calc = {
-          // Volume filter is opt-in: send only when set (> 0).
-          ...(this.minVolume > 0 ? { minVolume: this.minVolume } : {}),
-          natrMultiplier: this.natrMultiplier,
-          minGap: this.minGap,
-        };
-        const result = await levelsApi.screener(this.timeframe, {
-          sort: 'distance',
-          order: 'asc',
-          // Pinned mode needs the whole universe in one request (no by-symbol
-          // filter) to float favorites to the top across pages; paged mode keeps
-          // server-side limit/offset.
-          ...(this.pinFavorites
-            ? { limit: PINNED_FETCH_LIMIT, offset: 0 }
-            : { limit: this.pageSize, offset: (this.page - 1) * this.pageSize }),
-          ...calc,
-        });
-        this.rawItems = result.items;
-        this.serverTotal = result.total;
-        this.fetchedAt = Date.now();
+        await this._fetchPage();
+        // A filter/search change can shrink the result set so the current page no
+        // longer exists. Keep the page where possible, but clamp to the last valid
+        // page so the screen never lands on an empty out-of-range page. Paged mode
+        // then needs one corrective refetch for the new offset; pinned mode
+        // paginates client-side (entries getter), so no refetch is needed.
+        if (this.page > this.pageCount) {
+          this.page = this.pageCount;
+          if (!this.pinFavorites) await this._fetchPage();
+        }
         this.error = null;
       } catch (e) {
         this.error = extractApiErrorMessage(e, 'Не удалось загрузить уровни');
@@ -188,8 +209,9 @@ export const useLevelsStore = defineStore('levels', {
     },
 
     // Set calculation params (volume / NATR tolerance / touch gap). Applies only
-    // the provided fields, resets to the first page (the result set changes), and
-    // refetches. No-op when nothing actually changes — avoids a redundant recompute.
+    // the provided fields and refetches, keeping the current page (fetchScreener
+    // clamps it down only if the new result set has fewer pages). No-op when
+    // nothing actually changes — avoids a redundant recompute.
     async setParams(params: { minVolume?: number; natrMultiplier?: number; minGap?: number }) {
       let changed = false;
       if (params.minVolume !== undefined && params.minVolume !== this.minVolume) {
@@ -205,6 +227,17 @@ export const useLevelsStore = defineStore('levels', {
         changed = true;
       }
       if (!changed) return;
+      await this.fetchScreener();
+    },
+
+    // Set the by-symbol search filter (case-insensitive substring, matched
+    // server-side). Trims input, no-ops when unchanged, resets to the first page
+    // (the result set changes) and refetches in both paging modes (unlike
+    // setPage, which skips the refetch in pinned mode).
+    async setSearch(search: string) {
+      const next = search.trim();
+      if (next === this.search) return;
+      this.search = next;
       this.page = 1;
       await this.fetchScreener();
     },
