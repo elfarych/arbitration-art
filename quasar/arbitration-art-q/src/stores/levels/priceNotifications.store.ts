@@ -121,5 +121,29 @@ export const usePriceNotificationsStore = defineStore('levelsPriceNotifications'
         this.pending.delete(id);
       }
     },
+
+    // Remove all fired (disabled) alerts at once. Best-effort: deletes them in
+    // parallel, drops the ones that succeeded, keeps any that failed, and reports
+    // a partial-failure message. No DELETE-by-id rollback needed — failures stay.
+    async removeFired() {
+      const firedIds = this.items.filter((n) => !n.enabled).map((n) => n.id);
+      if (firedIds.length === 0) return;
+      firedIds.forEach((id) => this.pending.add(id));
+      this.error = null;
+      const results = await Promise.allSettled(
+        firedIds.map((id) => priceNotificationsApi.remove(id)),
+      );
+      const failed = new Set<number>();
+      results.forEach((result, i) => {
+        const id = firedIds[i];
+        if (id !== undefined && result.status === 'rejected') failed.add(id);
+      });
+      // Drop the successfully-deleted fired alerts; keep active and any that failed.
+      this.items = this.items.filter((n) => n.enabled || failed.has(n.id));
+      firedIds.forEach((id) => this.pending.delete(id));
+      if (failed.size > 0) {
+        this.error = 'Не удалось удалить некоторые уведомления';
+      }
+    },
   },
 });

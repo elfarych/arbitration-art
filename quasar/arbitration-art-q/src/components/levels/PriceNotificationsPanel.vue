@@ -3,71 +3,82 @@
     <div class="pn-body">
       <!-- Hint -->
       <div class="pn-hint">
-        <q-icon name="ads_click" size="17px" class="pn-hint-icon" />
-        <span>
-          Правый клик по цене на графике создаёт уведомление. Срабатывает один раз, затем
-          отключается.
-        </span>
+        <q-icon name="ads_click" size="15px" class="pn-hint-icon" />
+        <span>Правый клик по цене на графике создаёт уведомление. Срабатывает один раз.</span>
       </div>
 
       <q-banner v-if="store.error" dense class="pn-error">
         {{ store.error }}
       </q-banner>
 
-      <!-- List -->
-      <div v-if="store.loading" class="pn-state">
-        <q-spinner color="primary" size="28px" />
+      <!-- States -->
+      <div v-if="store.loading && store.items.length === 0" class="pn-state">
+        <q-spinner color="primary" size="26px" />
       </div>
 
       <div v-else-if="store.items.length === 0" class="pn-empty">
         <div class="pn-empty-icon">
-          <q-icon name="notifications_none" size="26px" />
+          <q-icon name="notifications_none" size="24px" />
         </div>
         <div class="pn-empty-title">Пока нет ценовых уведомлений</div>
         <div class="pn-empty-sub">Правый клик по цене на графике, чтобы добавить</div>
       </div>
 
-      <div v-else class="pn-rows">
-        <div
-          v-for="item in store.items"
-          :key="item.id"
-          class="pn-row"
-          :class="{ 'pn-row--fired': !item.enabled }"
-        >
-          <div class="pn-dir" :class="`pn-dir--${item.direction}`">
-            <q-icon :name="item.direction === 'above' ? 'arrow_upward' : 'arrow_downward'" size="15px" />
+      <!-- Sections: Активные / Сработавшие -->
+      <template v-else>
+        <div v-for="section in sections" :key="section.key" class="pn-section">
+          <div class="pn-section-head">
+            <span class="pn-section-label">{{ section.label }}</span>
+            <span class="pn-section-count">{{ section.items.length }}</span>
+            <q-space />
+            <q-btn
+              v-if="section.key === 'fired'"
+              flat
+              dense
+              no-caps
+              size="11px"
+              icon="delete_sweep"
+              label="Очистить"
+              color="grey-5"
+              class="pn-clear"
+              @click="onClearFired"
+            />
           </div>
 
-          <div class="pn-info">
-            <div class="pn-row-top">
+          <div class="pn-rows">
+            <div
+              v-for="item in section.items"
+              :key="item.id"
+              class="pn-row"
+              :class="{ 'pn-row--fired': !item.enabled }"
+            >
+              <div class="pn-dir" :class="`pn-dir--${item.direction}`">
+                <q-icon :name="item.direction === 'above' ? 'arrow_upward' : 'arrow_downward'" size="13px" />
+                <q-tooltip>{{ item.direction === 'above' ? 'при росте до цены' : 'при падении до цены' }}</q-tooltip>
+              </div>
               <span class="pn-symbol">{{ item.symbol }}</span>
               <span class="pn-price">{{ formatPrice(item.targetPrice) }}</span>
-            </div>
-            <div class="pn-meta">
-              {{ item.direction === 'above' ? 'при росте до цены' : 'при падении до цены' }}
+              <q-space />
+              <span v-if="!item.enabled && item.triggeredAt" class="pn-time">
+                {{ shortTime(item.triggeredAt) }}
+                <q-tooltip>сработало {{ formatTime(item.triggeredAt) }}</q-tooltip>
+              </span>
+              <q-btn
+                flat
+                dense
+                round
+                size="sm"
+                icon="close"
+                class="pn-del"
+                :loading="store.isPending(item.id)"
+                @click="onRemove(item)"
+              >
+                <q-tooltip>Удалить</q-tooltip>
+              </q-btn>
             </div>
           </div>
-
-          <span v-if="!item.enabled" class="pn-fired-pill">
-            <q-icon name="check" size="12px" />
-            сработало
-            <q-tooltip v-if="item.triggeredAt">{{ formatTime(item.triggeredAt) }}</q-tooltip>
-          </span>
-
-          <q-btn
-            flat
-            dense
-            round
-            size="sm"
-            icon="close"
-            class="pn-del"
-            :loading="store.isPending(item.id)"
-            @click="onRemove(item)"
-          >
-            <q-tooltip>Удалить</q-tooltip>
-          </q-btn>
         </div>
-      </div>
+      </template>
 
       <!-- Telegram -->
       <div class="pn-tg">
@@ -99,6 +110,7 @@
 </template>
 
 <script setup lang="ts">
+import { computed } from 'vue';
 import { useQuasar } from 'quasar';
 import { usePriceNotificationsStore } from 'src/stores/levels/priceNotifications.store';
 import { useNotificationsStore } from 'src/stores/levels/notifications.store';
@@ -113,6 +125,22 @@ const emit = defineEmits<{ 'update:chatId': [value: string] }>();
 const $q = useQuasar();
 const store = usePriceNotificationsStore();
 const notificationsStore = useNotificationsStore();
+
+interface Section {
+  key: 'active' | 'fired';
+  label: string;
+  items: PriceNotification[];
+}
+
+// Split into armed alerts and ones that have already fired (enabled=false).
+const sections = computed<Section[]>(() => {
+  const out: Section[] = [];
+  const active = store.items.filter((n) => n.enabled);
+  const fired = store.items.filter((n) => !n.enabled);
+  if (active.length) out.push({ key: 'active', label: 'Активные', items: active });
+  if (fired.length) out.push({ key: 'fired', label: 'Сработавшие', items: fired });
+  return out;
+});
 
 async function onSaveChatId() {
   const config = notificationsStore.config;
@@ -147,12 +175,40 @@ function onRemove(item: PriceNotification) {
   });
 }
 
+function onClearFired() {
+  const count = store.items.filter((n) => !n.enabled).length;
+  if (count === 0) return;
+  $q.dialog({
+    title: 'Удалить сработавшие',
+    message: `Удалить все сработавшие уведомления (${count})?`,
+    cancel: { label: 'Отмена', flat: true, noCaps: true, color: 'grey-5' },
+    ok: { label: 'Удалить', unelevated: true, noCaps: true, color: 'negative' },
+    persistent: true,
+    dark: true,
+    class: 'bg-dark text-white',
+  }).onOk(() => {
+    void store.removeFired();
+  });
+}
+
 // Compact price formatting across the wide range of futures prices.
 function formatPrice(value: number): string {
   if (!Number.isFinite(value) || value === 0) return String(value);
   const abs = Math.abs(value);
   const digits = abs >= 1000 ? 2 : abs >= 1 ? 4 : abs >= 0.01 ? 5 : 8;
   return value.toFixed(digits).replace(/\.?0+$/, '');
+}
+
+// Compact timestamp for the fired row (full datetime is in the tooltip).
+function shortTime(iso: string): string {
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return '';
+  return date.toLocaleString(undefined, {
+    day: '2-digit',
+    month: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+  });
 }
 
 function formatTime(iso: string): string {
@@ -170,14 +226,14 @@ function formatTime(iso: string): string {
 .pn-hint
   display: flex
   align-items: flex-start
-  gap: 9px
-  padding: 10px 12px
-  border-radius: 10px
+  gap: 8px
+  padding: 8px 11px
+  border-radius: 9px
   background: rgba($primary, 0.08)
   border: 1px solid rgba($primary, 0.16)
   color: $grey-4
-  font-size: 12px
-  line-height: 1.45
+  font-size: 11.5px
+  line-height: 1.4
 
 .pn-hint-icon
   color: $primary
@@ -194,7 +250,7 @@ function formatTime(iso: string): string {
 .pn-state
   display: flex
   justify-content: center
-  padding: 28px 0
+  padding: 26px 0
 
 // Empty state
 .pn-empty
@@ -202,19 +258,19 @@ function formatTime(iso: string): string {
   flex-direction: column
   align-items: center
   text-align: center
-  padding: 28px 0 24px
+  padding: 26px 0 22px
 
 .pn-empty-icon
   display: flex
   align-items: center
   justify-content: center
-  width: 52px
-  height: 52px
-  border-radius: 16px
+  width: 48px
+  height: 48px
+  border-radius: 15px
   color: $grey-6
   background: rgba(255, 255, 255, 0.04)
   border: 1px solid rgba(255, 255, 255, 0.06)
-  margin-bottom: 12px
+  margin-bottom: 11px
 
 .pn-empty-title
   font-size: 13px
@@ -226,19 +282,55 @@ function formatTime(iso: string): string {
   color: $grey-6
   margin-top: 3px
 
-// Rows
+// Sections
+.pn-section
+  margin-top: 14px
+
+.pn-section-head
+  display: flex
+  align-items: center
+  gap: 7px
+  padding: 0 2px 7px
+
+.pn-section-label
+  font-size: 11px
+  text-transform: uppercase
+  letter-spacing: 0.5px
+  font-weight: 700
+  color: $grey-5
+
+.pn-section-count
+  display: inline-flex
+  align-items: center
+  justify-content: center
+  min-width: 18px
+  height: 16px
+  padding: 0 5px
+  border-radius: 20px
+  font-size: 10.5px
+  font-weight: 700
+  color: $grey-6
+  background: rgba(255, 255, 255, 0.07)
+
+.pn-clear
+  border-radius: 7px
+
+  :deep(.q-icon)
+    margin-right: 3px
+
+// Rows (compact, single-line)
 .pn-rows
   display: flex
   flex-direction: column
-  gap: 8px
-  margin-top: 12px
+  gap: 5px
 
 .pn-row
   display: flex
   align-items: center
-  gap: 11px
-  padding: 9px 11px
-  border-radius: 11px
+  gap: 9px
+  min-height: 38px
+  padding: 5px 8px 5px 9px
+  border-radius: 9px
   background: rgba(255, 255, 255, 0.025)
   border: 1px solid rgba(255, 255, 255, 0.06)
   transition: background 0.15s ease, border-color 0.15s ease
@@ -251,15 +343,15 @@ function formatTime(iso: string): string {
       opacity: 1
 
 .pn-row--fired
-  opacity: 0.62
+  opacity: 0.58
 
 .pn-dir
   display: flex
   align-items: center
   justify-content: center
-  width: 30px
-  height: 30px
-  border-radius: 9px
+  width: 24px
+  height: 24px
+  border-radius: 7px
   flex: none
 
 .pn-dir--above
@@ -270,49 +362,27 @@ function formatTime(iso: string): string {
   color: $negative
   background: rgba($negative, 0.14)
 
-.pn-info
-  flex: 1 1 auto
-  min-width: 0
-
-.pn-row-top
-  display: flex
-  align-items: baseline
-  gap: 8px
-
 .pn-symbol
-  font-size: 13px
+  font-size: 12.5px
   font-weight: 700
   color: $title-color
   letter-spacing: 0.2px
 
 .pn-price
-  font-size: 13px
+  font-size: 12.5px
   font-weight: 600
   color: #f5c542
   font-variant-numeric: tabular-nums
 
-.pn-meta
-  font-size: 11px
-  color: $grey-6
-  margin-top: 2px
-
-.pn-fired-pill
-  display: inline-flex
-  align-items: center
-  gap: 3px
+.pn-time
   font-size: 10.5px
-  font-weight: 600
-  text-transform: uppercase
-  letter-spacing: 0.3px
-  color: $grey-5
-  background: rgba(255, 255, 255, 0.06)
-  border-radius: 20px
-  padding: 3px 8px
-  flex: none
+  color: $grey-6
+  white-space: nowrap
+  font-variant-numeric: tabular-nums
 
 .pn-del
   flex: none
-  opacity: 0.55
+  opacity: 0.5
   transition: opacity 0.15s ease, color 0.15s ease
 
   &:hover
