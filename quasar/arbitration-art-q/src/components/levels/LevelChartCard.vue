@@ -388,6 +388,14 @@ function recomputeMarkers(): void {
   notifyMarkers.value = markers;
 }
 
+// Recompute after the chart has painted: setData/setVisibleLogicalRange settle the
+// price-scale autoscale only on the next render frame, so priceToCoordinate is
+// wrong if read synchronously right after (badge lands at a stale price until the
+// first pan/crosshair/live event). Double rAF runs after that render.
+function recomputeMarkersAfterPaint(): void {
+  requestAnimationFrame(() => requestAnimationFrame(() => recomputeMarkers()));
+}
+
 function onDeleteNotification(id: number): void {
   // Chart delete is immediate (the widget tab is the place with a confirm).
   void priceStore.remove(id);
@@ -512,6 +520,9 @@ async function loadCandles(): Promise<void> {
     // Show all loaded candles at once (plus the right gap), instead of the
     // default recent-bars view.
     chart?.timeScale().setVisibleLogicalRange({ from: 0, to: candles.length - 1 + RIGHT_OFFSET });
+    // The range change re-runs autoscale on the next frame — realign badges then,
+    // so they don't sit at a stale price after a reload until the first interaction.
+    recomputeMarkersAfterPaint();
     // Start (or restart, on timeframe change) the live candle stream once the
     // REST snapshot is in place, so the first tick updates an existing bar.
     subscribeLive();
@@ -600,6 +611,7 @@ async function loadMoreHistory(): Promise<void> {
     if (timeScale && range) {
       timeScale.setVisibleLogicalRange({ from: range.from + added, to: range.to + added });
     }
+    recomputeMarkersAfterPaint();
   } catch {
     // ignore — will retry on the next scroll
   } finally {

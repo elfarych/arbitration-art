@@ -1,13 +1,26 @@
 <template>
-  <div>
-    <q-card-section class="q-gutter-y-md">
-      <div class="row items-center justify-between">
-        <q-toggle v-model="form.enabled" label="Включить уведомления" color="primary" />
-        <q-toggle v-model="form.onlyFavorites" label="Только избранные" color="primary" />
+  <div class="ln-tab">
+    <div class="ln-body">
+      <!-- Master toggles -->
+      <div class="ln-toggles">
+        <div class="ln-toggle" :class="{ 'ln-toggle--on': form.enabled }">
+          <div class="column">
+            <span class="ln-toggle-label">Уведомления</span>
+            <span class="ln-toggle-sub">включить алерты</span>
+          </div>
+          <q-toggle v-model="form.enabled" color="primary" dense />
+        </div>
+        <div class="ln-toggle" :class="{ 'ln-toggle--on': form.onlyFavorites }">
+          <div class="column">
+            <span class="ln-toggle-label">Избранные</span>
+            <span class="ln-toggle-sub">только из списка</span>
+          </div>
+          <q-toggle v-model="form.onlyFavorites" color="primary" dense />
+        </div>
       </div>
 
       <!-- Что сканируем -->
-      <div>
+      <div class="ln-group">
         <div class="group-label">Что сканировать</div>
         <div class="row q-col-gutter-sm">
           <q-select
@@ -37,7 +50,7 @@
       </div>
 
       <!-- Как ищем уровень -->
-      <div>
+      <div class="ln-group">
         <div class="group-label">Поиск уровней</div>
         <div class="row q-col-gutter-sm">
           <q-input
@@ -67,7 +80,7 @@
       </div>
 
       <!-- Когда уведомлять -->
-      <div>
+      <div class="ln-group">
         <div class="group-label">Срабатывание</div>
         <q-btn-toggle
           v-model="form.distanceMode"
@@ -77,7 +90,7 @@
           unelevated
           dense
           toggle-color="primary"
-          color="dark"
+          color="transparent"
           text-color="grey-5"
           class="distance-toggle q-mb-sm"
         />
@@ -94,39 +107,20 @@
         />
       </div>
 
-      <!-- Telegram -->
-      <div>
-        <div class="group-label">Telegram</div>
-        <div class="text-caption text-grey-5 q-mb-sm">
-          Откройте бота, нажмите <span class="text-weight-medium">/start</span> — он пришлёт
-          ваш <span class="text-weight-medium">chat_id</span>, вставьте его ниже.
-        </div>
-        <q-btn
-          v-if="botUrl"
-          :href="botUrl"
-          target="_blank"
-          rel="noopener noreferrer"
-          type="a"
-          icon="open_in_new"
-          :label="botLabel"
-          no-caps
-          dense
-          unelevated
-          color="primary"
-          size="sm"
-          class="q-mb-sm"
+      <!-- Telegram (shared chat_id, owned by the dialog) -->
+      <div class="ln-tg">
+        <TelegramSettings
+          :model-value="chatId"
+          @update:model-value="(value) => emit('update:chatId', value)"
         />
-        <q-input v-model.trim="form.chatId" label="Chat ID" dense outlined dark />
       </div>
 
-      <q-banner v-if="store.error" dense class="bg-negative text-white rounded-borders">
+      <q-banner v-if="store.error" dense class="ln-error">
         {{ store.error }}
       </q-banner>
-    </q-card-section>
+    </div>
 
-    <q-separator color="blue-dark" />
-
-    <q-card-actions align="right" class="q-pa-md">
+    <div class="ln-actions">
       <q-btn flat no-caps label="Отмена" color="grey-5" v-close-popup />
       <q-btn
         unelevated
@@ -134,11 +128,12 @@
         icon="save"
         label="Сохранить"
         color="primary"
+        class="ln-save"
         :loading="store.saving"
         :disable="!isValid"
         @click="onSave"
       />
-    </q-card-actions>
+    </div>
   </div>
 </template>
 
@@ -148,25 +143,18 @@ import { storeToRefs } from 'pinia';
 import { useNotificationsStore } from 'src/stores/levels/notifications.store';
 import { useLevelsStore, LEVELS_MIN_VOLUME } from 'src/stores/levels/levels.store';
 import type { DistanceMode, NotificationConfig } from 'src/stores/levels/api/notificationsApi';
+import TelegramSettings from './TelegramSettings.vue';
 
 // `open` mirrors the dialog visibility: the local editable copy is re-synced from
 // the store each time the dialog opens, so closing without "Сохранить" discards
-// edits (the component stays mounted inside q-tab-panels).
-const props = defineProps<{ open: boolean }>();
-const emit = defineEmits<{ saved: [] }>();
+// edits (the component stays mounted inside q-tab-panels). `chatId` is owned by the
+// dialog (shared with the price tab) and saved together with the level fields here.
+const props = defineProps<{ open: boolean; chatId: string }>();
+const emit = defineEmits<{ saved: []; 'update:chatId': [value: string] }>();
 
 const store = useNotificationsStore();
 const levelsStore = useLevelsStore();
 const { timeframes } = storeToRefs(levelsStore);
-
-// Telegram bot link — hardcoded to the notifications bot. Must stay the SAME bot
-// whose token the level-notifier service uses (TELEGRAM_BOT_TOKEN), otherwise
-// /start returns a chat_id that gets no alerts. Not read from env: process.env.*
-// is not injected into the production bundle (see DOCS §28), so the env path left
-// the button hidden in prod. botLabel (@username) is derived from the URL.
-const botUrl = 'https://t.me/Brakeoutautobot';
-const botMatch = botUrl.match(/t\.me\/([A-Za-z0-9_]+)/);
-const botLabel = botMatch ? `@${botMatch[1]}` : 'Открыть бота';
 
 // Volume is stored as raw USDT but edited in millions for a compact input (same
 // convention as LevelsFilters).
@@ -188,7 +176,6 @@ interface FormState {
   minVolumeM: number;
   distanceMode: DistanceMode;
   distanceValue: number;
-  chatId: string;
 }
 
 const form = reactive<FormState>(toForm(store.config));
@@ -223,7 +210,6 @@ function toForm(config: NotificationConfig): FormState {
     minVolumeM: Math.max(FLOOR_M, config.minVolume / MILLION),
     distanceMode: config.distanceMode,
     distanceValue: config.distanceValue,
-    chatId: config.chatId,
   };
 }
 
@@ -239,7 +225,7 @@ async function onSave() {
       minVolume: Math.max(LEVELS_MIN_VOLUME, Math.round(form.minVolumeM * MILLION)),
       distanceMode: form.distanceMode,
       distanceValue: form.distanceValue,
-      chatId: form.chatId,
+      chatId: props.chatId.trim(),
     });
     emit('saved');
   } catch {
@@ -249,16 +235,90 @@ async function onSave() {
 </script>
 
 <style lang="sass" scoped>
+.ln-body
+  display: flex
+  flex-direction: column
+  gap: 16px
+  padding: 4px 18px 0
+  max-height: 60vh
+  overflow-y: auto
+
 .group-label
   font-size: 11px
   letter-spacing: 0.6px
   text-transform: uppercase
-  color: $grey-6
-  font-weight: 600
-  margin-bottom: 6px
+  color: $grey-5
+  font-weight: 700
+  margin-bottom: 8px
 
+// Master toggles
+.ln-toggles
+  display: grid
+  grid-template-columns: 1fr 1fr
+  gap: 10px
+
+.ln-toggle
+  display: flex
+  align-items: center
+  justify-content: space-between
+  gap: 8px
+  padding: 9px 12px
+  border-radius: 11px
+  border: 1px solid rgba(255, 255, 255, 0.07)
+  background: rgba(255, 255, 255, 0.02)
+  transition: border-color 0.15s ease, background 0.15s ease
+
+.ln-toggle--on
+  border-color: rgba($primary, 0.4)
+  background: rgba($primary, 0.08)
+
+.ln-toggle-label
+  font-size: 13px
+  font-weight: 600
+  color: $title-color
+  line-height: 1.1
+
+.ln-toggle-sub
+  font-size: 10.5px
+  color: $grey-6
+  margin-top: 2px
+
+// Distance segmented toggle
 .distance-toggle
-  border: 1px solid $blue-dark
-  border-radius: 6px
+  border: 1px solid rgba(255, 255, 255, 0.1)
+  border-radius: 9px
   overflow: hidden
+  background: rgba(0, 0, 0, 0.25)
+  padding: 3px
+
+  :deep(.q-btn)
+    border-radius: 7px
+    font-weight: 600
+
+.ln-tg
+  padding-top: 16px
+  border-top: 1px solid rgba(255, 255, 255, 0.07)
+
+.ln-error
+  border-radius: 10px
+  background: rgba($negative, 0.14)
+  color: #ff8a94
+  border: 1px solid rgba($negative, 0.3)
+
+.ln-actions
+  display: flex
+  justify-content: flex-end
+  gap: 8px
+  padding: 14px 18px
+  margin-top: 16px
+  border-top: 1px solid rgba(255, 255, 255, 0.07)
+
+.ln-save
+  border-radius: 8px
+  padding-left: 18px
+  padding-right: 18px
+
+// Unified input rounding across the form
+:deep(.q-field--outlined .q-field__control)
+  border-radius: 10px
 </style>

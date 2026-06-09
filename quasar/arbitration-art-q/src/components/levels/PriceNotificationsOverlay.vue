@@ -62,6 +62,9 @@ const emit = defineEmits<{
   inset: 0
   pointer-events: none
   overflow: hidden
+  // Above the lightweight-charts canvases (incl. the transparent top/crosshair
+  // canvas) so the badges actually receive clicks and drag, not just paint.
+  z-index: 5
 
 .pn-marker
   position: absolute

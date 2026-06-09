@@ -1,92 +1,137 @@
 <template>
-  <div>
-    <q-card-section class="q-gutter-y-sm">
-      <!-- Telegram hint: price alerts reuse the chat_id from the level tab. -->
-      <q-banner
-        v-if="!hasChatId"
-        dense
-        class="bg-blue-dark text-grey-4 rounded-borders text-caption"
-      >
-        Укажите Telegram <span class="text-weight-medium">chat_id</span> во вкладке
-        «По уровням» — иначе ценовые алерты не придут.
-      </q-banner>
-
-      <div class="text-caption text-grey-5">
-        Создавайте уведомления правым кликом по цене на графике скринера. Срабатывает
-        один раз, затем отключается.
+  <div class="pn-tab">
+    <div class="pn-body">
+      <!-- Hint -->
+      <div class="pn-hint">
+        <q-icon name="ads_click" size="17px" class="pn-hint-icon" />
+        <span>
+          Правый клик по цене на графике создаёт уведомление. Срабатывает один раз, затем
+          отключается.
+        </span>
       </div>
 
-      <q-banner v-if="store.error" dense class="bg-negative text-white rounded-borders">
+      <q-banner v-if="store.error" dense class="pn-error">
         {{ store.error }}
       </q-banner>
-    </q-card-section>
 
-    <q-separator color="blue-dark" />
+      <!-- List -->
+      <div v-if="store.loading" class="pn-state">
+        <q-spinner color="primary" size="28px" />
+      </div>
 
-    <q-card-section class="notifications-list q-pa-none">
-      <div v-if="store.loading" class="row justify-center q-pa-md">
-        <q-spinner color="primary" size="md" />
+      <div v-else-if="store.items.length === 0" class="pn-empty">
+        <div class="pn-empty-icon">
+          <q-icon name="notifications_none" size="26px" />
+        </div>
+        <div class="pn-empty-title">Пока нет ценовых уведомлений</div>
+        <div class="pn-empty-sub">Правый клик по цене на графике, чтобы добавить</div>
       </div>
-      <div
-        v-else-if="store.items.length === 0"
-        class="text-center text-grey-6 text-caption q-pa-lg"
-      >
-        Пока нет ценовых уведомлений
+
+      <div v-else class="pn-rows">
+        <div
+          v-for="item in store.items"
+          :key="item.id"
+          class="pn-row"
+          :class="{ 'pn-row--fired': !item.enabled }"
+        >
+          <div class="pn-dir" :class="`pn-dir--${item.direction}`">
+            <q-icon :name="item.direction === 'above' ? 'arrow_upward' : 'arrow_downward'" size="15px" />
+          </div>
+
+          <div class="pn-info">
+            <div class="pn-row-top">
+              <span class="pn-symbol">{{ item.symbol }}</span>
+              <span class="pn-price">{{ formatPrice(item.targetPrice) }}</span>
+            </div>
+            <div class="pn-meta">
+              {{ item.direction === 'above' ? 'при росте до цены' : 'при падении до цены' }}
+            </div>
+          </div>
+
+          <span v-if="!item.enabled" class="pn-fired-pill">
+            <q-icon name="check" size="12px" />
+            сработало
+            <q-tooltip v-if="item.triggeredAt">{{ formatTime(item.triggeredAt) }}</q-tooltip>
+          </span>
+
+          <q-btn
+            flat
+            dense
+            round
+            size="sm"
+            icon="close"
+            class="pn-del"
+            :loading="store.isPending(item.id)"
+            @click="onRemove(item)"
+          >
+            <q-tooltip>Удалить</q-tooltip>
+          </q-btn>
+        </div>
       </div>
-      <q-list v-else separator dark>
-        <q-item v-for="item in store.items" :key="item.id" dense>
-          <q-item-section avatar>
-            <q-icon
-              :name="item.direction === 'above' ? 'north' : 'south'"
-              :color="item.direction === 'above' ? 'positive' : 'negative'"
-              size="20px"
-            />
-          </q-item-section>
-          <q-item-section>
-            <q-item-label class="text-weight-medium">
-              {{ item.symbol }}
-              <span class="text-grey-4">{{ formatPrice(item.targetPrice) }}</span>
-            </q-item-label>
-            <q-item-label caption class="text-grey-6">
-              <span v-if="item.triggeredAt && !item.enabled">
-                сработал {{ formatTime(item.triggeredAt) }}
-              </span>
-              <span v-else>{{ item.direction === 'above' ? 'при росте до цены' : 'при падении до цены' }}</span>
-            </q-item-label>
-          </q-item-section>
-          <q-item-section side>
-            <q-btn
-              flat
-              dense
-              round
-              size="sm"
-              icon="delete_outline"
-              color="grey-5"
-              :loading="store.isPending(item.id)"
-              @click="onRemove(item)"
-            >
-              <q-tooltip>Удалить</q-tooltip>
-            </q-btn>
-          </q-item-section>
-        </q-item>
-      </q-list>
-    </q-card-section>
+
+      <!-- Telegram -->
+      <div class="pn-tg">
+        <TelegramSettings
+          :model-value="chatId"
+          @update:model-value="(value) => emit('update:chatId', value)"
+        />
+        <q-banner v-if="notificationsStore.error" dense class="pn-error q-mt-sm">
+          {{ notificationsStore.error }}
+        </q-banner>
+      </div>
+    </div>
+
+    <div class="pn-actions">
+      <q-btn flat no-caps label="Закрыть" color="grey-5" v-close-popup />
+      <q-btn
+        unelevated
+        no-caps
+        icon="save"
+        label="Сохранить"
+        color="primary"
+        class="pn-save"
+        :loading="notificationsStore.saving"
+        :disable="!notificationsStore.loaded"
+        @click="onSaveChatId"
+      />
+    </div>
   </div>
 </template>
 
 <script setup lang="ts">
-import { computed } from 'vue';
 import { useQuasar } from 'quasar';
 import { usePriceNotificationsStore } from 'src/stores/levels/priceNotifications.store';
 import { useNotificationsStore } from 'src/stores/levels/notifications.store';
 import type { PriceNotification } from 'src/stores/levels/api/priceNotificationsApi';
+import TelegramSettings from './TelegramSettings.vue';
+
+// chat_id is the shared per-user value (owned by the dialog, also on the level
+// tab). Saving here persists it without touching the level-detection fields.
+const props = defineProps<{ chatId: string }>();
+const emit = defineEmits<{ 'update:chatId': [value: string] }>();
 
 const $q = useQuasar();
 const store = usePriceNotificationsStore();
 const notificationsStore = useNotificationsStore();
 
-// chat_id is shared with the level-notification config; warn if it is missing.
-const hasChatId = computed(() => notificationsStore.config.chatId.trim().length > 0);
+async function onSaveChatId() {
+  const config = notificationsStore.config;
+  try {
+    await notificationsStore.save({
+      enabled: config.enabled,
+      onlyFavorites: config.onlyFavorites,
+      timeframe: config.timeframe,
+      natrMultiplier: config.natrMultiplier,
+      minGap: config.minGap,
+      minVolume: config.minVolume,
+      distanceMode: config.distanceMode,
+      distanceValue: config.distanceValue,
+      chatId: props.chatId.trim(),
+    });
+  } catch {
+    // Error is surfaced via notificationsStore.error in the banner.
+  }
+}
 
 function onRemove(item: PriceNotification) {
   $q.dialog({
@@ -117,7 +162,179 @@ function formatTime(iso: string): string {
 </script>
 
 <style lang="sass" scoped>
-.notifications-list
-  max-height: 320px
+.pn-body
+  padding: 4px 18px 0
+  max-height: 60vh
   overflow-y: auto
+
+.pn-hint
+  display: flex
+  align-items: flex-start
+  gap: 9px
+  padding: 10px 12px
+  border-radius: 10px
+  background: rgba($primary, 0.08)
+  border: 1px solid rgba($primary, 0.16)
+  color: $grey-4
+  font-size: 12px
+  line-height: 1.45
+
+.pn-hint-icon
+  color: $primary
+  margin-top: 1px
+  flex: none
+
+.pn-error
+  margin-top: 10px
+  border-radius: 10px
+  background: rgba($negative, 0.14)
+  color: #ff8a94
+  border: 1px solid rgba($negative, 0.3)
+
+.pn-state
+  display: flex
+  justify-content: center
+  padding: 28px 0
+
+// Empty state
+.pn-empty
+  display: flex
+  flex-direction: column
+  align-items: center
+  text-align: center
+  padding: 28px 0 24px
+
+.pn-empty-icon
+  display: flex
+  align-items: center
+  justify-content: center
+  width: 52px
+  height: 52px
+  border-radius: 16px
+  color: $grey-6
+  background: rgba(255, 255, 255, 0.04)
+  border: 1px solid rgba(255, 255, 255, 0.06)
+  margin-bottom: 12px
+
+.pn-empty-title
+  font-size: 13px
+  font-weight: 600
+  color: $grey-4
+
+.pn-empty-sub
+  font-size: 11.5px
+  color: $grey-6
+  margin-top: 3px
+
+// Rows
+.pn-rows
+  display: flex
+  flex-direction: column
+  gap: 8px
+  margin-top: 12px
+
+.pn-row
+  display: flex
+  align-items: center
+  gap: 11px
+  padding: 9px 11px
+  border-radius: 11px
+  background: rgba(255, 255, 255, 0.025)
+  border: 1px solid rgba(255, 255, 255, 0.06)
+  transition: background 0.15s ease, border-color 0.15s ease
+
+  &:hover
+    background: rgba(255, 255, 255, 0.05)
+    border-color: rgba(255, 255, 255, 0.1)
+
+    .pn-del
+      opacity: 1
+
+.pn-row--fired
+  opacity: 0.62
+
+.pn-dir
+  display: flex
+  align-items: center
+  justify-content: center
+  width: 30px
+  height: 30px
+  border-radius: 9px
+  flex: none
+
+.pn-dir--above
+  color: $positive
+  background: rgba($positive, 0.14)
+
+.pn-dir--below
+  color: $negative
+  background: rgba($negative, 0.14)
+
+.pn-info
+  flex: 1 1 auto
+  min-width: 0
+
+.pn-row-top
+  display: flex
+  align-items: baseline
+  gap: 8px
+
+.pn-symbol
+  font-size: 13px
+  font-weight: 700
+  color: $title-color
+  letter-spacing: 0.2px
+
+.pn-price
+  font-size: 13px
+  font-weight: 600
+  color: #f5c542
+  font-variant-numeric: tabular-nums
+
+.pn-meta
+  font-size: 11px
+  color: $grey-6
+  margin-top: 2px
+
+.pn-fired-pill
+  display: inline-flex
+  align-items: center
+  gap: 3px
+  font-size: 10.5px
+  font-weight: 600
+  text-transform: uppercase
+  letter-spacing: 0.3px
+  color: $grey-5
+  background: rgba(255, 255, 255, 0.06)
+  border-radius: 20px
+  padding: 3px 8px
+  flex: none
+
+.pn-del
+  flex: none
+  opacity: 0.55
+  transition: opacity 0.15s ease, color 0.15s ease
+
+  &:hover
+    color: $negative
+
+// Telegram block
+.pn-tg
+  margin-top: 16px
+  padding-top: 16px
+  border-top: 1px solid rgba(255, 255, 255, 0.07)
+
+// Actions
+.pn-actions
+  display: flex
+  justify-content: flex-end
+  gap: 8px
+  padding: 14px 18px
+  margin-top: 4px
+  border-top: 1px solid rgba(255, 255, 255, 0.07)
+
+.pn-save
+  border-radius: 8px
+  padding-left: 18px
+  padding-right: 18px
 </style>
