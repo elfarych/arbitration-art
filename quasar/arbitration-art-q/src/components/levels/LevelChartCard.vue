@@ -140,6 +140,11 @@ let unsubscribeKline: (() => void) | null = null;
 // Lazy history loading guards.
 let loadingMore = false;
 let noMoreHistory = false;
+// Candle-dataset generation: bumped on every full (re)load (mount / timeframe
+// switch). An in-flight loadMoreHistory() captures it before its await and bails if
+// it changed, so a timeframe switch mid-fetch never prepends old-timeframe candles
+// onto the new dataset.
+let historyGen = 0;
 // One line series per level, drawn as a ray from the level's appearance time to
 // the right edge. Being visible series, they also pull the price scale to
 // include far-away levels (no separate anchor series needed).
@@ -511,6 +516,8 @@ async function loadCandles(): Promise<void> {
   error.value = '';
   noMoreHistory = false;
   loadingMore = false;
+  // New dataset → invalidate any in-flight history page for the previous timeframe.
+  historyGen++;
   try {
     candles = await fetchKlines(props.entry.symbol, props.timeframe, CANDLE_LIMIT);
     if (!chart) buildChart();
@@ -585,16 +592,22 @@ function onLiveCandle(c: LiveCandle): void {
 // Prepend an older batch of candles when scrolling near the left edge; keep the
 // same bars in view by shifting the visible logical range by the added count.
 async function loadMoreHistory(): Promise<void> {
-  if (loadingMore || noMoreHistory || candles.length === 0) return;
+  if (loadingMore || noMoreHistory) return;
+  const first = candles[0];
+  if (!first) return;
   loadingMore = true;
+  const gen = historyGen;
   try {
-    const oldestSec = candles[0].time as number;
+    const oldestSec = first.time as number;
     const older = await fetchKlines(
       props.entry.symbol,
       props.timeframe,
       HISTORY_BATCH,
       oldestSec * 1000 - 1,
     );
+    // Timeframe switched (full reload) while the fetch was in flight — drop this
+    // stale page so we never prepend old-timeframe candles onto the new dataset.
+    if (gen !== historyGen) return;
     const fresh = older.filter((c) => (c.time as number) < oldestSec);
     if (fresh.length === 0) {
       noMoreHistory = true;
@@ -615,7 +628,9 @@ async function loadMoreHistory(): Promise<void> {
   } catch {
     // ignore — will retry on the next scroll
   } finally {
-    loadingMore = false;
+    // Only release the guard if this dataset is still current (a reload already
+    // reset it for the new timeframe).
+    if (gen === historyGen) loadingMore = false;
   }
 }
 

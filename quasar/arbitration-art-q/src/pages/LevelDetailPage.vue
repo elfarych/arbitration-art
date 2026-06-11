@@ -19,6 +19,25 @@
       />
     </div>
 
+    <!-- Timeframe switch for the top levels chart. Each switch refetches the coin
+         on that timeframe (levels are computed per-timeframe), so the chart and its
+         level rays follow the chosen timeframe. -->
+    <div v-if="store.timeframes.length" class="row items-center no-wrap q-gutter-x-xs q-mb-sm">
+      <q-btn
+        v-for="tf in store.timeframes"
+        :key="tf"
+        :label="tf"
+        no-caps
+        dense
+        unelevated
+        :color="tf === chartTf ? 'primary' : 'dark'"
+        :text-color="tf === chartTf ? 'white' : 'grey-5'"
+        class="ctrl-btn"
+        :disable="chartLoading"
+        @click="onTopTimeframe(tf)"
+      />
+    </div>
+
     <!-- Small levels chart computed with the params carried in the URL (from the
          alert link or the screener filters). Falls back to defaults if absent. -->
     <div class="levels-chart-box q-mb-md">
@@ -123,6 +142,9 @@ async function loadChart(timeframe: string): Promise<void> {
   chartLoading.value = true;
   chartError.value = '';
   chartEntry.value = null;
+  // Reflect the requested timeframe in the TF-button highlight immediately (before
+  // the request resolves) and keep it correct even if the load fails.
+  chartTf.value = timeframe;
   const natrMultiplier = numQuery('natrMultiplier', store.natrMultiplier || LEVELS_DEFAULT_NATR_MULTIPLIER);
   const minGap = numQuery('minGap', store.minGap || LEVELS_DEFAULT_MIN_GAP);
   try {
@@ -135,13 +157,21 @@ async function loadChart(timeframe: string): Promise<void> {
     });
     const found = page.items.find((item) => item.symbol === symbol.value) ?? null;
     chartEntry.value = found;
-    chartTf.value = timeframe;
     if (!found) chartError.value = 'Нет данных по уровням';
   } catch {
     chartError.value = 'Не удалось загрузить график';
   } finally {
     chartLoading.value = false;
   }
+}
+
+// Switch the top chart timeframe. Reloads the coin on that timeframe (loadChart
+// recomputes levels per-timeframe), which remounts LevelChartCard cleanly with the
+// new entry + timeframe. Guarded against re-selecting the current one / concurrent
+// loads.
+function onTopTimeframe(timeframe: string): void {
+  if (timeframe === chartTf.value || chartLoading.value) return;
+  void loadChart(timeframe);
 }
 
 // Analysis settings (the dialog form), persisted across reloads except the
@@ -217,10 +247,10 @@ watch(symbol, init, { immediate: true });
 
 // Fixed-height box for the top levels chart (LevelChartCard is height:100%).
 .levels-chart-box
-  height: 300px
+  height: 420px
   flex: none
 
 @media (max-width: 599.98px)
   .levels-chart-box
-    height: 240px
+    height: 300px
 </style>

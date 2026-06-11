@@ -266,7 +266,7 @@ onMounted(async () => {
   // no background polling.
   store.pageSize = columns.value * rows.value;
   // Clamp the persisted value up to the floor so users with an old localStorage
-  // entry (0 = off, or a sub-50M value) still respect the 50M minimum.
+  // entry (0 = off, or a sub-20M value) still respect the 20M minimum.
   store.minVolume = Math.max(LEVELS_MIN_VOLUME, loadNumber(PARAM_MIN_VOLUME_KEY, store.minVolume));
   store.natrMultiplier = loadNumber(PARAM_NATR_MULT_KEY, store.natrMultiplier);
   store.minGap = loadNumber(PARAM_MIN_GAP_KEY, store.minGap);

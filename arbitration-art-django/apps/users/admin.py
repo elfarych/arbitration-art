@@ -5,7 +5,7 @@ from rest_framework_simplejwt.token_blacklist.models import (
     OutstandingToken,
 )
 
-from apps.users.models import User, UserExchangeKeys
+from apps.users.models import User, UserExchangeKeys, UserSectionAccess
 
 # Hide SimpleJWT token-blacklist tables from Django admin. The app itself
 # stays in INSTALLED_APPS because SIMPLE_JWT.BLACKLIST_AFTER_ROTATION relies
@@ -16,6 +16,23 @@ admin.site.unregister(BlacklistedToken)
 admin.site.unregister(OutstandingToken)
 
 
+class UserSectionAccessInline(admin.StackedInline):
+    """Per-user section toggles, edited inline on the user page.
+
+    extra=1 + max_num=1 shows a single form: the existing row when present, or an
+    empty one (all boxes checked from the field defaults) to create it. Leaving
+    every box checked keeps the row absent / all-enabled; unchecking disables a
+    section for that user.
+    """
+
+    model = UserSectionAccess
+    can_delete = True
+    extra = 1
+    min_num = 0
+    max_num = 1
+    verbose_name_plural = "Доступ к разделам сайта"
+
+
 @admin.register(User)
 class UserAdmin(BaseUserAdmin):
     """Admin configuration for the custom User model."""
@@ -24,6 +41,17 @@ class UserAdmin(BaseUserAdmin):
     list_filter = ("is_active", "is_staff", "is_superuser")
     search_fields = ("email", "username", "first_name", "last_name")
     ordering = ("-date_joined",)
+    inlines = (UserSectionAccessInline,)
+
+
+@admin.register(UserSectionAccess)
+class UserSectionAccessAdmin(admin.ModelAdmin):
+    """Standalone view of per-user section access (scan/filter restrictions)."""
+
+    list_display = ("user", "bots", "screener", "levels", "pnl")
+    list_filter = ("bots", "screener", "levels", "pnl")
+    search_fields = ("user__email", "user__username")
+    autocomplete_fields = ("user",)
 
 
 @admin.register(UserExchangeKeys)

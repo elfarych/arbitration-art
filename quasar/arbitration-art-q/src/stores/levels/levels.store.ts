@@ -11,10 +11,10 @@ import { extractApiErrorMessage } from 'src/utils/apiError';
 export const LEVELS_DEFAULT_PAGE_SIZE = 6;
 
 // Volume filter floor: the screener and the notification config enforce a minimum
-// 50M USDT turnover (sum of volume·close over 24×1h). This is both the default and
+// 20M USDT turnover (sum of volume·close over 24×1h). This is both the default and
 // the smallest selectable value — the filter cannot be lowered below it or turned
 // off. Single source of truth for the floor across the page, filter and dialog.
-export const LEVELS_MIN_VOLUME = 50_000_000;
+export const LEVELS_MIN_VOLUME = 20_000_000;
 
 // Default calculation params — NATR/gap match the levels-api env defaults so the
 // initial screen matches the server's calculation; volume defaults to the floor.
@@ -47,7 +47,7 @@ interface LevelsState {
   pinFavorites: boolean;
   // Calculation params sent to /screener (server recomputes on demand).
   // minVolume: minimum USDT turnover (sum of volume·close over 24×1h); floored at
-  // LEVELS_MIN_VOLUME (50M) — always sent, never off.
+  // LEVELS_MIN_VOLUME (20M) — always sent, never off.
   minVolume: number;
   // natrMultiplier: touch-zone tolerance in NATR units.
   natrMultiplier: number;

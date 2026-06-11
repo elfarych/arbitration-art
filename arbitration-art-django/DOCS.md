@@ -304,9 +304,25 @@ Root URL config: `arbitration_art_django/urls.py`.
 
 Профильные тест-эндпоинты (`/api/auth/exchange-keys/<exchange>/test-connection/` и `/test-trade/`) реализованы как тонкий прокси: `apps/users/services/exchange_tester.py` достаёт сырые ключи из `UserExchangeKeys`, добавляет `X-Service-Token` через `apps/bots/services/trader_runtime_shared.service_headers` и POST'ит на `BOT_ENGINE_SERVICE_URL_DEFAULT + /engine/exchange/...`. Это гарантирует, что валидация ключей проходит через тот же exchange-клиент, который engine использует в живой торговле. Read-only `test-connection` ретраится по политике `SERVICE_REQUEST_RETRIES`; `test-trade` отправляется **без ретраев**, потому что повтор может привести ко второй реальной сделке при сетевой ошибке после фактической отправки ордера.
 
+### 7.2a. Модель `UserSectionAccess` (доступ к разделам сайта)
+
+Файл: `apps/users/models.py`.
+
+Назначение: per-user включение/отключение верхнеуровневых разделов SPA. Это **фронт-гейт**: флаги уходят в `/auth/me/` (`sections`), фронт скрывает пункт меню и блокирует маршрут раздела (router guard). Это не серверная security-граница — Django/levels API остаются доступны по токену напрямую.
+
+Поля (все `BooleanField(default=True)`): `bots` (`/`), `screener` (`/screener`), `levels` (`/levels`), `pnl` (`/pnl`). `user` — `OneToOneField(User, related_name="section_access")`, cascade delete.
+
+Семантика по умолчанию: **нет строки `UserSectionAccess` → все разделы включены**. Ограничение пользователя — opt-in через админку. Профиль (`/profile`) и trader-runtime (`/trader-runtime`) всегда доступны и в модели не представлены.
+
+Ключи разделов (`UserSectionAccess.SECTIONS`) синхронизированы с фронтовым типом `SectionKey` и `meta.section` в роутере (AGENTS §9). `as_dict()` отдаёт карту строки, `default_dict()` — всё `true`.
+
+Админка (`apps/users/admin.py`): редактируется **инлайном на странице User** (`UserSectionAccessInline`, StackedInline, max_num=1 — пустая форма со всеми галками создаёт строку при снятии любой). Плюс отдельная регистрация `UserSectionAccessAdmin` (list/filter по разделам) для обзора ограничений.
+
+Миграция: модель добавлена, миграцию нужно сгенерировать и применить (`makemigrations users` → `migrate`).
+
 ### 7.3. User serializer
 
-`UserSerializer` возвращает только read-only профиль:
+`UserSerializer` возвращает read-only профиль + карту доступа к разделам:
 
 ```text
 id
@@ -315,9 +331,10 @@ username
 first_name
 last_name
 date_joined
+sections   # { bots, screener, levels, pnl } -> bool (SerializerMethodField)
 ```
 
-Все поля read-only.
+Все поля read-only. `sections` берётся из `UserSectionAccess` пользователя (`section_access`); если строки нет — все разделы `true` (`UserSectionAccess.default_dict()`). Это контракт фронт-гейта (см. §7.2a и AGENTS §9). `sections` — `SerializerMethodField`, поэтому в `read_only_fields` перечислены только модельные поля.
 
 `UserExchangeKeysSerializer` используется для текущего пользователя:
 

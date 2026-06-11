@@ -1,6 +1,6 @@
 from rest_framework import serializers
 
-from apps.users.models import User, UserExchangeKeys
+from apps.users.models import User, UserExchangeKeys, UserSectionAccess
 
 EXCHANGE_KEY_FIELDS = (
     "binance_api_key",
@@ -17,10 +17,22 @@ EXCHANGE_KEY_FIELDS = (
 class UserSerializer(serializers.ModelSerializer):
     """Serializer for current user profile data."""
 
+    # Per-user section access map ({bots, screener, levels, pnl} -> bool). Drives
+    # the frontend menu/route gate. Users with no UserSectionAccess row get all
+    # sections enabled (the default). Keep keys in sync with the frontend
+    # SectionKey type and router meta (AGENTS.md §9).
+    sections = serializers.SerializerMethodField()
+
     class Meta:
         model = User
-        fields = ("id", "email", "username", "first_name", "last_name", "date_joined")
-        read_only_fields = fields
+        fields = ("id", "email", "username", "first_name", "last_name", "date_joined", "sections")
+        # `sections` is a SerializerMethodField (inherently read-only) and must not
+        # be listed here, so read_only_fields covers only the model fields.
+        read_only_fields = ("id", "email", "username", "first_name", "last_name", "date_joined")
+
+    def get_sections(self, obj: User) -> dict[str, bool]:
+        access = getattr(obj, "section_access", None)
+        return access.as_dict() if access else UserSectionAccess.default_dict()
 
 
 class UserExchangeKeysSerializer(serializers.ModelSerializer):

@@ -100,7 +100,7 @@ import { gapDuration } from 'src/stores/levels/timeframe';
 // pass through as-is. Changes are committed on Enter/blur (one recompute, not per
 // keystroke — the screener is computed on demand server-side).
 const props = defineProps<{
-  // Minimum USDT turnover (raw USDT); floored at LEVELS_MIN_VOLUME (50M).
+  // Minimum USDT turnover (raw USDT); floored at LEVELS_MIN_VOLUME (20M).
   minVolume: number;
   natrMultiplier: number;
   minGap: number;
@@ -133,7 +133,7 @@ watch(() => props.minGap, (v) => (gap.value = v));
 
 function apply(): void {
   // Empty/invalid numeric inputs arrive as '' / NaN. Volume snaps up to the floor
-  // (50M); tolerance and gap fall back to the current values rather than producing
+  // (20M); tolerance and gap fall back to the current values rather than producing
   // a broken request.
   const minVolume = Math.max(LEVELS_MIN_VOLUME, Math.round((Number(volM.value) || 0) * MILLION));
   const natrMultiplier = Number(natr.value) > 0 ? Number(natr.value) : props.natrMultiplier;

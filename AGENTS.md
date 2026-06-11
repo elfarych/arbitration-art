@@ -288,6 +288,7 @@ pnpm build
 Контракты учитываются только между приложениями в scope §3.0. Если меняешь одну сторону контракта, проверь вторую:
 
 - Django auth API -> Quasar `auth.ts` и `boot/axios.ts`.
+- **Доступ к разделам сайта (фронт-гейт).** Django `apps.users` `UserSectionAccess` (per-user булевы `bots`/`screener`/`levels`/`pnl`, default=True; нет строки = всё включено) -> `UserSerializer.sections` в `GET /api/auth/me/` -> фронт `auth.ts` (`SectionKey`, getter `canAccess`), router `meta.section` + guard (`firstAllowedPath`), `MainLayout` (скрытие пунктов меню/чипа/виджета). Это **только фронт-гейт**, не серверная защита. Ключи разделов должны совпадать во всех трёх местах: `UserSectionAccess.SECTIONS` ↔ `SectionKey` ↔ `meta.section`. Меняешь набор разделов — синхронизируй модель/сериализатор (Django), тип/getter/guard/меню (фронт) и DOCS обоих приложений.
 - Django bots API -> Quasar `bots.store.ts` / `botConfig.ts`.
 - Django bot-engine sync payload -> `arbitration-bot-engine/src/classes/Engine.ts`.
 - Django real/emulation trades -> frontend dialogs, bot-engine.

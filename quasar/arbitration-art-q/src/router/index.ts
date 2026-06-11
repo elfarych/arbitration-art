@@ -6,7 +6,25 @@ import {
   createWebHistory,
 } from 'vue-router';
 import routes from './routes';
-import { useAuthStore } from 'stores/auth';
+import { useAuthStore, type SectionKey } from 'stores/auth';
+
+// Gateable sections in menu order, with their landing path. Used to send a user
+// away from a disabled section to the first one they can still reach.
+const SECTION_PATH: Record<SectionKey, string> = {
+  bots: '/',
+  screener: '/screener',
+  levels: '/levels',
+  pnl: '/pnl',
+};
+
+// First section the user can access (menu order), or /profile — which has no
+// section gate and is always available — when every gateable section is disabled.
+function firstAllowedPath(auth: ReturnType<typeof useAuthStore>): string {
+  for (const key of ['bots', 'screener', 'levels', 'pnl'] as SectionKey[]) {
+    if (auth.canAccess(key)) return SECTION_PATH[key];
+  }
+  return '/profile';
+}
 
 export default defineRouter(function (/* { store, ssrContext } */) {
   const createHistory = process.env.SERVER
@@ -42,7 +60,17 @@ export default defineRouter(function (/* { store, ssrContext } */) {
       return '/login';
     }
     if (to.path === '/login' && isAuthenticated) {
-      return '/';
+      return firstAllowedPath(authStore);
+    }
+
+    // Section access gate (frontend-only): a disabled section is not navigable.
+    // Send the user to the first section they can still reach (or profile, which
+    // is always available). Routes without meta.section are never gated.
+    if (isAuthenticated) {
+      const section = to.meta.section as SectionKey | undefined;
+      if (section && !authStore.canAccess(section)) {
+        return firstAllowedPath(authStore);
+      }
     }
   });
 

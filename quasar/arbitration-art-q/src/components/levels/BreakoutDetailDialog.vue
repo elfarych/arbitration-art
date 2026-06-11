@@ -14,6 +14,27 @@
           <span class="text-caption text-grey-5">{{ subtitle }}</span>
         </div>
         <q-space />
+        <!-- Timeframe switch for the top (analysis-TF) chart only; the per-second
+             and tick charts below are trade-based and timeframe-independent. -->
+        <div
+          v-if="levelsStore.timeframes.length"
+          class="row items-center no-wrap q-gutter-x-xs q-mr-sm"
+        >
+          <q-btn
+            v-for="tf in levelsStore.timeframes"
+            :key="tf"
+            :label="tf"
+            no-caps
+            dense
+            unelevated
+            :color="tf === topTf ? 'primary' : 'dark'"
+            :text-color="tf === topTf ? 'white' : 'grey-5'"
+            class="tf-btn"
+            :disable="tfLoading"
+            @click="setTopTf(tf)"
+          />
+          <q-tooltip :delay="400">Таймфрейм верхнего графика</q-tooltip>
+        </div>
         <q-btn flat dense round icon="close" color="grey-5" v-close-popup />
       </q-card-section>
 
@@ -22,12 +43,13 @@
       <q-card-section class="charts col">
         <MiniBreakoutChart
           class="chart-top"
-          :title="`Пробой · ${timeframe}`"
+          :title="`Пробой · ${topTf}`"
           :candles="tfCandles"
           :level-price="level"
           :markers="tfMarkers"
           :loading="tfLoading"
           :error="tfError"
+          :load-more="loadMoreTfHistory"
         />
         <div class="charts-bottom">
           <MiniBreakoutChart
@@ -63,6 +85,7 @@ import type { CandlestickData, LineData, SeriesMarker, UTCTimestamp } from 'ligh
 import type { AnalysisBreakout } from 'src/stores/levels/api/levelsApi';
 import { fetchKlines } from 'src/stores/levels/api/binanceKlines';
 import { fetchAggTradeSeries } from 'src/stores/levels/api/binanceAggTrades';
+import { useLevelsStore } from 'src/stores/levels/levels.store';
 import MiniBreakoutChart from './MiniBreakoutChart.vue';
 import MiniTickChart from './MiniTickChart.vue';
 
@@ -76,9 +99,18 @@ const props = defineProps<{
 
 const emit = defineEmits<{ 'update:modelValue': [value: boolean] }>();
 
+// Timeframe list for the top-chart switch (loaded by the detail page on mount).
+const levelsStore = useLevelsStore();
+
+// Top-chart timeframe — defaults to the analysis timeframe, switchable by the user
+// (the per-second/tick charts are trade-based and ignore it). Reset on each open.
+const topTf = ref(props.timeframe);
+
 // Chart A — analysis timeframe: candles around the breakout.
 const TF_LIMIT = 160;
 const TF_AFTER = 40; // candles shown after the breakout for context
+// Older batch size when lazy-loading top-chart history on scroll-back.
+const TF_HISTORY_BATCH = 500;
 // Chart B — per-second window padding around the breakout.
 const SEC_PAD_MS = 20_000;
 
@@ -117,9 +149,19 @@ function tfMs(tf: string): number {
 const tfMarkers = computed<SeriesMarker<UTCTimestamp>[]>(() => {
   const b = props.breakout;
   if (!b) return [];
+  // Snap the marker to the loaded bar containing the breakout: the chosen top-chart
+  // timeframe need not align to breakoutCandleTime, and a candle marker must sit on
+  // an existing data point to render. Candles are ascending.
+  const breakSec = Math.floor(b.breakoutCandleTime / 1000);
+  let markerTime = breakSec as UTCTimestamp;
+  for (const c of tfCandles.value) {
+    const t = c.time as number;
+    if (t <= breakSec) markerTime = t as UTCTimestamp;
+    else break;
+  }
   return [
     {
-      time: Math.floor(b.breakoutCandleTime / 1000) as UTCTimestamp,
+      time: markerTime,
       position: isUp.value ? 'belowBar' : 'aboveBar',
       color: isUp.value ? '#83c764' : '#ff5d6b',
       shape: isUp.value ? 'arrowUp' : 'arrowDown',
@@ -208,14 +250,30 @@ async function loadTf(): Promise<void> {
   tfLoading.value = true;
   tfError.value = '';
   try {
-    const endTime = b.breakoutCandleTime + TF_AFTER * tfMs(props.timeframe);
-    tfCandles.value = await fetchKlines(props.symbol, props.timeframe, TF_LIMIT, endTime);
+    const endTime = b.breakoutCandleTime + TF_AFTER * tfMs(topTf.value);
+    tfCandles.value = await fetchKlines(props.symbol, topTf.value, TF_LIMIT, endTime);
   } catch {
     tfError.value = 'Не удалось загрузить свечи';
     tfCandles.value = [];
   } finally {
     tfLoading.value = false;
   }
+}
+
+// Switch the top chart timeframe and reload its candles around the breakout. The
+// MiniBreakoutChart resets to a fresh full view on the new dataset (no double load:
+// the change is driven here, not by a watcher).
+function setTopTf(tf: string): void {
+  if (tf === topTf.value || tfLoading.value) return;
+  topTf.value = tf;
+  void loadTf();
+}
+
+// Lazy-history fetcher for the top chart: older klines on the current top-chart
+// timeframe ending just before the oldest loaded candle. MiniBreakoutChart prepends
+// the result and keeps the visible bars in place.
+function loadMoreTfHistory(oldestTimeSec: number): Promise<CandlestickData[]> {
+  return fetchKlines(props.symbol, topTf.value, TF_HISTORY_BATCH, oldestTimeSec * 1000 - 1);
 }
 
 async function loadTrades(): Promise<void> {
@@ -248,11 +306,14 @@ async function loadTrades(): Promise<void> {
   }
 }
 
-// Load all charts when the dialog opens (or the selected breakout changes).
+// Load all charts when the dialog opens (or the selected breakout changes). Reset
+// the top-chart timeframe to the analysis timeframe for each breakout so it doesn't
+// carry over a previous manual switch.
 watch(
   () => [props.modelValue, props.breakout] as const,
   ([open, breakout]) => {
     if (open && breakout) {
+      topTf.value = props.timeframe;
       void loadTf();
       void loadTrades();
     }
@@ -268,6 +329,11 @@ watch(
   width: 100%
   height: 100%
   border-color: $blue-dark
+
+// Compact timeframe buttons in the header (top-chart switch).
+.tf-btn
+  min-width: 36px
+  border-radius: 6px
 
 .charts
   min-height: 0

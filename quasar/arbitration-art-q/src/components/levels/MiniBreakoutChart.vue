@@ -43,6 +43,10 @@ const props = defineProps<{
   loading?: boolean;
   error?: string;
   emptyText?: string;
+  // When provided, the chart lazy-loads older candles as the user scrolls/zooms
+  // past the left edge: it calls loadMore(oldestTimeSec) and prepends the result,
+  // keeping the visible bars in place. Omitted → static chart (no history paging).
+  loadMore?: (oldestTimeSec: number) => Promise<CandlestickData[]>;
 }>();
 
 const container = ref<HTMLElement | null>(null);
@@ -50,6 +54,18 @@ let chart: IChartApi | null = null;
 let series: ISeriesApi<'Candlestick'> | null = null;
 let priceLine: IPriceLine | null = null;
 let markersApi: ReturnType<typeof createSeriesMarkers> | null = null;
+// Candle list actually rendered. Seeded from props.candles and, in lazy mode,
+// grown at the front by loadOlder(); reset to props.candles whenever the parent
+// swaps the dataset (new breakout / timeframe switch).
+let data: CandlestickData[] = [...props.candles];
+// Lazy history guards (only used when props.loadMore is set).
+let loadingMore = false;
+let noMoreHistory = false;
+// Dataset generation: bumped whenever the parent swaps props.candles (timeframe
+// switch / different breakout). An in-flight loadOlder() captures the generation
+// before its await and bails if it changed, so it never prepends candles from the
+// previous timeframe onto the new dataset.
+let loadGen = 0;
 
 // Derive precision from price magnitude so sub-cent coins don't render as 0.
 function priceFormat() {
@@ -114,12 +130,27 @@ function build(): void {
     borderVisible: false,
     priceFormat: priceFormat(),
   });
+
+  // Lazy-load older candles when the user scrolls/zooms past the left edge
+  // (opt-in via loadMore). barsBefore < 0 means the view ran past the oldest
+  // loaded candle — only then fetch more, so the initial fitContent view (no empty
+  // space on the left) does not auto-load extra batches.
+  if (props.loadMore) {
+    chart.timeScale().subscribeVisibleLogicalRangeChange(() => {
+      if (!chart || !series) return;
+      const range = chart.timeScale().getVisibleLogicalRange();
+      if (!range) return;
+      const bars = series.barsInLogicalRange(range);
+      if (bars !== null && bars.barsBefore < 0) void loadOlder();
+    });
+  }
+
   render();
 }
 
-function render(): void {
+function render(opts?: { preserveRange?: boolean }): void {
   if (!chart || !series) return;
-  series.setData([...props.candles]);
+  series.setData([...data]);
 
   if (priceLine) {
     series.removePriceLine(priceLine);
@@ -143,8 +174,55 @@ function render(): void {
     markersApi.setMarkers(markers);
   }
 
-  if (props.candles.length) {
-    chart.timeScale().fitContent();
+  // Fit only on a fresh dataset; a lazy prepend keeps the current view (the caller
+  // shifts the visible range by the number of bars added).
+  if (data.length && !opts?.preserveRange) {
+    if (props.loadMore) {
+      // Lazy mode: pin the initial left edge to bar 0 (no fitContent margin) so
+      // barsBefore starts at exactly 0 — otherwise a sub-bar left margin reads as
+      // barsBefore < 0 and auto-loads a history batch on open.
+      chart.timeScale().setVisibleLogicalRange({ from: 0, to: data.length - 1 });
+    } else {
+      chart.timeScale().fitContent();
+    }
+  }
+}
+
+// Prepend an older batch when scrolling near the left edge, keeping the same bars
+// in view by shifting the visible logical range by the number added.
+async function loadOlder(): Promise<void> {
+  if (!props.loadMore || loadingMore || noMoreHistory) return;
+  const first = data[0];
+  if (!first) return;
+  loadingMore = true;
+  const gen = loadGen;
+  try {
+    const oldestSec = first.time as number;
+    const older = await props.loadMore(oldestSec);
+    // Dataset was swapped (timeframe switch / different breakout) while the fetch
+    // was in flight — drop this stale page so we never prepend wrong-timeframe
+    // candles onto the new dataset.
+    if (gen !== loadGen) return;
+    const fresh = older.filter((c) => (c.time as number) < oldestSec);
+    if (fresh.length === 0) {
+      noMoreHistory = true;
+      return;
+    }
+    const ts = chart?.timeScale();
+    const range = ts?.getVisibleLogicalRange();
+    const before = data.length;
+    data = [...fresh, ...data];
+    render({ preserveRange: true });
+    const added = data.length - before;
+    if (ts && range) {
+      ts.setVisibleLogicalRange({ from: range.from + added, to: range.to + added });
+    }
+  } catch {
+    // ignore — will retry on the next scroll
+  } finally {
+    // Only release the guard if we still own the current dataset; a swap already
+    // reset it for the new dataset and may have a newer loadOlder in flight.
+    if (gen === loadGen) loadingMore = false;
   }
 }
 
@@ -154,10 +232,17 @@ onMounted(() => {
   void nextTick(() => build());
 });
 
-// Rebuild data when inputs change (dialog reused for a different breakout).
+// Rebuild data when the parent swaps the dataset (dialog reused for a different
+// breakout, or the top-chart timeframe switched). Resets the lazy-history state and
+// re-fits, so a new dataset starts from a clean full view.
 watch(
   () => props.candles,
   () => {
+    data = [...props.candles];
+    loadingMore = false;
+    noMoreHistory = false;
+    // Invalidate any in-flight loadOlder() bound to the previous dataset.
+    loadGen++;
     if (!chart) build();
     else render();
   },

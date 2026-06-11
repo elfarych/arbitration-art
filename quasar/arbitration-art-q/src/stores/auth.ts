@@ -1,6 +1,10 @@
 import { defineStore } from 'pinia';
 import { api } from 'boot/axios';
 
+// Gateable top-level sections. Keep in sync with the Django UserSectionAccess
+// model + serializer and the router `meta.section` values (AGENTS.md §9).
+export type SectionKey = 'bots' | 'screener' | 'levels' | 'pnl';
+
 export interface User {
   id: number;
   email: string;
@@ -8,6 +12,9 @@ export interface User {
   first_name: string;
   last_name: string;
   date_joined: string;
+  // Per-user section access from /auth/me/. Absent on older backends → treated as
+  // all-enabled by the `canAccess` getter.
+  sections?: Partial<Record<SectionKey, boolean>>;
 }
 
 export interface TokenPair {
@@ -26,6 +33,13 @@ export const useAuthStore = defineStore('auth', {
   }),
   getters: {
     isAuthenticated: (state) => !!state.currentUser,
+    // Section access check for menu/route gating. Defaults to enabled when the
+    // user is not loaded yet or the backend did not send the flag, so a missing
+    // field never hides everything.
+    canAccess:
+      (state) =>
+      (section: SectionKey): boolean =>
+        state.currentUser?.sections?.[section] ?? true,
   },
   actions: {
     setTokens(tokens: TokenPair) {
