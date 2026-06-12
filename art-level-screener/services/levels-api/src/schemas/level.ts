@@ -160,6 +160,13 @@ export const AnalysisQuery = Type.Object({
       description: 'Погрешность зоны касания/пробоя в долях NATR (полоса = natr·natrMultiplier); нет — env-дефолт',
     }),
   ),
+  tolerancePct: Type.Optional(
+    Type.Number({
+      minimum: 0,
+      description:
+        'Погрешность зоны касания/пробоя напрямую в % от цены (±tolerancePct). При >0 переопределяет natrMultiplier; 0/нет — расчёт от NATR',
+    }),
+  ),
   minGap: Type.Optional(
     Type.Integer({
       minimum: 1,
@@ -264,6 +271,13 @@ export const ScreenerQuery = Type.Object({
     Type.Number({
       minimum: 0,
       description: 'Погрешность зоны касания в долях NATR (ширина полосы = natr·natrMultiplier)',
+    }),
+  ),
+  tolerancePct: Type.Optional(
+    Type.Number({
+      minimum: 0,
+      description:
+        'Погрешность зоны касания напрямую в % от цены (±tolerancePct). При >0 переопределяет natrMultiplier; 0/нет — расчёт от NATR',
     }),
   ),
   minGap: Type.Optional(

@@ -138,6 +138,17 @@ function numQuery(key: string, fallback: number): number {
   return Number.isFinite(value) && value > 0 ? value : fallback;
 }
 
+// Tolerance carried in the URL as a screener-query fragment: tolerancePct (percent
+// mode) takes precedence when present and > 0, else natrMultiplier (NATR mode),
+// else the store/default. Lets the top chart match the levels the alert link or
+// the screener filters used.
+function toleranceQuery(): { tolerancePct: number } | { natrMultiplier: number } {
+  const pctRaw = route.query.tolerancePct;
+  const pct = typeof pctRaw === 'string' ? Number(pctRaw) : NaN;
+  if (Number.isFinite(pct) && pct > 0) return { tolerancePct: pct };
+  return { natrMultiplier: numQuery('natrMultiplier', store.natrMultiplier || LEVELS_DEFAULT_NATR_MULTIPLIER) };
+}
+
 async function loadChart(timeframe: string): Promise<void> {
   chartLoading.value = true;
   chartError.value = '';
@@ -145,12 +156,11 @@ async function loadChart(timeframe: string): Promise<void> {
   // Reflect the requested timeframe in the TF-button highlight immediately (before
   // the request resolves) and keep it correct even if the load fails.
   chartTf.value = timeframe;
-  const natrMultiplier = numQuery('natrMultiplier', store.natrMultiplier || LEVELS_DEFAULT_NATR_MULTIPLIER);
   const minGap = numQuery('minGap', store.minGap || LEVELS_DEFAULT_MIN_GAP);
   try {
     const page = await levelsApi.screener(timeframe, {
       search: symbol.value,
-      natrMultiplier,
+      ...toleranceQuery(),
       minGap,
       minVolume: 0,
       limit: 20,
@@ -231,6 +241,17 @@ async function init() {
     store.timeframe ||
     store.timeframes[0] ||
     '1h';
+  // Seed the analysis dialog's tolerance from the URL so a fresh analysis matches
+  // the levels shown in the top chart (the link/screener carried the active mode).
+  const urlPct = typeof route.query.tolerancePct === 'string' ? Number(route.query.tolerancePct) : NaN;
+  const urlNatr = typeof route.query.natrMultiplier === 'string' ? Number(route.query.natrMultiplier) : NaN;
+  if (Number.isFinite(urlPct) && urlPct > 0) {
+    settings.toleranceMode = 'pct';
+    settings.tolerancePct = urlPct;
+  } else if (Number.isFinite(urlNatr) && urlNatr > 0) {
+    settings.toleranceMode = 'natr';
+    settings.natrMultiplier = urlNatr;
+  }
   // Load the top chart in parallel — it must not block the analysis list.
   void loadChart(settings.timeframe);
   await analysis.fetchList(symbol.value);

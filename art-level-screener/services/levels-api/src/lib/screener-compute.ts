@@ -31,12 +31,18 @@ export interface ComputeOptions {
 /** Build effective level params: query overrides win, env defaults fill the rest. */
 export function resolveLevelParams(
   defaults: LevelParams,
-  overrides: { natrMultiplier?: number; minGap?: number },
+  overrides: { natrMultiplier?: number; minGap?: number; tolerancePct?: number },
 ): LevelParams {
   return {
     ...defaults,
     natrMultiplier: overrides.natrMultiplier ?? defaults.natrMultiplier,
     minGap: overrides.minGap ?? defaults.minGap,
+    // Direct %-of-price tolerance overrides the NATR-derived band when > 0;
+    // 0/undefined leaves the adaptive natr·natrMultiplier behaviour intact.
+    tolerancePct:
+      overrides.tolerancePct != null && overrides.tolerancePct > 0
+        ? overrides.tolerancePct
+        : undefined,
   };
 }
 

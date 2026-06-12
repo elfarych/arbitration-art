@@ -20,7 +20,12 @@ export function calculateHorizontalLevels(
   const lows = candles.map((candle) => candle.low);
   const price = candles[n - 1].close;
   const natr = computeNatr(candles, params.atrPeriod);
-  const tolerancePct = natr * params.natrMultiplier;
+  // A caller-supplied tolerancePct pins the touch-zone half-width directly;
+  // otherwise it stays adaptive (natr · multiplier). See levels-api source.
+  const tolerancePct =
+    params.tolerancePct != null && params.tolerancePct > 0
+      ? params.tolerancePct
+      : natr * params.natrMultiplier;
 
   const maxima = findExtrema(highs, params.period, false, params.extremaWindow);
   const minima = findExtrema(lows, params.period, true, params.extremaWindow);

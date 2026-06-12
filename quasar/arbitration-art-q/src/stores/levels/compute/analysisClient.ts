@@ -34,6 +34,9 @@ export async function runClientAnalysis(
       timeframe: settings.timeframe,
       symbol: symbol.toUpperCase(),
       natrMultiplier: settings.natrMultiplier,
+      // Percent mode pins the zone width directly; NATR mode leaves it undefined
+      // so computeAnalysis derives the band from natr × natrMultiplier.
+      tolerancePct: settings.toleranceMode === 'pct' ? settings.tolerancePct : undefined,
       minGap: settings.minGap,
       direction: settings.direction,
       maxBreakoutSeconds: settings.maxBreakoutSeconds,

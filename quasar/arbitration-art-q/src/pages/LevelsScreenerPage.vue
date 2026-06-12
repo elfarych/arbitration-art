@@ -76,7 +76,9 @@
 
       <LevelsFilters
         :min-volume="store.minVolume"
+        :tolerance-mode="store.toleranceMode"
         :natr-multiplier="store.natrMultiplier"
+        :tolerance-pct="store.tolerancePct"
         :min-gap="store.minGap"
         :pin-favorites="store.pinFavorites"
         :favorites-count="favoritesStore.count"
@@ -144,7 +146,12 @@
 <script setup lang="ts">
 import { ref, onMounted } from 'vue';
 import { useRouter } from 'vue-router';
-import { useLevelsStore, LEVELS_MIN_VOLUME } from 'src/stores/levels/levels.store';
+import {
+  useLevelsStore,
+  LEVELS_MIN_VOLUME,
+  LEVELS_DEFAULT_TOLERANCE_MODE,
+  type ToleranceMode,
+} from 'src/stores/levels/levels.store';
 import { useFavoritesStore } from 'src/stores/levels/favorites.store';
 import { useNotificationsStore } from 'src/stores/levels/notifications.store';
 import { usePriceNotificationsStore } from 'src/stores/levels/priceNotifications.store';
@@ -164,14 +171,18 @@ const showNotifications = ref(false);
 
 // Open the coin detail page; carry the current screener timeframe and the level
 // params from the filters so the detail page renders a chart with the same levels
-// the user is looking at. minVolume is a universe pre-filter (irrelevant to a
-// single coin), so it is not passed.
+// the user is looking at. The tolerance is carried in its active unit: tolerancePct
+// (percent mode) or natrMultiplier (NATR mode) — the detail page picks the present
+// one. minVolume is a universe pre-filter (irrelevant to a single coin), so it is
+// not passed.
 function onOpenCoin(symbol: string) {
   void router.push({
     path: `/levels/${symbol}`,
     query: {
       tf: store.timeframe,
-      natrMultiplier: String(store.natrMultiplier),
+      ...(store.toleranceMode === 'pct'
+        ? { tolerancePct: String(store.tolerancePct) }
+        : { natrMultiplier: String(store.natrMultiplier) }),
       minGap: String(store.minGap),
     },
   });
@@ -201,7 +212,9 @@ async function onSelectGrid({ columns: c, rows: r }: { columns: number; rows: nu
 // Calculation params (volume / NATR tolerance / touch gap) are held in the store
 // and persisted so the choice sticks across reloads.
 const PARAM_MIN_VOLUME_KEY = 'levels.minVolume';
+const PARAM_TOLERANCE_MODE_KEY = 'levels.toleranceMode';
 const PARAM_NATR_MULT_KEY = 'levels.natrMultiplier';
+const PARAM_TOLERANCE_PCT_KEY = 'levels.tolerancePct';
 const PARAM_MIN_GAP_KEY = 'levels.minGap';
 const PIN_FAVORITES_KEY = 'levels.pinFavorites';
 
@@ -212,9 +225,17 @@ function loadNumber(key: string, fallback: number): number {
   return Number.isFinite(value) ? value : fallback;
 }
 
-async function onParams(p: { minVolume: number; natrMultiplier: number; minGap: number }) {
+async function onParams(p: {
+  minVolume: number;
+  toleranceMode: ToleranceMode;
+  natrMultiplier: number;
+  tolerancePct: number;
+  minGap: number;
+}) {
   localStorage.setItem(PARAM_MIN_VOLUME_KEY, String(p.minVolume));
+  localStorage.setItem(PARAM_TOLERANCE_MODE_KEY, p.toleranceMode);
   localStorage.setItem(PARAM_NATR_MULT_KEY, String(p.natrMultiplier));
+  localStorage.setItem(PARAM_TOLERANCE_PCT_KEY, String(p.tolerancePct));
   localStorage.setItem(PARAM_MIN_GAP_KEY, String(p.minGap));
   await store.setParams(p);
 }
@@ -268,7 +289,14 @@ onMounted(async () => {
   // Clamp the persisted value up to the floor so users with an old localStorage
   // entry (0 = off, or a sub-20M value) still respect the 20M minimum.
   store.minVolume = Math.max(LEVELS_MIN_VOLUME, loadNumber(PARAM_MIN_VOLUME_KEY, store.minVolume));
+  store.toleranceMode =
+    localStorage.getItem(PARAM_TOLERANCE_MODE_KEY) === 'pct'
+      ? 'pct'
+      : localStorage.getItem(PARAM_TOLERANCE_MODE_KEY) === 'natr'
+        ? 'natr'
+        : LEVELS_DEFAULT_TOLERANCE_MODE;
   store.natrMultiplier = loadNumber(PARAM_NATR_MULT_KEY, store.natrMultiplier);
+  store.tolerancePct = loadNumber(PARAM_TOLERANCE_PCT_KEY, store.tolerancePct);
   store.minGap = loadNumber(PARAM_MIN_GAP_KEY, store.minGap);
   store.pinFavorites = localStorage.getItem(PIN_FAVORITES_KEY) === '1';
   // Favorites must be loaded before the first screener fetch so pinned ordering

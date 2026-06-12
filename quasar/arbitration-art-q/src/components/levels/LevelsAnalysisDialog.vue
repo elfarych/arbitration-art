@@ -44,18 +44,31 @@
         <!-- Уровни: как ищем уровень -->
         <div>
           <div class="group-label">Поиск уровней</div>
+          <q-btn-toggle
+            v-model="form.toleranceMode"
+            :options="TOLERANCE_OPTIONS"
+            spread
+            no-caps
+            unelevated
+            dense
+            toggle-color="primary"
+            color="dark"
+            text-color="grey-5"
+            class="tolerance-toggle q-mb-sm"
+          />
           <div class="row q-col-gutter-sm">
             <q-input
-              v-model.number="form.natrMultiplier"
+              v-model.number="tol"
               type="number"
               label="Погрешность"
-              suffix="NATR"
+              :suffix="form.toleranceMode === 'pct' ? '%' : 'NATR'"
               step="0.05"
               min="0"
               dense
               outlined
               dark
               class="col-6"
+              :hint="form.toleranceMode === 'pct' ? 'ширина зоны = ±значение%' : ''"
             />
             <q-input
               v-model.number="form.minGap"
@@ -138,6 +151,7 @@
 <script setup lang="ts">
 import { reactive, computed, watch } from 'vue';
 import type { AnalysisSettings } from 'src/stores/levels/analysis.store';
+import type { ToleranceMode } from 'src/stores/levels/levels.store';
 import { gapDuration } from 'src/stores/levels/timeframe';
 
 const props = defineProps<{
@@ -158,6 +172,11 @@ const DIRECTION_OPTIONS = [
   { label: 'Вниз', value: 'down' },
 ];
 
+const TOLERANCE_OPTIONS: { label: string; value: ToleranceMode }[] = [
+  { label: 'NATR', value: 'natr' },
+  { label: '%', value: 'pct' },
+];
+
 const MIN_CANDLES = 61;
 const MAX_CANDLES = 10000;
 
@@ -172,6 +191,16 @@ watch(
   },
 );
 
+// The single "Погрешность" input edits natrMultiplier or tolerancePct depending
+// on the active mode, so switching modes preserves both entries (mirrors LevelsFilters).
+const tol = computed<number>({
+  get: () => (form.toleranceMode === 'pct' ? form.tolerancePct : form.natrMultiplier),
+  set: (v) => {
+    if (form.toleranceMode === 'pct') form.tolerancePct = v;
+    else form.natrMultiplier = v;
+  },
+});
+
 // Wall-clock span of the "candles between touches" gap on the selected analysis
 // timeframe, shown as a hint under the field (e.g. "≈ 1ч35м"). Empty while the
 // timeframe/gap is unset so the hint just hides.
@@ -183,8 +212,9 @@ const gapHint = computed(() => {
 const isValid = computed(
   () =>
     !!form.timeframe &&
-    Number.isFinite(form.natrMultiplier) &&
-    form.natrMultiplier >= 0 &&
+    (form.toleranceMode === 'pct'
+      ? Number.isFinite(form.tolerancePct) && form.tolerancePct > 0
+      : Number.isFinite(form.natrMultiplier) && form.natrMultiplier >= 0) &&
     Number.isFinite(form.minGap) &&
     form.minGap >= 1 &&
     Number.isFinite(form.maxBreakoutSeconds) &&
@@ -219,6 +249,11 @@ function onRun() {
   margin-bottom: 6px
 
 .direction-toggle
+  border: 1px solid $blue-dark
+  border-radius: 6px
+  overflow: hidden
+
+.tolerance-toggle
   border: 1px solid $blue-dark
   border-radius: 6px
   overflow: hidden

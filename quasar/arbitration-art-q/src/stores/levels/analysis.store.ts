@@ -5,6 +5,11 @@ import {
   type SavedAnalysisDetail,
 } from './api/analysisApi';
 import { levelsApi, type BreakoutDirection, type LevelsConfig } from './api/levelsApi';
+import {
+  LEVELS_DEFAULT_TOLERANCE_MODE,
+  LEVELS_DEFAULT_TOLERANCE_PCT,
+  type ToleranceMode,
+} from './levels.store';
 import { runClientAnalysis } from './compute/analysisClient';
 import { extractApiErrorMessage } from 'src/utils/apiError';
 
@@ -16,8 +21,13 @@ import { extractApiErrorMessage } from 'src/utils/apiError';
 
 export interface AnalysisSettings {
   timeframe: string;
-  // Touch/breakout zone width in NATR units (= screener's natrMultiplier).
+  // How the touch/breakout zone tolerance is specified — 'natr' (natrMultiplier)
+  // or 'pct' (tolerancePct, a direct % of price). Mirrors the screener filter.
+  toleranceMode: ToleranceMode;
+  // Touch/breakout zone width in NATR units (used when toleranceMode = 'natr').
   natrMultiplier: number;
+  // Touch/breakout zone half-width as % of price (used when toleranceMode = 'pct').
+  tolerancePct: number;
   minGap: number;
   direction: BreakoutDirection;
   maxBreakoutSeconds: number;
@@ -26,7 +36,9 @@ export interface AnalysisSettings {
 }
 
 export const ANALYSIS_DEFAULTS: Omit<AnalysisSettings, 'timeframe'> = {
+  toleranceMode: LEVELS_DEFAULT_TOLERANCE_MODE,
   natrMultiplier: 0.3,
+  tolerancePct: LEVELS_DEFAULT_TOLERANCE_PCT,
   minGap: 12,
   direction: 'both',
   maxBreakoutSeconds: 300,

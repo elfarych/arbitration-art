@@ -22,6 +22,15 @@ export const LEVELS_DEFAULT_MIN_VOLUME = LEVELS_MIN_VOLUME;
 export const LEVELS_DEFAULT_NATR_MULTIPLIER = 0.3;
 export const LEVELS_DEFAULT_MIN_GAP = 12;
 
+// Touch-zone tolerance can be specified two ways: 'natr' (band = natr × multiplier,
+// adaptive to volatility) or 'pct' (band = ±tolerancePct% of price, fixed). The
+// screener computes the band server-side, so percent mode is sent as a separate
+// `tolerancePct` query param (a single multiplier can't express a uniform percent
+// across coins with different NATR). Default keeps the historical NATR behaviour.
+export type ToleranceMode = 'natr' | 'pct';
+export const LEVELS_DEFAULT_TOLERANCE_MODE: ToleranceMode = 'natr';
+export const LEVELS_DEFAULT_TOLERANCE_PCT = 0.5;
+
 // In "pin favorites" mode the screener has no by-symbol filter, so the whole
 // universe is fetched in one request and paginated client-side. 500 is the API's
 // max `limit`; if the filtered universe ever exceeds it, coins past 500 are not
@@ -49,8 +58,12 @@ interface LevelsState {
   // minVolume: minimum USDT turnover (sum of volume·close over 24×1h); floored at
   // LEVELS_MIN_VOLUME (20M) — always sent, never off.
   minVolume: number;
-  // natrMultiplier: touch-zone tolerance in NATR units.
+  // toleranceMode: which of the two tolerance inputs below is sent to the server.
+  toleranceMode: ToleranceMode;
+  // natrMultiplier: touch-zone tolerance in NATR units (used when mode = 'natr').
   natrMultiplier: number;
+  // tolerancePct: touch-zone half-width as % of price (used when mode = 'pct').
+  tolerancePct: number;
   // minGap: minimum candles between counted touches.
   minGap: number;
   // Case-insensitive symbol substring filter, matched server-side. Empty → off.
@@ -71,7 +84,9 @@ export const useLevelsStore = defineStore('levels', {
     pageSize: LEVELS_DEFAULT_PAGE_SIZE,
     pinFavorites: false,
     minVolume: LEVELS_DEFAULT_MIN_VOLUME,
+    toleranceMode: LEVELS_DEFAULT_TOLERANCE_MODE,
     natrMultiplier: LEVELS_DEFAULT_NATR_MULTIPLIER,
+    tolerancePct: LEVELS_DEFAULT_TOLERANCE_PCT,
     minGap: LEVELS_DEFAULT_MIN_GAP,
     search: '',
     loading: false,
@@ -129,7 +144,11 @@ export const useLevelsStore = defineStore('levels', {
       const calc = {
         // Volume filter is opt-in: send only when set (> 0).
         ...(this.minVolume > 0 ? { minVolume: this.minVolume } : {}),
-        natrMultiplier: this.natrMultiplier,
+        // Send exactly one tolerance input: tolerancePct (percent mode) overrides
+        // natrMultiplier server-side, so the other is omitted to avoid ambiguity.
+        ...(this.toleranceMode === 'pct'
+          ? { tolerancePct: this.tolerancePct }
+          : { natrMultiplier: this.natrMultiplier }),
         minGap: this.minGap,
       };
       const result = await levelsApi.screener(this.timeframe, {
@@ -208,18 +227,32 @@ export const useLevelsStore = defineStore('levels', {
       await this.fetchScreener();
     },
 
-    // Set calculation params (volume / NATR tolerance / touch gap). Applies only
-    // the provided fields and refetches, keeping the current page (fetchScreener
-    // clamps it down only if the new result set has fewer pages). No-op when
-    // nothing actually changes — avoids a redundant recompute.
-    async setParams(params: { minVolume?: number; natrMultiplier?: number; minGap?: number }) {
+    // Set calculation params (volume / tolerance mode+value / touch gap). Applies
+    // only the provided fields and refetches, keeping the current page
+    // (fetchScreener clamps it down only if the new result set has fewer pages).
+    // No-op when nothing actually changes — avoids a redundant recompute.
+    async setParams(params: {
+      minVolume?: number;
+      toleranceMode?: ToleranceMode;
+      natrMultiplier?: number;
+      tolerancePct?: number;
+      minGap?: number;
+    }) {
       let changed = false;
       if (params.minVolume !== undefined && params.minVolume !== this.minVolume) {
         this.minVolume = params.minVolume;
         changed = true;
       }
+      if (params.toleranceMode !== undefined && params.toleranceMode !== this.toleranceMode) {
+        this.toleranceMode = params.toleranceMode;
+        changed = true;
+      }
       if (params.natrMultiplier !== undefined && params.natrMultiplier !== this.natrMultiplier) {
         this.natrMultiplier = params.natrMultiplier;
+        changed = true;
+      }
+      if (params.tolerancePct !== undefined && params.tolerancePct !== this.tolerancePct) {
+        this.tolerancePct = params.tolerancePct;
         changed = true;
       }
       if (params.minGap !== undefined && params.minGap !== this.minGap) {

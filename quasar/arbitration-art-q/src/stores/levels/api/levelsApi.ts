@@ -66,6 +66,9 @@ export interface ScreenerQuery {
   minVolume?: number;
   // Touch-zone tolerance in NATR units (band width = natr·natrMultiplier).
   natrMultiplier?: number;
+  // Touch-zone tolerance as a direct % of price (±tolerancePct). When > 0 it
+  // overrides natrMultiplier server-side; omit/0 → NATR-derived band.
+  tolerancePct?: number;
   // Minimum gap in candles between touches (closer counts as one touch).
   minGap?: number;
   side?: LevelSide;
@@ -82,6 +85,7 @@ function buildQuery(params: ScreenerQuery): string {
   const qs = new URLSearchParams();
   if (params.minVolume !== undefined) qs.set('minVolume', String(params.minVolume));
   if (params.natrMultiplier !== undefined) qs.set('natrMultiplier', String(params.natrMultiplier));
+  if (params.tolerancePct !== undefined) qs.set('tolerancePct', String(params.tolerancePct));
   if (params.minGap !== undefined) qs.set('minGap', String(params.minGap));
   if (params.side) qs.set('side', params.side);
   if (params.maxDistanceNatr !== undefined) qs.set('maxDistanceNatr', String(params.maxDistanceNatr));
@@ -103,6 +107,8 @@ export type BreakoutDirection = 'up' | 'down' | 'both';
 // levels-api env defaults (natrMultiplier/minGap/candles) or schema defaults.
 export interface AnalysisParams {
   natrMultiplier?: number;
+  // Direct %-of-price tolerance (±tolerancePct); when > 0 overrides natrMultiplier.
+  tolerancePct?: number;
   minGap?: number;
   direction?: BreakoutDirection;
   maxBreakoutSeconds?: number;

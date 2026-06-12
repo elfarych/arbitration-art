@@ -20,13 +20,13 @@ import { ref, watch, onMounted, onBeforeUnmount, nextTick } from 'vue';
 import {
   createChart,
   CandlestickSeries,
+  LineSeries,
   createSeriesMarkers,
   ColorType,
   LineStyle,
   CrosshairMode,
   type IChartApi,
   type ISeriesApi,
-  type IPriceLine,
   type CandlestickData,
   type SeriesMarker,
   type UTCTimestamp,
@@ -38,6 +38,10 @@ const props = defineProps<{
   title: string;
   candles: CandlestickData[];
   levelPrice: number;
+  // Level formation time (ms, open of the extremum candle). The level is drawn as
+  // a ray from here to the right edge; clamped to the left edge when older than the
+  // loaded window. Omitted/0 → ray spans the full width.
+  levelTime?: number;
   markers?: SeriesMarker<UTCTimestamp>[];
   secondsVisible?: boolean;
   loading?: boolean;
@@ -52,7 +56,9 @@ const props = defineProps<{
 const container = ref<HTMLElement | null>(null);
 let chart: IChartApi | null = null;
 let series: ISeriesApi<'Candlestick'> | null = null;
-let priceLine: IPriceLine | null = null;
+// Level drawn as a ray (separate 2-point line series) instead of a full-width
+// price line — starts at the level formation time and runs to the right edge.
+let levelRay: ISeriesApi<'Line'> | null = null;
 let markersApi: ReturnType<typeof createSeriesMarkers> | null = null;
 // Candle list actually rendered. Seeded from props.candles and, in lazy mode,
 // grown at the front by loadOlder(); reset to props.candles whenever the parent
@@ -129,6 +135,21 @@ function build(): void {
     wickDownColor: '#ff5d6b',
     borderVisible: false,
     priceFormat: priceFormat(),
+    // No current-price line/label — the only reference line is the level ray below.
+    lastValueVisible: false,
+    priceLineVisible: false,
+  });
+  // Level ray: a thin dashed line at the level price, drawn from the formation time
+  // to the right edge. Its own price line/label is hidden so the level reads as a
+  // clean ray.
+  levelRay = chart.addSeries(LineSeries, {
+    color: '#c4c7cd',
+    lineWidth: 1,
+    lineStyle: LineStyle.Dashed,
+    priceFormat: priceFormat(),
+    lastValueVisible: false,
+    priceLineVisible: false,
+    crosshairMarkerVisible: false,
   });
 
   // Lazy-load older candles when the user scrolls/zooms past the left edge
@@ -151,21 +172,7 @@ function build(): void {
 function render(opts?: { preserveRange?: boolean }): void {
   if (!chart || !series) return;
   series.setData([...data]);
-
-  if (priceLine) {
-    series.removePriceLine(priceLine);
-    priceLine = null;
-  }
-  if (props.levelPrice) {
-    priceLine = series.createPriceLine({
-      price: props.levelPrice,
-      color: '#c4c7cd',
-      lineWidth: 1,
-      lineStyle: LineStyle.Dashed,
-      axisLabelVisible: true,
-      title: 'уровень',
-    });
-  }
+  renderLevelRay();
 
   const markers = props.markers ?? [];
   if (!markersApi) {
@@ -186,6 +193,28 @@ function render(opts?: { preserveRange?: boolean }): void {
       chart.timeScale().fitContent();
     }
   }
+}
+
+// Draw the level as a 2-point ray from the formation time (clamped to the loaded
+// window's left edge) to the right edge. Empty when there's no level or too few
+// candles to span. Re-run on every render so a lazy prepend / dataset swap keeps
+// the ray's left anchor and right edge correct.
+function renderLevelRay(): void {
+  if (!levelRay) return;
+  if (!props.levelPrice || data.length < 2) {
+    levelRay.setData([]);
+    return;
+  }
+  const firstT = data[0].time as number;
+  const lastT = data[data.length - 1].time as number;
+  const startSec = props.levelTime ? Math.floor(props.levelTime / 1000) : firstT;
+  // Clamp into [firstT, lastT). A formation at/after the right edge (shouldn't
+  // happen) falls back to a full-width line.
+  const start = startSec >= lastT ? firstT : Math.max(startSec, firstT);
+  levelRay.setData([
+    { time: start as UTCTimestamp, value: props.levelPrice },
+    { time: lastT as UTCTimestamp, value: props.levelPrice },
+  ]);
 }
 
 // Prepend an older batch when scrolling near the left edge, keeping the same bars
@@ -255,7 +284,7 @@ onBeforeUnmount(() => {
     chart.remove();
     chart = null;
     series = null;
-    priceLine = null;
+    levelRay = null;
     markersApi = null;
   }
 });

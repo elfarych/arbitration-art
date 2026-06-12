@@ -35,6 +35,8 @@ export const analysisRoutes: FastifyPluginAsyncTypebox = async (app) => {
             timeframe: request.params.tf,
             symbol: request.params.symbol.toUpperCase(),
             natrMultiplier: request.query.natrMultiplier ?? app.config.levels.natrMultiplier,
+            // Direct %-of-price tolerance overrides natrMultiplier when > 0.
+            tolerancePct: request.query.tolerancePct,
             minGap: request.query.minGap ?? app.config.levels.minGap,
             direction: request.query.direction ?? 'both',
             maxBreakoutSeconds: request.query.maxBreakoutSeconds ?? 300,

@@ -19,7 +19,7 @@
     <label class="filter-field row no-wrap items-center">
       <span class="filter-label text-grey-5">Погр.</span>
       <input
-        v-model.number="natr"
+        v-model.number="tol"
         type="number"
         min="0"
         step="0.1"
@@ -28,25 +28,41 @@
         @keyup.enter="apply"
         @blur="apply"
       />
-      <span class="filter-unit text-grey-6">NATR</span>
       <span class="filter-stepper column no-wrap items-center justify-center">
         <q-icon
           name="keyboard_arrow_up"
           size="14px"
           color="grey-6"
           class="filter-step"
-          @click.prevent="stepNatr(0.1)"
+          @click.prevent="stepTol(0.1)"
         />
         <q-icon
           name="keyboard_arrow_down"
           size="14px"
           color="grey-6"
           class="filter-step"
-          @click.prevent="stepNatr(-0.1)"
+          @click.prevent="stepTol(-0.1)"
         />
       </span>
-      <q-tooltip>Погрешность зоны касания в долях NATR (ширина полосы = natr · значение). Стрелки — шаг 0.1</q-tooltip>
+      <q-tooltip>{{ tolTooltip }}</q-tooltip>
     </label>
+
+    <!-- Tolerance mode: NATR (band = natr · value) vs % (band = ±value% of price).
+         Switching applies immediately so the screen recomputes with the new mode. -->
+    <q-btn-toggle
+      :model-value="mode"
+      :options="TOLERANCE_OPTIONS"
+      no-caps
+      dense
+      unelevated
+      toggle-color="primary"
+      color="dark"
+      text-color="grey-5"
+      class="tol-toggle"
+      @update:model-value="onMode"
+    >
+      <q-tooltip>Единицы погрешности: NATR (адаптивно к волатильности) или % от цены (фиксировано)</q-tooltip>
+    </q-btn-toggle>
 
     <label class="filter-field row no-wrap items-center">
       <span class="filter-label text-grey-5">{{ gapTime || 'Свечей' }}</span>
@@ -92,7 +108,7 @@
 
 <script setup lang="ts">
 import { ref, watch, computed } from 'vue';
-import { LEVELS_MIN_VOLUME } from 'src/stores/levels/levels.store';
+import { LEVELS_MIN_VOLUME, type ToleranceMode } from 'src/stores/levels/levels.store';
 import { gapDuration } from 'src/stores/levels/timeframe';
 
 // Screener calculation params edited in the page header. The contract value for
@@ -102,7 +118,10 @@ import { gapDuration } from 'src/stores/levels/timeframe';
 const props = defineProps<{
   // Minimum USDT turnover (raw USDT); floored at LEVELS_MIN_VOLUME (20M).
   minVolume: number;
+  // Which tolerance unit is active: 'natr' edits natrMultiplier, 'pct' edits tolerancePct.
+  toleranceMode: ToleranceMode;
   natrMultiplier: number;
+  tolerancePct: number;
   minGap: number;
   // Whether favorites are pinned to the top of the screener.
   pinFavorites: boolean;
@@ -114,21 +133,50 @@ const props = defineProps<{
 }>();
 
 const emit = defineEmits<{
-  (e: 'apply', value: { minVolume: number; natrMultiplier: number; minGap: number }): void;
+  (
+    e: 'apply',
+    value: {
+      minVolume: number;
+      toleranceMode: ToleranceMode;
+      natrMultiplier: number;
+      tolerancePct: number;
+      minGap: number;
+    },
+  ): void;
   (e: 'toggle-pin'): void;
 }>();
+
+const TOLERANCE_OPTIONS: { label: string; value: ToleranceMode }[] = [
+  { label: 'NATR', value: 'natr' },
+  { label: '%', value: 'pct' },
+];
 
 const MILLION = 1_000_000;
 // Smallest selectable volume, in millions (input unit). Mirrors the raw-USDT floor.
 const FLOOR_M = LEVELS_MIN_VOLUME / MILLION;
 
 const volM = ref<number>(props.minVolume / MILLION);
+const mode = ref<ToleranceMode>(props.toleranceMode);
+// Two independent tolerance values; the single visible input edits whichever the
+// active mode selects (see `tol`), so switching modes preserves both entries.
 const natr = ref<number>(props.natrMultiplier);
+const pct = ref<number>(props.tolerancePct);
 const gap = ref<number>(props.minGap);
+
+// The visible tolerance input proxies to natr or pct depending on the mode.
+const tol = computed<number>({
+  get: () => (mode.value === 'pct' ? pct.value : natr.value),
+  set: (v) => {
+    if (mode.value === 'pct') pct.value = v;
+    else natr.value = v;
+  },
+});
 
 // Resync local inputs when the store changes the values elsewhere (e.g. reset).
 watch(() => props.minVolume, (v) => (volM.value = v / MILLION));
+watch(() => props.toleranceMode, (v) => (mode.value = v));
 watch(() => props.natrMultiplier, (v) => (natr.value = v));
+watch(() => props.tolerancePct, (v) => (pct.value = v));
 watch(() => props.minGap, (v) => (gap.value = v));
 
 function apply(): void {
@@ -137,23 +185,39 @@ function apply(): void {
   // a broken request.
   const minVolume = Math.max(LEVELS_MIN_VOLUME, Math.round((Number(volM.value) || 0) * MILLION));
   const natrMultiplier = Number(natr.value) > 0 ? Number(natr.value) : props.natrMultiplier;
+  const tolerancePct = Number(pct.value) > 0 ? Number(pct.value) : props.tolerancePct;
   const minGap = Number(gap.value) >= 1 ? Math.round(Number(gap.value)) : props.minGap;
   // Reflect the normalized values back into the inputs (clears empty states).
   volM.value = minVolume / MILLION;
   natr.value = natrMultiplier;
+  pct.value = tolerancePct;
   gap.value = minGap;
-  emit('apply', { minVolume, natrMultiplier, minGap });
+  emit('apply', { minVolume, toleranceMode: mode.value, natrMultiplier, tolerancePct, minGap });
 }
 
-// Step the NATR tolerance by ±0.1 via the up/down arrows and commit immediately.
-// Rounds to 1 decimal to avoid float drift (0.1+0.2 = 0.30000000000000004) and
-// floors at 0.1 — apply() treats 0 as invalid and would revert, so the smallest
-// committed step is 0.1.
-function stepNatr(delta: number): void {
-  const current = Number(natr.value) || 0;
-  natr.value = Math.max(0.1, Math.round((current + delta) * 10) / 10);
+// Switch the tolerance unit and recompute immediately (the band definition changes).
+function onMode(next: ToleranceMode): void {
+  if (next === mode.value) return;
+  mode.value = next;
   apply();
 }
+
+// Step the active tolerance value by ±0.1 via the up/down arrows and commit
+// immediately. Rounds to 1 decimal to avoid float drift (0.1+0.2 = 0.300…4) and
+// floors at 0.1 — apply() treats 0 as invalid and would revert, so the smallest
+// committed step is 0.1.
+function stepTol(delta: number): void {
+  const current = Number(tol.value) || 0;
+  tol.value = Math.max(0.1, Math.round((current + delta) * 10) / 10);
+  apply();
+}
+
+// Tooltip explaining the band built from the active mode.
+const tolTooltip = computed(() =>
+  mode.value === 'pct'
+    ? 'Погрешность зоны касания в % от цены (ширина полосы = ±значение%). Стрелки — шаг 0.1'
+    : 'Погрешность зоны касания в долях NATR (ширина полосы = natr · значение). Стрелки — шаг 0.1',
+);
 
 // Time the "candles between touches" gap spans on the current timeframe — shown
 // in place of the "Свечей" label. Tracks the live input value; falls back to the
@@ -216,6 +280,17 @@ const gapTime = computed(() => {
   line-height: 1
   &:hover
     color: $title-color
+
+// Tolerance unit toggle (NATR / %) — compact segmented control matching the
+// 32px filter pills so it reads as part of the same control group.
+.tol-toggle
+  height: 32px
+  border-radius: 6px
+  overflow: hidden
+  :deep(.q-btn)
+    min-width: 34px
+    font-size: 11px
+    font-weight: 600
 
 // Pin button aligned to the filter pills: same height and radius so the row
 // stays one cohesive control group.

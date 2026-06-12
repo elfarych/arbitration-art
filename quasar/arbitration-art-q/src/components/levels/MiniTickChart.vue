@@ -26,7 +26,6 @@ import {
   CrosshairMode,
   type IChartApi,
   type ISeriesApi,
-  type IPriceLine,
   type LineData,
   type SeriesMarker,
   type UTCTimestamp,
@@ -38,6 +37,10 @@ const props = defineProps<{
   title: string;
   points: LineData[];
   levelPrice: number;
+  // Level formation time (ms). The level is drawn as a ray from here to the right
+  // edge; on this tick window it always predates the data, so the ray clamps to the
+  // left edge (full-width). Omitted/0 → full-width.
+  levelTime?: number;
   markers?: SeriesMarker<UTCTimestamp>[];
   loading?: boolean;
   error?: string;
@@ -47,7 +50,8 @@ const props = defineProps<{
 const container = ref<HTMLElement | null>(null);
 let chart: IChartApi | null = null;
 let series: ISeriesApi<'Line'> | null = null;
-let priceLine: IPriceLine | null = null;
+// Level drawn as a ray (separate 2-point line series) instead of a price line.
+let levelRay: ISeriesApi<'Line'> | null = null;
 let markersApi: ReturnType<typeof createSeriesMarkers> | null = null;
 
 // Derive precision from price magnitude so sub-cent coins don't render as 0.
@@ -107,6 +111,20 @@ function build(): void {
     color: '#4c5cf9',
     lineWidth: 1,
     priceFormat: priceFormat(),
+    // No current-price line/label — the only reference line is the level ray below.
+    lastValueVisible: false,
+    priceLineVisible: false,
+  });
+  // Level ray: thin dashed line at the level price across the window. Own price
+  // line/label hidden so it reads as a clean ray.
+  levelRay = chart.addSeries(LineSeries, {
+    color: '#c4c7cd',
+    lineWidth: 1,
+    lineStyle: LineStyle.Dashed,
+    priceFormat: priceFormat(),
+    lastValueVisible: false,
+    priceLineVisible: false,
+    crosshairMarkerVisible: false,
   });
   render();
 }
@@ -114,21 +132,7 @@ function build(): void {
 function render(): void {
   if (!chart || !series) return;
   series.setData([...props.points]);
-
-  if (priceLine) {
-    series.removePriceLine(priceLine);
-    priceLine = null;
-  }
-  if (props.levelPrice) {
-    priceLine = series.createPriceLine({
-      price: props.levelPrice,
-      color: '#c4c7cd',
-      lineWidth: 1,
-      lineStyle: LineStyle.Dashed,
-      axisLabelVisible: true,
-      title: 'уровень',
-    });
-  }
+  renderLevelRay();
 
   const markers = props.markers ?? [];
   if (!markersApi) {
@@ -140,6 +144,26 @@ function render(): void {
   if (props.points.length) {
     chart.timeScale().fitContent();
   }
+}
+
+// Draw the level as a 2-point ray spanning the tick window at the level price. The
+// formation time predates this window, so it clamps to the left edge; the ray runs
+// to the last tick. Empty when there's no level or too few points to span.
+function renderLevelRay(): void {
+  if (!levelRay) return;
+  const points = props.points;
+  if (!props.levelPrice || points.length < 2) {
+    levelRay.setData([]);
+    return;
+  }
+  const firstT = points[0].time as number;
+  const lastT = points[points.length - 1].time as number;
+  const startSec = props.levelTime ? props.levelTime / 1000 : firstT;
+  const start = startSec >= lastT ? firstT : Math.max(startSec, firstT);
+  levelRay.setData([
+    { time: start as UTCTimestamp, value: props.levelPrice },
+    { time: lastT as UTCTimestamp, value: props.levelPrice },
+  ]);
 }
 
 onMounted(() => {
@@ -164,7 +188,7 @@ onBeforeUnmount(() => {
     chart.remove();
     chart = null;
     series = null;
-    priceLine = null;
+    levelRay = null;
     markersApi = null;
   }
 });

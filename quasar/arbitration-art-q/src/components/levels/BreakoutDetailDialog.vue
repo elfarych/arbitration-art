@@ -46,6 +46,7 @@
           :title="`Пробой · ${topTf}`"
           :candles="tfCandles"
           :level-price="level"
+          :level-time="levelTimeMs"
           :markers="tfMarkers"
           :loading="tfLoading"
           :error="tfError"
@@ -57,6 +58,7 @@
             title="Посекундно (по трейдам)"
             :candles="secCandles"
             :level-price="level"
+            :level-time="levelTimeMs"
             :markers="secMarkers"
             :seconds-visible="true"
             :loading="tradesLoading"
@@ -68,6 +70,7 @@
             title="Тиковый (по трейдам)"
             :points="tickPoints"
             :level-price="level"
+            :level-time="levelTimeMs"
             :markers="tickMarkers"
             :loading="tradesLoading"
             :error="tradesError"
@@ -125,6 +128,8 @@ const tradesLoading = ref(false);
 const tradesError = ref('');
 
 const level = computed(() => props.breakout?.price ?? 0);
+// Level formation time (ms) — the start anchor for the level ray on each chart.
+const levelTimeMs = computed(() => props.breakout?.levelTime ?? 0);
 const isUp = computed(() => props.breakout?.direction === 'up');
 const dirLabel = computed(() => (isUp.value ? '▲ пробой вверх' : '▼ пробой вниз'));
 

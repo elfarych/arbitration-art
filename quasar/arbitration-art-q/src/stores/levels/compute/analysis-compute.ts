@@ -26,6 +26,12 @@ export interface AnalysisParams {
   symbol: string;
   /** Touch/breakout zone width in NATR units (band % = natr·natrMultiplier). */
   natrMultiplier: number;
+  /**
+   * Touch/breakout zone width as a direct % of price (band half-width). When set
+   * and > 0 it overrides `natr · natrMultiplier`. Used by the percent tolerance
+   * mode; the response echoes the effective natrMultiplier (= tolerancePct/natr).
+   */
+  tolerancePct?: number;
   /** Minimum candle gap between counted touches. */
   minGap: number;
   direction: BreakoutDirection;
@@ -76,7 +82,17 @@ export async function computeAnalysis(
     minGap: params.minGap,
   };
   const natr = computeNatr(candles, levelParams.atrPeriod);
-  const tolerancePct = natr * levelParams.natrMultiplier;
+  // A direct %-of-price tolerance pins the zone; otherwise it is natr-derived.
+  const usePct = params.tolerancePct != null && params.tolerancePct > 0;
+  const tolerancePct = usePct ? (params.tolerancePct as number) : natr * levelParams.natrMultiplier;
+  // Effective multiplier echoed in the response: in percent mode the zone is
+  // pinned, so back it out to NATR units for this (single) coin so the saved
+  // record reflects the actual band without a separate field. natr=0 → 0.
+  const effectiveNatrMultiplier = usePct
+    ? natr > 0
+      ? (params.tolerancePct as number) / natr
+      : 0
+    : params.natrMultiplier;
 
   const highs = candles.map((candle) => candle.high);
   const lows = candles.map((candle) => candle.low);
@@ -103,7 +119,7 @@ export async function computeAnalysis(
     symbol: params.symbol,
     timeframe: params.timeframe,
     params: {
-      natrMultiplier: params.natrMultiplier,
+      natrMultiplier: effectiveNatrMultiplier,
       minGap: params.minGap,
       direction: params.direction,
       maxBreakoutSeconds: params.maxBreakoutSeconds,

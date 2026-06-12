@@ -26,6 +26,13 @@ export interface LevelParams {
   minTouches: number;
   minGap: number;
   natrMultiplier: number;
+  /**
+   * Touch-zone tolerance as a direct % of price (band half-width). When set and
+   * > 0 it overrides the adaptive `natr · natrMultiplier`. The notifier never
+   * sets it (config uses natrMultiplier) — present to keep the shape in sync
+   * with levels-api.
+   */
+  tolerancePct?: number;
   atrPeriod: number;
 }
 

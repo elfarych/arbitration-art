@@ -34,6 +34,13 @@ Django (`POST /api/levels/analyses/`).
 (`aggTradesLimit / maxTradePages`) **не хардкодим** — фронт тянет их с levels-api
 `GET /config` (`levelsApi.config()`), чтобы они всегда совпадали со скринером.
 
+`LevelParams.tolerancePct?` (часть синхронного алгоритма) — допуск зоны напрямую в
+% от цены: при `>0` переопределяет `natr · natrMultiplier`. Используется процентным
+режимом погрешности (тумблер `NATR / %` в скринере и диалоге анализа). В этом режиме
+`analysis-compute.ts` эхо-выдаёт эффективный множитель `tolerancePct/natr` в
+`params.natrMultiplier` (анализ по одной монете → `natr` известен), чтобы не менять
+форму `AnalysisResult` и сохранить запись в Django без новой колонки.
+
 ## Доверие
 
 Django сохраняет клиент-посчитанный результат (осознанный trust-tradeoff: см.
