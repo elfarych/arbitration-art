@@ -20,8 +20,13 @@ DATABASES = {
 }
 
 
-# CORS — restrict to specific origins in production
+# CORS — auth is JWT via the Authorization header (no cookies/session), so a
+# wildcard Access-Control-Allow-Origin is safe: there are no credentials for a
+# hostile origin to ride on, and CORS never guarded the API from non-browser
+# clients anyway. Allow any origin by default; to lock it down set
+# CORS_ALLOW_ALL_ORIGINS=False and list origins in CORS_ALLOWED_ORIGINS.
 
+CORS_ALLOW_ALL_ORIGINS = env.bool("CORS_ALLOW_ALL_ORIGINS", default=True)
 CORS_ALLOWED_ORIGINS = env.list("CORS_ALLOWED_ORIGINS", default=[])
 
 # CSRF trusted origins are required for Django 4+ admin/login POST when the

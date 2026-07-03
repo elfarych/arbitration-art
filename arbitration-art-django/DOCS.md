@@ -187,7 +187,8 @@ Production overrides:
 - `DEBUG = False`.
 - `ALLOWED_HOSTS` читается из env.
 - `DATABASES["default"] = env.db("DATABASE_URL")`.
-- `CORS_ALLOWED_ORIGINS = env.list("CORS_ALLOWED_ORIGINS", default=[])`.
+- `CORS_ALLOW_ALL_ORIGINS = env.bool("CORS_ALLOW_ALL_ORIGINS", default=True)` — аутентификация на JWT (Bearer, без кук), поэтому wildcard безопасен; по умолчанию prod принимает любой origin. Залочить: `CORS_ALLOW_ALL_ORIGINS=False` + список в `CORS_ALLOWED_ORIGINS`.
+- `CORS_ALLOWED_ORIGINS = env.list("CORS_ALLOWED_ORIGINS", default=[])` — учитывается только когда `CORS_ALLOW_ALL_ORIGINS=False`.
 - Security hardening:
   - `SECURE_BROWSER_XSS_FILTER = True`
   - `SECURE_CONTENT_TYPE_NOSNIFF = True`
@@ -233,7 +234,8 @@ TIME_ZONE=Asia/Almaty
 | `ALLOWED_HOSTS` | production | да для prod | В development захардкожен список localhost. |
 | `LANGUAGE_CODE` | base | нет | Дефолт env-схемы: `ru`. |
 | `TIME_ZONE` | base | нет | Дефолт env-схемы: `Asia/Almaty`. |
-| `CORS_ALLOWED_ORIGINS` | production | нет | Список origin-ов frontend в prod. |
+| `CORS_ALLOW_ALL_ORIGINS` | production | нет | Дефолт `True` — prod принимает любой origin (JWT-аутентификация, без кук). `False` → работает `CORS_ALLOWED_ORIGINS`. |
+| `CORS_ALLOWED_ORIGINS` | production | нет | Список origin-ов frontend; учитывается только при `CORS_ALLOW_ALL_ORIGINS=False`. |
 | `SECURE_SSL_REDIRECT` | production | нет | Дефолт `True`. |
 | `SERVICE_SHARED_TOKEN` | Django -> trader/bot-engine | да для service calls | Shared token для запросов между Django и runtime-сервисами. Без него `is_service_request` всегда False, и engine не сможет писать trade-ы в Django. |
 | `BOT_ENGINE_SERVICE_URL_DEFAULT` | base | нет | Дефолтный `service_url` для новых `BotConfig`. Это поле read-only через API, что закрывает SSRF-вектор «юзер шлёт ключи на свой произвольный host». Поле остаётся в БД для multi-engine deployment-ов через admin. |
@@ -1559,7 +1561,8 @@ Build context для Dokploy:
 
 Опциональные (есть дефолты в `base.py`):
 
-- `CORS_ALLOWED_ORIGINS` — origin фронтенда (`https://...`); без него API недоступен из браузера.
+- `CORS_ALLOW_ALL_ORIGINS` — дефолт `True`: prod отдаёт CORS-заголовки любому origin (аутентификация на JWT/Bearer, без кук, поэтому wildcard безопасен). Чтобы ограничить — `False` + `CORS_ALLOWED_ORIGINS`.
+- `CORS_ALLOWED_ORIGINS` — origin фронтенда (`https://...`); учитывается только при `CORS_ALLOW_ALL_ORIGINS=False`.
 - `CSRF_TRUSTED_ORIGINS` — список origin-ов с схемой (`https://...`) для CSRF-валидации POST-форм за TLS-терминирующим прокси. Обязателен для `/admin/login/` и любой формы admin, когда Django стоит за Traefik. Без него Django 4+ отдаёт 403 на POST.
 - `SECURE_SSL_REDIRECT` — дефолт `True`. См. риски ниже.
 - `LANGUAGE_CODE`, `TIME_ZONE`, `SERVICE_*_TIMEOUT_SECONDS`, `GUNICORN_WORKERS`.
