@@ -192,7 +192,7 @@ export const AnalysisQuery = Type.Object({
   candles: Type.Optional(
     Type.Integer({
       minimum: 61,
-      description: 'Сколько свечей анализировать; нет — env-дефолт, сверху ограничено ANALYSIS_MAX_CANDLES',
+      description: 'Сколько свечей анализировать; нет — env-дефолт ANALYSIS_DEFAULT_CANDLES',
     }),
   ),
 });
@@ -214,7 +214,6 @@ export const ConfigResponse = Type.Object(
     analysis: Type.Object(
       {
         defaultCandles: Type.Integer(),
-        maxCandles: Type.Integer(),
         aggTradesLimit: Type.Integer(),
         maxTradePages: Type.Integer(),
       },

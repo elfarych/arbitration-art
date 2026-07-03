@@ -33,10 +33,9 @@ export interface Config {
     /** Per-minute request-weight budget (Binance Futures default is 2400). */
     weightLimitPerMin: number;
   };
-  /** Breakout-analysis defaults and safety caps (`GET /analysis/:tf/:symbol`). */
+  /** Breakout-analysis defaults (`GET /analysis/:tf/:symbol`). */
   analysis: {
     defaultCandles: number;
-    maxCandles: number;
     /** Per-request aggTrades page size (Binance max 1000). */
     aggTradesLimit: number;
     /** Max aggTrades pages fetched per breakout window before giving up. */
@@ -77,7 +76,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     },
     analysis: {
       defaultCandles: parseNumber(env.ANALYSIS_DEFAULT_CANDLES, 1000),
-      maxCandles: parseNumber(env.ANALYSIS_MAX_CANDLES, 10000),
       aggTradesLimit: parseNumber(env.ANALYSIS_AGG_TRADES_LIMIT, 1000),
       maxTradePages: parseNumber(env.ANALYSIS_MAX_TRADE_PAGES, 12),
     },

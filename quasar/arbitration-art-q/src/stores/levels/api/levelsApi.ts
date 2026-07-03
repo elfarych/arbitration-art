@@ -187,7 +187,6 @@ export interface LevelsConfig {
   };
   analysis: {
     defaultCandles: number;
-    maxCandles: number;
     aggTradesLimit: number;
     maxTradePages: number;
   };

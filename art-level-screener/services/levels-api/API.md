@@ -117,7 +117,6 @@ HTTP API горизонтальных уровней Binance Futures для ск
   },
   "analysis": {
     "defaultCandles": 1000,
-    "maxCandles": 10000,
     "aggTradesLimit": 1000,
     "maxTradePages": 12
   },
@@ -260,7 +259,7 @@ query-параметры расчёта не применяются). `symbol` �
 | `direction` | `up` \| `down` \| `both` | `both` | Какие пробои анализировать |
 | `maxBreakoutSeconds` | integer ≥ 1 | `300` | Макс. время пробоя по трейдам, сек (от пересечения зоны до мин. движения) |
 | `minMovePct` | number ≥ 0 | `0.5` | Минимальное движение за уровень, % |
-| `candles` | integer ≥ 61 | env `ANALYSIS_DEFAULT_CANDLES` (`1000`) | Сколько свечей грузить; сверху ограничено `ANALYSIS_MAX_CANDLES` (`10000`). Значения >1500 грузятся из Binance пагинацией |
+| `candles` | integer ≥ 61 | env `ANALYSIS_DEFAULT_CANDLES` (`1000`) | Сколько свечей грузить; лимита сверху нет. Значения >1500 грузятся из Binance пагинацией |
 
 **Ответ `200`** — `AnalysisResponse`:
 ```json

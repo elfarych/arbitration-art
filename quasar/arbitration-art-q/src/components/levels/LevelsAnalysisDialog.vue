@@ -30,13 +30,12 @@
               type="number"
               label="Свечей для анализа"
               :min="61"
-              :max="10000"
               step="100"
               dense
               outlined
               dark
               class="col-6"
-              hint="61–10000"
+              hint="от 61"
             />
           </div>
         </div>
@@ -178,7 +177,6 @@ const TOLERANCE_OPTIONS: { label: string; value: ToleranceMode }[] = [
 ];
 
 const MIN_CANDLES = 61;
-const MAX_CANDLES = 10000;
 
 // Local editable copy so closing without "Запустить" discards edits. Re-synced
 // from props each time the dialog opens.
@@ -222,8 +220,7 @@ const isValid = computed(
     Number.isFinite(form.minMovePct) &&
     form.minMovePct >= 0 &&
     Number.isFinite(form.candles) &&
-    form.candles >= MIN_CANDLES &&
-    form.candles <= MAX_CANDLES,
+    form.candles >= MIN_CANDLES,
 );
 
 function onRun() {

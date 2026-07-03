@@ -26,8 +26,7 @@ export async function runClientAnalysis(
 ): Promise<AnalysisResult> {
   const limiter = new WeightRateLimiter(config.binance.weightLimitPerMin);
   const client = new BinanceRestClient(config.binance.restUrl, limiter);
-  // Same cap levels-api applies server-side (ANALYSIS_MAX_CANDLES).
-  const candles = Math.min(settings.candles, config.analysis.maxCandles);
+  const candles = settings.candles;
   const result = await computeAnalysis(
     client,
     {

@@ -280,12 +280,12 @@ weight-лимит. Нужен потому, что **анализ пробоев
 `src/binance/rate-limiter.ts` (нативный Binance REST на undici), `src/routes/analysis.ts`.
 
 Источник данных — **Binance USDⓈ-M Futures REST напрямую**, не Redis: так honored
-произвольное число свечей (`candles`, до `ANALYSIS_MAX_CANDLES`) и используются
+произвольное число свечей (`candles`, без верхнего лимита) и используются
 официальные klines/aggTrades. Публичные данные, без ключей и подписи (правило §5.2).
 
 Поток одного запроса:
 
-1. **Свечи**: `GET /fapi/v1/klines` — `candles` свечей по `:tf` (дефолт `ANALYSIS_DEFAULT_CANDLES=1000`, максимум `ANALYSIS_MAX_CANDLES=10000`); значения >1500 грузятся пагинацией назад по `endTime` (`klinesHistory`).
+1. **Свечи**: `GET /fapi/v1/klines` — `candles` свечей по `:tf` (дефолт `ANALYSIS_DEFAULT_CANDLES=1000`, верхнего лимита нет); значения >1500 грузятся пагинацией назад по `endTime` (`klinesHistory`).
 2. **Уровни**: тот же код, что у `/screener` (`src/levels/`: `findExtrema` +
    `countTouches` + `computeNatr`). Эффективные параметры: `natrMultiplier`
    (погрешность зоны в долях NATR) **или** `tolerancePct` (та же погрешность

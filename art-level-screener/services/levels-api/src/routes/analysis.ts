@@ -24,10 +24,7 @@ export const analysisRoutes: FastifyPluginAsyncTypebox = async (app) => {
       },
     },
     async (request, reply) => {
-      const candles = Math.min(
-        request.query.candles ?? app.config.analysis.defaultCandles,
-        app.config.analysis.maxCandles,
-      );
+      const candles = request.query.candles ?? app.config.analysis.defaultCandles;
       try {
         const result = await computeAnalysis(
           app.binance,
